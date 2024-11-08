@@ -1,0 +1,5 @@
+# vars.yml
+use_tls: false
+use_delegated_ssl: false
+kafka_truststore_password: "admin123"
+kafka_keystore_password:  "admin123"

@@ -1,4 +1,4 @@
-#
+---
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,6 +16,8 @@
   hosts: all
   gather_facts: no # important
   tags: [always]
+  vars_files:
+    - ./tf_ansible_vars_file.yml
   tasks:
     - name: Wait for all instances to become reachable
       wait_for_connection:
@@ -99,6 +101,8 @@
   hosts: all
   connection: ssh
   become: true
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - name: Install RPM packages
       yum: pkg={{ item }} state=installed
@@ -118,7 +122,7 @@
         gatewayServers: "{{ groups['gateway'] | map('extract', hostvars, ['private_ip']) | map('regex_replace', '^(.*)$', '\\1:6969') | join(',') }}"
         privateIp: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
         kafkaVersion: "3.6.1"
-      tags: [ always, client-code ]
+      tags: [always, client-code]
     - debug:
         msg: "zookeeper servers: {{ zookeeperServers }}\nbootstrap servers: {{ bootstrapServers }}\ngateway servers: {{ gatewayServers }}"
     - name: Change locale to en_US.utf-8
@@ -131,6 +135,9 @@
   connection: ssh
   become: true
   tags: [kafka]
+  when: use_delegate_ssl == true
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - file: path=/opt/kafka state=absent
     - file: path=/opt/kafka state=directory
@@ -140,7 +147,72 @@
         remote_src: yes
         dest: /opt/kafka
         extra_opts: ["--strip-components=1"]
+    - name: Ensure truststore and keystore directory exists
+      file:
+        path: /opt/kafka/config
+        state: directory
+        mode: '0755'
 
+    - name: Remove existing truststore and keystore if TLS is enabled
+      file:
+        path: /opt/kafka/config/kafka-server.keystore.jks
+        state: absent
+      when: use_tls
+    - name: Generate Kafka keystore if TLS is enabled
+      command: >
+        keytool -genkeypair -alias kafka-server -keyalg RSA -keystore /opt/kafka/config/kafka-server.keystore.jks
+        -storepass "{{ kafka_keystore_password }}" -keypass "{{ kafka_keystore_password }}"
+        -dname "CN={{ inventory_hostname }}, OU=Kafka, O=YourOrg, L=YourCity, ST=YourState, C=YourCountry"
+      when: use_tls
+    - name: Generate CSR for Kafka server if TLS is enabled
+      command: >
+        keytool -keystore /opt/kafka/config/kafka-server.keystore.jks -alias kafka-server -certreq -file /opt/kafka/config/kafka-server.csr
+        -storepass "{{ kafka_keystore_password }}"
+      when: use_tls
+    - name: Import signed certificate to Kafka keystore if TLS is enabled
+      command: >
+        keytool -keystore /opt/kafka/config/kafka-server.keystore.jks -alias kafka-server -import -file /opt/kafka/config/kafka-server-cert.pem
+        -storepass "{{ kafka_keystore_password }}" -noprompt
+      when: use_tls
+    - name: Set permissions for keystore and truststore if TLS is enabled
+      file:
+        path: /opt/kafka/config/kafka-server.keystore.jks
+        owner: kafka
+        group: kafka
+        mode: '0600'
+      loop:
+        - 
+        - kafka-server.truststore.jks
+      when: use_tls
+
+    - file:
+        path: /opt/kafka/config/kafka-server.truststore.jks
+        state: absent
+      when: use_delegated_ssl
+    - name: Sign CSR with CA if use_delegated_ssl is enabled
+      command: >
+        openssl x509 -req -in /opt/kafka/config/kafka-server.csr -CA /tmp/ca-cert.pem -CAkey /tmp/ca-key.pem
+        -CAcreateserial -out /opt/kafka/config/kafka-server-cert.pem -days 365 -sha256
+      when: use_delegated_ssl
+    - name: Import CA certificate to Kafka truststore if TLS is enabled
+      command: >
+        keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot -import -file /tmp/ca-cert.pem
+        -storepass "{{ kafka_truststore_password }}" -noprompt
+      when: use_delegated_ssl
+    - name: Set permissions for keystore and truststore if TLS is enabled
+      file:
+        path: /opt/kafka/config/kafka-server.truststore.jks
+        owner: kafka
+        group: kafka
+        mode: '0600'
+      when: use_delegated_ssl
+
+    - name: Reload and restart Kafka to apply configuration
+      systemd:
+        name: kafka
+        state: restarted
+        daemon_reload: yes
+      tags: [restart-kafka]
 
 - name: Setup ZooKeeper
   hosts: zookeeper
@@ -177,6 +249,8 @@
   connection: ssh
   become: true
   tags: [kafka]
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - set_fact:
         brokerId: "{{ groups['kafka'].index(inventory_hostname) }}"
@@ -184,6 +258,19 @@
       template:
         src: "templates/server.properties"
         dest: "/opt/kafka/config/server.properties"
+      when: not use_delegate_ssl and not use_tls
+    - name: Configure Kafka SSL with SASL
+      template:
+        src: templates/server_ssl.properties.j2
+        dest: /opt/kafka/config/server_ssl.properties
+      vars:
+        kafka_truststore_path: /opt/kafka/config/kafka-server.truststore.jks
+        kafka_truststore_password: "{{ kafka_truststore_password }}"
+        kafka_keystore_path: /opt/kafka/config/kafka-server.keystore.jks
+        kafka_keystore_password: "{{ kafka_keystore_password }}"
+        use_tls: "{{ use_tls }}"
+        use_ssl: "{{ use_delegate_ssl }}"
+      when: use_tls or use_delegate_ssl
     - template:
         src: "templates/kafka.service"
         dest: "/etc/systemd/system/kafka.service"
@@ -342,7 +429,7 @@
         regexp: '^  bootstrap.servers='
         line: '  bootstrap.servers={{ gatewayServers }}'
       with_items: '{{ gateway_drivers_list.stdout_lines }}'
-      tags: [ client-code ]
+      tags: [client-code]
 
     - name: Get list of jms driver config files
       raw: ls -1 /opt/benchmark/driver-jms/kafka*.yaml
@@ -389,7 +476,7 @@
         name: "benchmark-worker"
       tags: [client-code]
 
-- name:  Hosts addresses
+- name: Hosts addresses
   hosts: localhost
   become: false
   tasks:

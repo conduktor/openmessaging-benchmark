@@ -22,6 +22,7 @@ Pre-requisites:
    2. export REGISTRY_USERNAME=<registry login>
    3. export REGISTRY_PASSWORD=<registry api token>
 7. Setup nodes with `ansible-playbook --user ec2-user --inventory-file inventory.ini deploy.yaml`
+   1. If you want to set tls and use delegated_sasl_ssl run `ansible-playbook --user ec2-user --inventory-file inventory.ini deploy.yaml -e "use_tls=true use_delegated_ssl=true"`
 8. Connect to one benchmark worker node with `ssh -i ~/.ssh/kafka_aws ec2-user@$(terraform output client_ssh_host | tr -d '"')`
 9.  Go to benchmark directory with `cd /opt/benchmark`
 10. Run the benchmark with `sudo bin/benchmark --drivers driver-gateway/gateway-latency.yaml workloads/100-topic-4-partitions-1kb-4p-4c-500k.yaml;`

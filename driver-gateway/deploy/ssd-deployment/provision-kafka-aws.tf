@@ -130,6 +130,7 @@ resource "aws_security_group" "benchmark_security_group" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # ICMP access from anywhere
   ingress {
     from_port = -1
     to_port = -1
