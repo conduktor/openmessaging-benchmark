@@ -130,6 +130,71 @@
         echo 'LANG=en_US.utf-8
               LC_ALL=en_US.utf-8' > /etc/environment
 
+# TLS Certificate Generation for Kafka and Conduktor Gateway
+- name: Generate CA and server certificates for TLS
+  hosts: [kafka, gateway]
+  become: true
+  when: use_tls_and_ssl
+  vars_files:
+    - ./ansible-vars.yml
+  tasks:
+    - name: Generate CA private key and certificate (if not exists)
+      command: >
+        openssl req -new -x509 -keyout /tmp/ca-key.pem -out /tmp/ca-cert.pem -days 365 -nodes
+        -subj "/CN=MyKafkaCA/O=Conduktor/C=UK"
+      args:
+        creates: /tmp/ca-cert.pem
+
+    - name: Generate Kafka private key and CSR
+      command: >
+        openssl req -new -newkey rsa:2048 -nodes -keyout /opt/kafka/config/kafka-key.pem
+        -out /opt/kafka/config/kafka.csr -subj "/CN=kafka-server/O=Conduktor/C=UK"
+      when: "'kafka' in group_names"
+
+    - name: Sign Kafka CSR with CA certificate
+      command: >
+        openssl x509 -req -in /opt/kafka/config/kafka.csr -CA /tmp/ca-cert.pem
+        -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/kafka/config/kafka-cert.pem -days 365
+      when: "'kafka' in group_names"
+
+    - name: Import CA certificate to Kafka truststore
+      command: >
+        keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot
+        -import -file /tmp/ca-cert.pem -storepass "{{ kafka_truststore_password }}" -noprompt
+      when: "'kafka' in group_names"
+
+    - name: Import Kafka certificate and key to Kafka keystore
+      command: >
+        keytool -importkeystore -srckeystore /opt/kafka/config/kafka-cert.pem
+        -destkeystore /opt/kafka/config/kafka-server.keystore.jks
+        -srcalias kafka-server -destalias kafka-server -srcstorepass "{{ kafka_keystore_password }}"
+      when: "'kafka' in group_names"
+
+    - name: Generate Gateway private key and CSR
+      command: >
+        openssl req -new -newkey rsa:2048 -nodes -keyout /opt/conduktor-gateway/ssl/gateway-key.pem
+        -out /opt/conduktor-gateway/ssl/gateway.csr -subj "/CN=gateway-server/O=Conduktor/C=UK"
+      when: "'gateway' in group_names"
+
+    - name: Sign Gateway CSR with CA certificate
+      command: >
+        openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr -CA /tmp/ca-cert.pem
+        -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem -days 365
+      when: "'gateway' in group_names"
+
+    - name: Import CA certificate to Gateway truststore
+      command: >
+        keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks -alias CARoot
+        -import -file /tmp/ca-cert.pem -storepass "{{ gateway_truststore_password }}" -noprompt
+      when: "'gateway' in group_names"
+
+    - name: Import Gateway certificate and key to Gateway keystore
+      command: >
+        keytool -importkeystore -srckeystore /opt/conduktor-gateway/ssl/gateway-cert.pem
+        -destkeystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
+        -srcalias gateway-server -destalias gateway-server -srcstorepass "{{ gateway_keystore_password }}"
+      when: "'gateway' in group_names"
+
 - name: Kafka setup
   hosts: kafka
   connection: ssh
@@ -146,63 +211,6 @@
         remote_src: yes
         dest: /opt/kafka
         extra_opts: ["--strip-components=1"]
-    
-    - name: Ensure truststore and keystore directory exists
-      file:
-        path: /opt/kafka/config
-        state: directory
-        mode: '0755'
-      when: use_tls_and_ssl
-    - name: Remove existing truststore and keystore if use_tls_and_ssl is enabled
-      file:
-        path: /opt/kafka/config/kafka-server.keystore.jks
-        state: absent
-      when: use_tls_and_ssl
-    - name: Generate Kafka keystore if use_tls_and_ssl is enabled
-      command: >
-        keytool -genkeypair -alias kafka-server -keyalg RSA -keystore /opt/kafka/config/kafka-server.keystore.jks
-        -storepass "{{ kafka_keystore_password }}" -keypass "{{ kafka_keystore_password }}"
-        -dname "CN={{ inventory_hostname }}, OU=Kafka, O=Conduktor, L=London, ST=London, C=England"
-      when: use_tls_and_ssl
-    - name: Generate CSR for Kafka server if use_tls_and_ssl is enabled
-      command: >
-        keytool -keystore /opt/kafka/config/kafka-server.keystore.jks -alias kafka-server -certreq -file /opt/kafka/config/kafka-server.csr
-        -storepass "{{ kafka_keystore_password }}"
-      when: use_tls_and_ssl
-    - name: Import signed certificate to Kafka keystore if use_tls_and_ssl is enabled
-      command: >
-        keytool -keystore /opt/kafka/config/kafka-server.keystore.jks -alias kafka-server -import -file /opt/kafka/config/kafka-server-cert.pem
-        -storepass "{{ kafka_keystore_password }}" -noprompt
-      when: use_tls_and_ssl
-    - name: Set permissions for keystore and truststore if use_tls_and_ssl is enabled
-      file:
-        path: /opt/kafka/config/kafka-server.keystore.jks
-        owner: kafka
-        group: kafka
-        mode: '0600'
-      when: use_tls_and_ssl
-    - file:
-        path: /opt/kafka/config/kafka-server.truststore.jks
-        state: absent
-      when: use_tls_and_ssl
-    - name: Sign CSR with CA if use_tls_and_ssl is enabled
-      command: >
-        openssl x509 -req -in /opt/kafka/config/kafka-server.csr -CA /tmp/ca-cert.pem -CAkey /tmp/ca-key.pem
-        -CAcreateserial -out /opt/kafka/config/kafka-server-cert.pem -days 365 -sha256
-      when: use_tls_and_ssl
-    - name: Import CA certificate to Kafka truststore if use_tls_and_ssl is enabled
-      command: >
-        keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot -import -file /tmp/ca-cert.pem
-        -storepass "{{ kafka_truststore_password }}" -noprompt
-      when: use_tls_and_ssl
-    - name: Set permissions for keystore and truststore if use_tls_and_ssl is enabled
-      file:
-        path: /opt/kafka/config/kafka-server.truststore.jks
-        owner: kafka
-        group: kafka
-        mode: '0600'
-      when: use_tls_and_ssl
-
     - name: Reload and restart Kafka to apply configuration
       systemd:
         name: kafka
@@ -328,63 +336,6 @@
         registry_url: "{{ lookup('ansible.builtin.env', 'REGISTRY_URL', default='harbor.cdkt.dev') }}"
         username:  "{{ lookup('ansible.builtin.env', 'REGISTRY_USERNAME') }}"
         password: "{{ lookup('ansible.builtin.env', 'REGISTRY_PASSWORD') }}"
-
-    - name: Ensure truststore and keystore directory exists
-      file:
-        path: /opt/conduktor-gateway/ssl
-        state: directory
-        mode: '0755'
-
-    - name: Generate Gateway keystore if use_tls_and_ssl is enabled
-      command: >
-        keytool -genkeypair -alias gateway -keyalg RSA
-        -keystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
-        -storepass "{{ gateway_keystore_password }}" -keypass "{{ gateway_keystore_password }}"
-        -dname "CN={{ inventory_hostname }}, OU=Conduktor, O=Conduktor, L=London, ST=London, C=England"
-      when: use_tls_and_ssl
-
-    - name: Generate CSR for Gateway if use_tls_and_ssl is enabled
-      command: >
-        keytool -keystore /opt/conduktor-gateway/ssl/gateway_keystore.jks -alias gateway
-        -certreq -file /opt/conduktor-gateway/ssl/gateway.csr
-        -storepass "{{ gateway_keystore_password }}"
-      when: use_tls_and_ssl
-
-    - name: Set permissions for keystore if use_tls_and_ssl is enabled
-      file:
-        path: /opt/conduktor-gateway/ssl/gateway_keystore.jks
-        owner: root
-        group: root
-        mode: '0600'
-      when: use_tls_and_ssl
-
-    - name: Sign CSR with CA if use_tls_and_ssl is enabled
-      command: >
-        openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr
-        -CA /tmp/ca-cert.pem -CAkey /tmp/ca-key.pem
-        -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem
-        -days 365 -sha256
-      when: use_tls_and_ssl
-    - name: Import signed certificate to Gateway keystore if use_tls_and_ssl is enabled
-      command: >
-        keytool -keystore /opt/conduktor-gateway/ssl/gateway_keystore.jks -alias gateway
-        -import -file /opt/conduktor-gateway/ssl/gateway-cert.pem
-        -storepass "{{ gateway_keystore_password }}" -noprompt
-      when: use_tls_and_ssl
-    - name: Import CA certificate to Gateway truststore if use_tls_and_ssl is enabled
-      command: >
-        keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks
-        -alias CARoot -import -file /tmp/ca-cert.pem
-        -storepass "{{ gateway_truststore_password }}" -noprompt
-      when: use_tls_and_ssl
-
-    - name: Set permissions for truststore if use_tls_and_ssl is enabled
-      file:
-        path: /opt/conduktor-gateway/ssl/gateway_truststore.jks
-        owner: root
-        group: root
-        mode: '0600'
-      when: use_tls_and_ssl
 
     - name: Set base volume mounts for Gateway
       set_fact:
