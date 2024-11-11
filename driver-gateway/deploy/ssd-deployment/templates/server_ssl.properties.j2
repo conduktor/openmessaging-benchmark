@@ -12,23 +12,22 @@
 # limitations under the License.
 #
 
-{% if use_ssl %}
-#bootstrap.servers={{ gatewayServers }}
-security.protocol=SASL_SSL
-advertised.listeners=SASL_SSL://{{ privateIp }}:9094
-security.inter.broker.protocol=ASL_SSL
-ssl.truststore.location={{ kafka_truststore_path }}
-ssl.truststore.password={{ kafka_truststore_password }}
-sasl.enabled.mechanisms=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin";
-{% endif %}
-
-{% if use_tls %}
+# SSL Settings
 ssl.keystore.location={{ kafka_keystore_path }}
 ssl.keystore.password={{ kafka_keystore_password }}
 ssl.key.password={{ kafka_key_password }}
-{% endif %}
+ssl.truststore.location={{ kafka_truststore_path }}
+ssl.truststore.password={{ kafka_truststore_password }}
 
+# SASL Authentication
+security.protocol=SASL_SSL
+sasl.enabled.mechanisms=PLAIN
+sasl.mechanism.inter.broker.protocol=PLAIN
+advertised.listeners=SASL_SSL://{{ privateIp }}:9094
+security.inter.broker.protocol=ASL_SSL
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin";
+
+# Kafka Broker Config
 broker.id={{ brokerId }}
 
 log.dirs=/mnt/data-1,/mnt/data-2

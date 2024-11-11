@@ -135,7 +135,6 @@
   connection: ssh
   become: true
   tags: [kafka]
-  when: use_delegate_ssl == true
   vars_files:
     - ./ansible-vars.yml
   tasks:
@@ -147,65 +146,62 @@
         remote_src: yes
         dest: /opt/kafka
         extra_opts: ["--strip-components=1"]
+    
     - name: Ensure truststore and keystore directory exists
       file:
         path: /opt/kafka/config
         state: directory
         mode: '0755'
-
-    - name: Remove existing truststore and keystore if TLS is enabled
+      when: use_tls_and_ssl
+    - name: Remove existing truststore and keystore if use_tls_and_ssl is enabled
       file:
         path: /opt/kafka/config/kafka-server.keystore.jks
         state: absent
-      when: use_tls
-    - name: Generate Kafka keystore if TLS is enabled
+      when: use_tls_and_ssl
+    - name: Generate Kafka keystore if use_tls_and_ssl is enabled
       command: >
         keytool -genkeypair -alias kafka-server -keyalg RSA -keystore /opt/kafka/config/kafka-server.keystore.jks
         -storepass "{{ kafka_keystore_password }}" -keypass "{{ kafka_keystore_password }}"
-        -dname "CN={{ inventory_hostname }}, OU=Kafka, O=YourOrg, L=YourCity, ST=YourState, C=YourCountry"
-      when: use_tls
-    - name: Generate CSR for Kafka server if TLS is enabled
+        -dname "CN={{ inventory_hostname }}, OU=Kafka, O=Conduktor, L=London, ST=London, C=England"
+      when: use_tls_and_ssl
+    - name: Generate CSR for Kafka server if use_tls_and_ssl is enabled
       command: >
         keytool -keystore /opt/kafka/config/kafka-server.keystore.jks -alias kafka-server -certreq -file /opt/kafka/config/kafka-server.csr
         -storepass "{{ kafka_keystore_password }}"
-      when: use_tls
-    - name: Import signed certificate to Kafka keystore if TLS is enabled
+      when: use_tls_and_ssl
+    - name: Import signed certificate to Kafka keystore if use_tls_and_ssl is enabled
       command: >
         keytool -keystore /opt/kafka/config/kafka-server.keystore.jks -alias kafka-server -import -file /opt/kafka/config/kafka-server-cert.pem
         -storepass "{{ kafka_keystore_password }}" -noprompt
-      when: use_tls
-    - name: Set permissions for keystore and truststore if TLS is enabled
+      when: use_tls_and_ssl
+    - name: Set permissions for keystore and truststore if use_tls_and_ssl is enabled
       file:
         path: /opt/kafka/config/kafka-server.keystore.jks
         owner: kafka
         group: kafka
         mode: '0600'
-      loop:
-        - 
-        - kafka-server.truststore.jks
-      when: use_tls
-
+      when: use_tls_and_ssl
     - file:
         path: /opt/kafka/config/kafka-server.truststore.jks
         state: absent
-      when: use_delegated_ssl
-    - name: Sign CSR with CA if use_delegated_ssl is enabled
+      when: use_tls_and_ssl
+    - name: Sign CSR with CA if use_tls_and_ssl is enabled
       command: >
         openssl x509 -req -in /opt/kafka/config/kafka-server.csr -CA /tmp/ca-cert.pem -CAkey /tmp/ca-key.pem
         -CAcreateserial -out /opt/kafka/config/kafka-server-cert.pem -days 365 -sha256
-      when: use_delegated_ssl
-    - name: Import CA certificate to Kafka truststore if TLS is enabled
+      when: use_tls_and_ssl
+    - name: Import CA certificate to Kafka truststore if use_tls_and_ssl is enabled
       command: >
         keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot -import -file /tmp/ca-cert.pem
         -storepass "{{ kafka_truststore_password }}" -noprompt
-      when: use_delegated_ssl
-    - name: Set permissions for keystore and truststore if TLS is enabled
+      when: use_tls_and_ssl
+    - name: Set permissions for keystore and truststore if use_tls_and_ssl is enabled
       file:
         path: /opt/kafka/config/kafka-server.truststore.jks
         owner: kafka
         group: kafka
         mode: '0600'
-      when: use_delegated_ssl
+      when: use_tls_and_ssl
 
     - name: Reload and restart Kafka to apply configuration
       systemd:
@@ -258,7 +254,7 @@
       template:
         src: "templates/server.properties"
         dest: "/opt/kafka/config/server.properties"
-      when: not use_delegate_ssl and not use_tls
+      when: not use_tls_and_ssl
     - name: Configure Kafka SSL with SASL
       template:
         src: templates/server_ssl.properties.j2
@@ -268,9 +264,7 @@
         kafka_truststore_password: "{{ kafka_truststore_password }}"
         kafka_keystore_path: /opt/kafka/config/kafka-server.keystore.jks
         kafka_keystore_password: "{{ kafka_keystore_password }}"
-        use_tls: "{{ use_tls }}"
-        use_ssl: "{{ use_delegate_ssl }}"
-      when: use_tls or use_delegate_ssl
+      when: use_tls_and_ssl
     - template:
         src: "templates/kafka.service"
         dest: "/etc/systemd/system/kafka.service"
@@ -287,6 +281,7 @@
   tags: [gateway]
   vars_files:
     - ./tf_ansible_vars_file.yml
+    - ./ansible-vars.yml
   tasks:
     - name: Check mandatory variables imported from Terraform
       assert:
@@ -333,15 +328,76 @@
         registry_url: "{{ lookup('ansible.builtin.env', 'REGISTRY_URL', default='harbor.cdkt.dev') }}"
         username:  "{{ lookup('ansible.builtin.env', 'REGISTRY_USERNAME') }}"
         password: "{{ lookup('ansible.builtin.env', 'REGISTRY_PASSWORD') }}"
-    - name: "Gateway container"
-      community.docker.docker_container:
-        name: gateway
-        state: started
-        image: "{{ lookup('ansible.builtin.env', 'GATEWAY_IMAGE', default='conduktor/conduktor-gateway:3.0.4') }}"
-        restart_policy: on-failure
-        volumes:
+
+    - name: Ensure truststore and keystore directory exists
+      file:
+        path: /opt/conduktor-gateway/ssl
+        state: directory
+        mode: '0755'
+
+    - name: Generate Gateway keystore if use_tls_and_ssl is enabled
+      command: >
+        keytool -genkeypair -alias gateway -keyalg RSA
+        -keystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
+        -storepass "{{ gateway_keystore_password }}" -keypass "{{ gateway_keystore_password }}"
+        -dname "CN={{ inventory_hostname }}, OU=Conduktor, O=Conduktor, L=London, ST=London, C=England"
+      when: use_tls_and_ssl
+
+    - name: Generate CSR for Gateway if use_tls_and_ssl is enabled
+      command: >
+        keytool -keystore /opt/conduktor-gateway/ssl/gateway_keystore.jks -alias gateway
+        -certreq -file /opt/conduktor-gateway/ssl/gateway.csr
+        -storepass "{{ gateway_keystore_password }}"
+      when: use_tls_and_ssl
+
+    - name: Set permissions for keystore if use_tls_and_ssl is enabled
+      file:
+        path: /opt/conduktor-gateway/ssl/gateway_keystore.jks
+        owner: root
+        group: root
+        mode: '0600'
+      when: use_tls_and_ssl
+
+    - name: Sign CSR with CA if use_tls_and_ssl is enabled
+      command: >
+        openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr
+        -CA /tmp/ca-cert.pem -CAkey /tmp/ca-key.pem
+        -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem
+        -days 365 -sha256
+      when: use_tls_and_ssl
+    - name: Import signed certificate to Gateway keystore if use_tls_and_ssl is enabled
+      command: >
+        keytool -keystore /opt/conduktor-gateway/ssl/gateway_keystore.jks -alias gateway
+        -import -file /opt/conduktor-gateway/ssl/gateway-cert.pem
+        -storepass "{{ gateway_keystore_password }}" -noprompt
+      when: use_tls_and_ssl
+    - name: Import CA certificate to Gateway truststore if use_tls_and_ssl is enabled
+      command: >
+        keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks
+        -alias CARoot -import -file /tmp/ca-cert.pem
+        -storepass "{{ gateway_truststore_password }}" -noprompt
+      when: use_tls_and_ssl
+
+    - name: Set permissions for truststore if use_tls_and_ssl is enabled
+      file:
+        path: /opt/conduktor-gateway/ssl/gateway_truststore.jks
+        owner: root
+        group: root
+        mode: '0600'
+      when: use_tls_and_ssl
+
+    - name: Set base volume mounts for Gateway
+      set_fact:
+        gateway_volumes:
           - "/opt/gateway-interceptors.json:/opt/interceptors.json"
-        env:
+    - name: Add TLS volume mounts to Gateway if enabled
+      set_fact:
+        gateway_volumes: "{{ gateway_volumes + [ lookup('template', 'gateway_volumes.j2').splitlines() ] | flatten }}"
+      when: use_tls_and_ssl
+
+    - name: Set base environment variables for Gateway
+      set_fact:
+        gateway_env:
           LOG4J2_IO_CONDUKTOR_PROXY_SERVICE_LEVEL: "DEBUG"
           LOG4J2_IO_CONDUKTOR_PROXY_NETWORK_LEVEL: "DEBUG"
           LOG4J2_IO_NETTY_LEVEL: "INFO"
@@ -354,6 +410,20 @@
           ENCRYPT_SECRET_KEY: "{{ lookup('ansible.builtin.env', 'ENCRYPT_SECRET_KEY') }}"
           GATEWAY_INTERCEPTOR_CONFIG_LOCATION: "/opt/interceptors.json"
           GATEWAY_ADMIN_API_USERS: "[{username: admin, password: conduktor, admin: true}]"
+
+    - name: Add TLS environment variables to Gateway if enabled
+      set_fact:
+        gateway_env: "{{ gateway_env | combine(lookup('template', 'gateway_env.j2') | from_yaml) }}"
+      when: use_tls_and_ssl
+
+    - name: "Gateway container"
+      community.docker.docker_container:
+        name: gateway
+        state: started
+        image: "{{ lookup('ansible.builtin.env', 'GATEWAY_IMAGE', default='conduktor/conduktor-gateway:latest') }}"
+        restart_policy: on-failure
+        volumes: "{{ gateway_volumes }}"
+        env: "{{ gateway_env }}"
         published_ports:
           - "8888:8888"
           - "6969:6969"
