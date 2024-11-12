@@ -130,71 +130,6 @@
         echo 'LANG=en_US.utf-8
               LC_ALL=en_US.utf-8' > /etc/environment
 
-# TLS Certificate Generation for Kafka and Conduktor Gateway
-- name: Generate CA and server certificates for TLS
-  hosts: [kafka, gateway]
-  become: true
-  when: use_tls_and_ssl
-  vars_files:
-    - ./ansible-vars.yml
-  tasks:
-    - name: Generate CA private key and certificate (if not exists)
-      command: >
-        openssl req -new -x509 -keyout /tmp/ca-key.pem -out /tmp/ca-cert.pem -days 365 -nodes
-        -subj "/CN=MyKafkaCA/O=Conduktor/C=UK"
-      args:
-        creates: /tmp/ca-cert.pem
-
-    - name: Generate Kafka private key and CSR
-      command: >
-        openssl req -new -newkey rsa:2048 -nodes -keyout /opt/kafka/config/kafka-key.pem
-        -out /opt/kafka/config/kafka.csr -subj "/CN=kafka-server/O=Conduktor/C=UK"
-      when: "'kafka' in group_names"
-
-    - name: Sign Kafka CSR with CA certificate
-      command: >
-        openssl x509 -req -in /opt/kafka/config/kafka.csr -CA /tmp/ca-cert.pem
-        -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/kafka/config/kafka-cert.pem -days 365
-      when: "'kafka' in group_names"
-
-    - name: Import CA certificate to Kafka truststore
-      command: >
-        keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot
-        -import -file /tmp/ca-cert.pem -storepass "{{ kafka_truststore_password }}" -noprompt
-      when: "'kafka' in group_names"
-
-    - name: Import Kafka certificate and key to Kafka keystore
-      command: >
-        keytool -importkeystore -srckeystore /opt/kafka/config/kafka-cert.pem
-        -destkeystore /opt/kafka/config/kafka-server.keystore.jks
-        -srcalias kafka-server -destalias kafka-server -srcstorepass "{{ kafka_keystore_password }}"
-      when: "'kafka' in group_names"
-
-    - name: Generate Gateway private key and CSR
-      command: >
-        openssl req -new -newkey rsa:2048 -nodes -keyout /opt/conduktor-gateway/ssl/gateway-key.pem
-        -out /opt/conduktor-gateway/ssl/gateway.csr -subj "/CN=gateway-server/O=Conduktor/C=UK"
-      when: "'gateway' in group_names"
-
-    - name: Sign Gateway CSR with CA certificate
-      command: >
-        openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr -CA /tmp/ca-cert.pem
-        -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem -days 365
-      when: "'gateway' in group_names"
-
-    - name: Import CA certificate to Gateway truststore
-      command: >
-        keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks -alias CARoot
-        -import -file /tmp/ca-cert.pem -storepass "{{ gateway_truststore_password }}" -noprompt
-      when: "'gateway' in group_names"
-
-    - name: Import Gateway certificate and key to Gateway keystore
-      command: >
-        keytool -importkeystore -srckeystore /opt/conduktor-gateway/ssl/gateway-cert.pem
-        -destkeystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
-        -srcalias gateway-server -destalias gateway-server -srcstorepass "{{ gateway_keystore_password }}"
-      when: "'gateway' in group_names"
-
 - name: Kafka setup
   hosts: kafka
   connection: ssh
@@ -211,12 +146,6 @@
         remote_src: yes
         dest: /opt/kafka
         extra_opts: ["--strip-components=1"]
-    - name: Reload and restart Kafka to apply configuration
-      systemd:
-        name: kafka
-        state: restarted
-        daemon_reload: yes
-      tags: [restart-kafka]
 
 - name: Setup ZooKeeper
   hosts: zookeeper
@@ -248,6 +177,88 @@
         daemon_reload: yes
         name: "zookeeper"
 
+# TLS Certificate Generation for Kafka and Conduktor Gateway
+- name: Generate CA and server certificates for TLS
+  hosts: [kafka, gateway]
+  become: true
+  vars_files:
+    - ./ansible-vars.yml
+    - ./tf_ansible_vars_file.yml
+  tasks:
+    - name: Generate certificates for Kafka and Conduktor Gateway
+      when: use_tls_and_ssl
+      block:
+      - name: Generate CA private key and certificate (if not exists)
+        command: >
+          openssl req -new -x509 -keyout /tmp/ca-key.pem -out /tmp/ca-cert.pem -days 365 -nodes
+          -subj "/CN=MyKafkaCA/O=Conduktor/C=UK"
+        args:
+          creates: /tmp/ca-cert.pem
+
+      - name: Create SSL directory for Gateway if it doesn't exist
+        file:
+          path: /opt/conduktor-gateway/ssl
+          state: directory
+          mode: '0755'
+        when: "'gateway' in group_names"
+
+      - name: Create SSL directory for Kafka if it doesn't exist
+        file:
+          path: /opt/kafka/config
+          state: directory
+          mode: '0755'
+        when: "'kafka' in group_names"
+
+      - name: Generate Kafka private key and CSR
+        command: >
+          openssl req -new -newkey rsa:2048 -nodes -keyout /opt/kafka/config/kafka-key.pem
+          -out /opt/kafka/config/kafka.csr -subj "/CN=kafka-server/O=Conduktor/C=UK"
+        when: "'kafka' in group_names"
+
+      - name: Sign Kafka CSR with CA certificate
+        command: >
+          openssl x509 -req -in /opt/kafka/config/kafka.csr -CA /tmp/ca-cert.pem
+          -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/kafka/config/kafka-cert.pem -days 365
+        when: "'kafka' in group_names"
+
+      - name: Import CA certificate to Kafka truststore
+        command: >
+          keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot
+          -import -file /tmp/ca-cert.pem -storepass "{{ kafka_truststore_password }}" -noprompt
+        when: "'kafka' in group_names"
+
+      - name: Import Kafka certificate and key to Kafka keystore
+        command: >
+          keytool -importkeystore -srckeystore /opt/kafka/config/kafka-cert.pem
+          -destkeystore /opt/kafka/config/kafka-server.keystore.jks
+          -srcalias kafka-server -destalias kafka-server -srcstorepass "{{ kafka_keystore_password }}"
+        when: "'kafka' in group_names"
+
+      - name: Generate Gateway private key and CSR
+        command: >
+          openssl req -new -newkey rsa:2048 -nodes -keyout /opt/conduktor-gateway/ssl/gateway-key.pem
+          -out /opt/conduktor-gateway/ssl/gateway.csr -subj "/CN=gateway-server/O=Conduktor/C=UK"
+        when: "'gateway' in group_names"
+
+      - name: Sign Gateway CSR with CA certificate
+        command: >
+          openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr -CA /tmp/ca-cert.pem
+          -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem -days 365
+        when: "'gateway' in group_names"
+
+      - name: Import CA certificate to Gateway truststore
+        command: >
+          keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks -alias CARoot
+          -import -file /tmp/ca-cert.pem -storepass "{{ gateway_truststore_password }}" -noprompt
+        when: "'gateway' in group_names"
+
+      - name: Import Gateway certificate and key to Gateway keystore
+        command: >
+          keytool -importkeystore -srckeystore /opt/conduktor-gateway/ssl/gateway-cert.pem
+          -destkeystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
+          -srcalias gateway-server -destalias gateway-server -srcstorepass "{{ gateway_keystore_password }}"
+        when: "'gateway' in group_names"
+
 - name: Setup Kafka
   hosts: kafka
   connection: ssh
@@ -268,10 +279,11 @@
         src: templates/server_ssl.properties.j2
         dest: /opt/kafka/config/server_ssl.properties
       vars:
-        kafka_truststore_path: /opt/kafka/config/kafka-server.truststore.jks
-        kafka_truststore_password: "{{ kafka_truststore_password }}"
-        kafka_keystore_path: /opt/kafka/config/kafka-server.keystore.jks
-        kafka_keystore_password: "{{ kafka_keystore_password }}"
+        template_kafka_truststore_path: /opt/kafka/config/kafka-server.truststore.jks
+        template_kafka_truststore_password: "{{ kafka_truststore_password }}"
+        template_kafka_keystore_path: /opt/kafka/config/kafka-server.keystore.jks
+        template_kafka_keystore_password: "{{ kafka_keystore_password }}"
+        template_kafka_key_password: "{{ kafka_key_password }}"
       when: use_tls_and_ssl
     - template:
         src: "templates/kafka.service"

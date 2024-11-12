@@ -13,11 +13,11 @@
 #
 
 # SSL Settings
-ssl.keystore.location={{ kafka_keystore_path }}
-ssl.keystore.password={{ kafka_keystore_password }}
-ssl.key.password={{ kafka_key_password }}
-ssl.truststore.location={{ kafka_truststore_path }}
-ssl.truststore.password={{ kafka_truststore_password }}
+ssl.keystore.location={{ template_kafka_keystore_path }}
+ssl.keystore.password={{ template_kafka_keystore_password }}
+ssl.key.password={{ template_kafka_key_password }}
+ssl.truststore.location={{ template_kafka_truststore_path }}
+ssl.truststore.password={{ template_kafka_truststore_password }}
 
 # SASL Authentication
 security.protocol=SASL_SSL
