@@ -446,6 +446,8 @@
   hosts: client
   connection: ssh
   become: true
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - file: path=/opt/benchmark state=absent
       tags: [client-code]
@@ -469,6 +471,20 @@
         regexp: '^  bootstrap.servers='
         line: '  bootstrap.servers={{ bootstrapServers }}'
       with_items: '{{ drivers_list.stdout_lines }}'
+      tags: [client-code]
+
+    - name: Configure SSL/SASL settings in client driver configuration
+      blockinfile:
+        path: "{{ item }}"
+        marker: "# {mark} SSL and SASL Configurations"
+        content: |
+          security.protocol=SASL_SSL
+          ssl.truststore.location=/opt/client/ssl/client-truststore.jks
+          ssl.truststore.password={{ client_truststore_password }}
+          sasl.mechanism=PLAIN
+          sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin";
+      with_items: "{{ drivers_list.stdout_lines }}"
+      when: use_tls_and_ssl
       tags: [client-code]
 
     - name: Get list of gateway driver config files
