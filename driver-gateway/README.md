@@ -15,12 +15,13 @@ Pre-requisites:
 4. Initialize terraform with `terraform init`
 5. Create the infrastructure with `terraform apply`
    1. You can change the value of num_instances using -var='num_instances={"client"=5, "gateway"=4, "kafka"=2}'
-   2. You might also need to change the AWS profile with -var='aws_profile=your_profile'
+   2. You might also need to change the AWS profile with -var='profile=your_profile'
    3. With SSO the session does expire so you might need to run `aws sso login --profile your_profile` before running terraform
 6. Export your harbor creds https://harbor.cdkt.dev/
    1. Click your name in the top right corner and select User Profile then take your username and CLI secret
    2. export REGISTRY_USERNAME=<registry login>
    3. export REGISTRY_PASSWORD=<registry api token>
+   4. export GATEWAY_IMAGE=harbor.cdkt.dev/conduktor/conduktor-gateway:latest
 7. Setup nodes with `ansible-playbook --user ec2-user --inventory-file inventory.ini deploy.yaml`
    1. If you want to set tls and use delegated_sasl_ssl run `ansible-playbook --user ec2-user --inventory-file inventory.ini deploy.yaml -e "use_tls_and_ssl=true"`
 8. Connect to one benchmark worker node with `ssh -i ~/.ssh/kafka_aws ec2-user@$(terraform output client_ssh_host | tr -d '"')`
