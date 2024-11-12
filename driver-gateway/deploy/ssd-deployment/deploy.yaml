@@ -185,9 +185,9 @@
     - ./ansible-vars.yml
     - ./tf_ansible_vars_file.yml
   tasks:
-    - name: Generate certificates for Kafka and Conduktor Gateway
-      when: use_tls_and_ssl
-      block:
+  - name: Generate certificates for Kafka and Conduktor Gateway
+    when: use_tls_and_ssl
+    block:
       - name: Generate CA private key and certificate (if not exists)
         command: >
           openssl req -new -x509 -keyout /tmp/ca-key.pem -out /tmp/ca-cert.pem -days 365 -nodes
@@ -209,54 +209,70 @@
           mode: '0755'
         when: "'kafka' in group_names"
 
-      - name: Generate Kafka private key and CSR
+      - name: Generate Kafka private key and CSR (if key does not exist)
         command: >
           openssl req -new -newkey rsa:2048 -nodes -keyout /opt/kafka/config/kafka-key.pem
           -out /opt/kafka/config/kafka.csr -subj "/CN=kafka-server/O=Conduktor/C=UK"
+        args:
+          creates: /opt/kafka/config/kafka-key.pem
         when: "'kafka' in group_names"
 
-      - name: Sign Kafka CSR with CA certificate
+      - name: Sign Kafka CSR with CA certificate (if not already signed)
         command: >
           openssl x509 -req -in /opt/kafka/config/kafka.csr -CA /tmp/ca-cert.pem
           -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/kafka/config/kafka-cert.pem -days 365
+        args:
+          creates: /opt/kafka/config/kafka-cert.pem
         when: "'kafka' in group_names"
 
-      - name: Import CA certificate to Kafka truststore
+      - name: Import CA certificate to Kafka truststore (if not exists)
         command: >
           keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot
           -import -file /tmp/ca-cert.pem -storepass "{{ kafka_truststore_password }}" -noprompt
+        args:
+          creates: /opt/kafka/config/kafka-server.truststore.jks
         when: "'kafka' in group_names"
 
-      - name: Import Kafka certificate and key to Kafka keystore
+      - name: Import Kafka certificate and key to Kafka keystore (if not exists)
         command: >
           keytool -importkeystore -srckeystore /opt/kafka/config/kafka-cert.pem
           -destkeystore /opt/kafka/config/kafka-server.keystore.jks
           -srcalias kafka-server -destalias kafka-server -srcstorepass "{{ kafka_keystore_password }}"
+        args:
+          creates: /opt/kafka/config/kafka-server.keystore.jks
         when: "'kafka' in group_names"
 
-      - name: Generate Gateway private key and CSR
+      - name: Generate Gateway private key and CSR (if key does not exist)
         command: >
           openssl req -new -newkey rsa:2048 -nodes -keyout /opt/conduktor-gateway/ssl/gateway-key.pem
           -out /opt/conduktor-gateway/ssl/gateway.csr -subj "/CN=gateway-server/O=Conduktor/C=UK"
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway-key.pem
         when: "'gateway' in group_names"
 
-      - name: Sign Gateway CSR with CA certificate
+      - name: Sign Gateway CSR with CA certificate (if not already signed)
         command: >
           openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr -CA /tmp/ca-cert.pem
           -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem -days 365
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway-cert.pem
         when: "'gateway' in group_names"
 
-      - name: Import CA certificate to Gateway truststore
+      - name: Import CA certificate to Gateway truststore (if not exists)
         command: >
           keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks -alias CARoot
           -import -file /tmp/ca-cert.pem -storepass "{{ gateway_truststore_password }}" -noprompt
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway_truststore.jks
         when: "'gateway' in group_names"
 
-      - name: Import Gateway certificate and key to Gateway keystore
+      - name: Import Gateway certificate and key to Gateway keystore (if not exists)
         command: >
           keytool -importkeystore -srckeystore /opt/conduktor-gateway/ssl/gateway-cert.pem
           -destkeystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
           -srcalias gateway-server -destalias gateway-server -srcstorepass "{{ gateway_keystore_password }}"
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway_keystore.jks
         when: "'gateway' in group_names"
 
 - name: Setup Kafka
@@ -350,13 +366,18 @@
         password: "{{ lookup('ansible.builtin.env', 'REGISTRY_PASSWORD') }}"
 
     - name: Set base volume mounts for Gateway
+      when: not use_tls_and_ssl
       set_fact:
         gateway_volumes:
           - "/opt/gateway-interceptors.json:/opt/interceptors.json"
-    - name: Add TLS volume mounts to Gateway if enabled
-      set_fact:
-        gateway_volumes: "{{ gateway_volumes + [ lookup('template', 'gateway_volumes.j2').splitlines() ] | flatten }}"
+
+    - name: Set base volume mounts for Gateway with TLS
       when: use_tls_and_ssl
+      set_fact:
+        gateway_volumes:
+          - "/opt/gateway-interceptors.json:/opt/interceptors.json"
+          - "/opt/conduktor-gateway/ssl/gateway_keystore.jks:/etc/conduktor-gateway/keystore.jks"
+          - "/opt/conduktor-gateway/ssl/gateway_truststore.jks:/etc/conduktor-gateway/truststore.jks"
 
     - name: Set base environment variables for Gateway
       set_fact:
