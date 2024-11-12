@@ -1,6 +1,8 @@
-SECURITY_PROTOCOL: "SASL_SSL"
-SSL_TRUSTSTORE_LOCATION: "/etc/conduktor-gateway/truststore.jks"
-SSL_TRUSTSTORE_PASSWORD: "{{ gateway_truststore_password }}"
-SSL_KEYSTORE_LOCATION: "/etc/conduktor-gateway/keystore.jks"
-SSL_KEYSTORE_PASSWORD: "{{ gateway_keystore_password }}"
-SSL_KEY_PASSWORD: "{{ gateway_key_password }}"
+GATEWAY_SECURITY_PROTOCOL: DELEGATED_SASL_SSL
+KAFKA_SASL_MECHANISM: "SCRAM-SHA-256"
+KAFKA_SECURITY_PROTOCOL: SSL
+KAFKA_SSL_TRUSTSTORE_LOCATION: "/etc/conduktor-gateway/truststore.jks"
+KAFKA_SSL_TRUSTSTORE_PASSWORD: "{{ gateway_truststore_password }}"
+KAFKA_SSL_KEYSTORE_LOCATION: "/etc/conduktor-gateway/keystore.jks"
+KAFKA_SSL_KEYSTORE_PASSWORD: "{{ gateway_keystore_password }}"
+KAFKA_SSL_KEY_PASSWORD: "{{ gateway_key_password }}"
