@@ -1,0 +1,11 @@
+# vars.yml
+use_tls_and_ssl: false
+kafka_truststore_password: "admin123"
+kafka_keystore_password:  "admin123"
+kafka_key_password: "admin123"
+gateway_truststore_password: "admin123"
+gateway_keystore_password: "admin123"
+gateway_key_password: "admin123"
+client_truststore_password: "admin123"
+client_keystore_password: "admin123"
+client_key_password: "admin123"

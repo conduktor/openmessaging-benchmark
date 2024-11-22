@@ -1,4 +1,4 @@
-#
+---
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,6 +16,8 @@
   hosts: all
   gather_facts: no # important
   tags: [always]
+  vars_files:
+    - ./tf_ansible_vars_file.yml
   tasks:
     - name: Wait for all instances to become reachable
       wait_for_connection:
@@ -99,6 +101,8 @@
   hosts: all
   connection: ssh
   become: true
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - name: Install RPM packages
       yum: pkg={{ item }} state=installed
@@ -119,7 +123,7 @@
         gatewayServers: "{{ groups['gateway'] | map('extract', hostvars, ['private_ip']) | map('regex_replace', '^(.*)$', '\\1:6969') | join(',') }}"
         privateIp: "{{ hostvars[inventory_hostname]['ansible_default_ipv4']['address'] }}"
         kafkaVersion: "3.6.1"
-      tags: [ always, client-code ]
+      tags: [always, client-code]
     - debug:
         msg: "zookeeper servers: {{ zookeeperServers }}\nbootstrap servers: {{ bootstrapServers }}\ngateway servers: {{ gatewayServers }}"
     - name: Change locale to en_US.utf-8
@@ -132,6 +136,8 @@
   connection: ssh
   become: true
   tags: [kafka]
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - file: path=/opt/kafka state=absent
     - file: path=/opt/kafka state=directory
@@ -141,7 +147,6 @@
         remote_src: yes
         dest: /opt/kafka
         extra_opts: ["--strip-components=1"]
-
 
 - name: Setup ZooKeeper
   hosts: zookeeper
@@ -173,11 +178,110 @@
         daemon_reload: yes
         name: "zookeeper"
 
+# Set up TLS for Client, Gateway, and Kafka
+- name: Generate CA and certificates
+  hosts: [kafka, gateway, client]
+  become: true
+  vars_files:
+    - ./ansible-vars.yml
+  tasks:
+  - name: Generate CA private key and certificate if not exist
+    command: >
+      openssl req -new -x509 -keyout /tmp/ca-key.pem -out /tmp/ca-cert.pem -days 365 -nodes
+      -subj "/CN=MyKafkaCA/O=Conduktor/C=UK"
+    args:
+      creates: /tmp/ca-cert.pem
+  # Gateway Certificate and Truststore Setup
+  - name: Generate certificates for Gateway
+    when: "'gateway' in group_names and use_tls_and_ssl"
+    block:
+      - name: Create SSL directory for Gateway
+        file:
+          path: /opt/conduktor-gateway/ssl
+          state: directory
+          mode: '0755'
+      - name: Generate Gateway private key and CSR if not exist
+        command: >
+          openssl req -new -newkey rsa:2048 -nodes -keyout /opt/conduktor-gateway/ssl/gateway-key.pem
+          -out /opt/conduktor-gateway/ssl/gateway.csr -subj "/CN=gateway-server/O=Conduktor/C=UK"
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway-key.pem
+      - name: Sign Gateway CSR with CA certificate
+        command: >
+          openssl x509 -req -in /opt/conduktor-gateway/ssl/gateway.csr -CA /tmp/ca-cert.pem
+          -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/conduktor-gateway/ssl/gateway-cert.pem -days 365
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway-cert.pem
+      - name: Import CA certificate to Gateway truststore
+        command: >
+          keytool -keystore /opt/conduktor-gateway/ssl/gateway_truststore.jks -alias CARoot
+          -import -file /tmp/ca-cert.pem -storepass "{{ gateway_truststore_password }}" -noprompt
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway_truststore.jks
+      - name: Import Gateway certificate and key to Gateway keystore
+        command: >
+          keytool -importkeystore -srckeystore /opt/conduktor-gateway/ssl/gateway-cert.pem
+          -destkeystore /opt/conduktor-gateway/ssl/gateway_keystore.jks
+          -srcalias gateway-server -destalias gateway-server -srcstorepass "{{ gateway_keystore_password }}"
+        args:
+          creates: /opt/conduktor-gateway/ssl/gateway_keystore.jks
+  # Kafka Certificate and Truststore Setup
+  - name: Generate certificates for Kafka
+    when: "'kafka' in group_names and use_tls_and_ssl"
+    block:
+      - name: Create SSL directory for Kafka
+        file:
+          path: /opt/kafka/config
+          state: directory
+          mode: '0755'
+      - name: Generate Kafka private key and CSR if not exist
+        command: >
+          openssl req -new -newkey rsa:2048 -nodes -keyout /opt/kafka/config/kafka-key.pem
+          -out /opt/kafka/config/kafka.csr -subj "/CN=kafka-server/O=Conduktor/C=UK"
+        args:
+          creates: /opt/kafka/config/kafka-key.pem
+      - name: Sign Kafka CSR with CA certificate
+        command: >
+          openssl x509 -req -in /opt/kafka/config/kafka.csr -CA /tmp/ca-cert.pem
+          -CAkey /tmp/ca-key.pem -CAcreateserial -out /opt/kafka/config/kafka-cert.pem -days 365
+        args:
+          creates: /opt/kafka/config/kafka-cert.pem
+      - name: Import CA certificate to Kafka truststore
+        command: >
+          keytool -keystore /opt/kafka/config/kafka-server.truststore.jks -alias CARoot
+          -import -file /tmp/ca-cert.pem -storepass "{{ kafka_truststore_password }}" -noprompt
+        args:
+          creates: /opt/kafka/config/kafka-server.truststore.jks
+      - name: Import Kafka certificate and key to Kafka keystore
+        command: >
+          keytool -importkeystore -srckeystore /opt/kafka/config/kafka-cert.pem
+          -destkeystore /opt/kafka/config/kafka-server.keystore.jks
+          -srcalias kafka-server -destalias kafka-server -srcstorepass "{{ kafka_keystore_password }}"
+        args:
+          creates: /opt/kafka/config/kafka-server.keystore.jks
+  # Client Certificate and Truststore Setup
+  - name: Configure Client for TLS
+    when: "'client' in group_names and use_tls_and_ssl"
+    block:
+      - name: Create SSL directory for Client
+        file:
+          path: /opt/client/ssl
+          state: directory
+          mode: '0755'
+      - name: Import Gateway CA certificate to Client truststore
+        command: >
+          keytool -keystore /opt/client/ssl/client-truststore.jks -alias CARoot
+          -import -file /tmp/ca-cert.pem -storepass "{{ client_truststore_password }}" -noprompt
+        args:
+          creates: /opt/client/ssl/client-truststore.jks
+
 - name: Setup Kafka
   hosts: kafka
   connection: ssh
   become: true
   tags: [kafka]
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - set_fact:
         brokerId: "{{ groups['kafka'].index(inventory_hostname) }}"
@@ -185,6 +289,18 @@
       template:
         src: "templates/server.properties"
         dest: "/opt/kafka/config/server.properties"
+      when: not use_tls_and_ssl
+    - name: Configure Kafka SSL with SASL
+      template:
+        src: templates/server_ssl.properties.j2
+        dest: /opt/kafka/config/server_ssl.properties
+      vars:
+        template_kafka_truststore_path: /opt/kafka/config/kafka-server.truststore.jks
+        template_kafka_truststore_password: "{{ kafka_truststore_password }}"
+        template_kafka_keystore_path: /opt/kafka/config/kafka-server.keystore.jks
+        template_kafka_keystore_password: "{{ kafka_keystore_password }}"
+        template_kafka_key_password: "{{ kafka_key_password }}"
+      when: use_tls_and_ssl
     - template:
         src: "templates/kafka.service"
         dest: "/etc/systemd/system/kafka.service"
@@ -201,6 +317,7 @@
   tags: [gateway]
   vars_files:
     - ./tf_ansible_vars_file.yml
+    - ./ansible-vars.yml
   tasks:
     - name: Check mandatory variables imported from Terraform
       assert:
@@ -247,15 +364,24 @@
         registry_url: "{{ lookup('ansible.builtin.env', 'REGISTRY_URL', default='harbor.cdkt.dev') }}"
         username:  "{{ lookup('ansible.builtin.env', 'REGISTRY_USERNAME') }}"
         password: "{{ lookup('ansible.builtin.env', 'REGISTRY_PASSWORD') }}"
-    - name: "Gateway container"
-      community.docker.docker_container:
-        name: gateway
-        state: started
-        image: "{{ lookup('ansible.builtin.env', 'GATEWAY_IMAGE', default='conduktor/conduktor-gateway:3.0.4') }}"
-        restart_policy: on-failure
-        volumes:
+
+    - name: Set base volume mounts for Gateway
+      when: not use_tls_and_ssl
+      set_fact:
+        gateway_volumes:
           - "/opt/gateway-interceptors.json:/opt/interceptors.json"
-        env:
+
+    - name: Set base volume mounts for Gateway with TLS
+      when: use_tls_and_ssl
+      set_fact:
+        gateway_volumes:
+          - "/opt/gateway-interceptors.json:/opt/interceptors.json"
+          - "/opt/conduktor-gateway/ssl/gateway_keystore.jks:/etc/conduktor-gateway/keystore.jks"
+          - "/opt/conduktor-gateway/ssl/gateway_truststore.jks:/etc/conduktor-gateway/truststore.jks"
+
+    - name: Set base environment variables for Gateway
+      set_fact:
+        gateway_env:
           LOG4J2_IO_CONDUKTOR_PROXY_SERVICE_LEVEL: "DEBUG"
           LOG4J2_IO_CONDUKTOR_PROXY_NETWORK_LEVEL: "DEBUG"
           LOG4J2_IO_NETTY_LEVEL: "INFO"
@@ -268,6 +394,20 @@
           ENCRYPT_SECRET_KEY: "{{ lookup('ansible.builtin.env', 'ENCRYPT_SECRET_KEY') }}"
           GATEWAY_INTERCEPTOR_CONFIG_LOCATION: "/opt/interceptors.json"
           GATEWAY_ADMIN_API_USERS: "[{username: admin, password: conduktor, admin: true}]"
+
+    - name: Add TLS environment variables to Gateway if enabled
+      set_fact:
+        gateway_env: "{{ gateway_env | combine(lookup('template', 'gateway_env.j2') | from_yaml) }}"
+      when: use_tls_and_ssl
+
+    - name: "Gateway container"
+      community.docker.docker_container:
+        name: gateway
+        state: started
+        image: "{{ lookup('ansible.builtin.env', 'GATEWAY_IMAGE', default='conduktor/conduktor-gateway:latest') }}"
+        restart_policy: on-failure
+        volumes: "{{ gateway_volumes }}"
+        env: "{{ gateway_env }}"
         published_ports:
           - "8888:8888"
           - "6969:6969"
@@ -307,6 +447,8 @@
   hosts: client
   connection: ssh
   become: true
+  vars_files:
+    - ./ansible-vars.yml
   tasks:
     - name: Install pygal
       pip:
@@ -336,6 +478,20 @@
       with_items: '{{ drivers_list.stdout_lines }}'
       tags: [client-code]
 
+    - name: Configure SSL/SASL settings in client driver configuration
+      blockinfile:
+        path: "{{ item }}"
+        marker: "# {mark} SSL and SASL Configurations"
+        content: |
+          security.protocol=SASL_SSL
+          ssl.truststore.location=/opt/client/ssl/client-truststore.jks
+          ssl.truststore.password={{ client_truststore_password }}
+          sasl.mechanism=PLAIN
+          sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin";
+      with_items: "{{ drivers_list.stdout_lines }}"
+      when: use_tls_and_ssl
+      tags: [client-code]
+
     - name: Get list of gateway driver config files
       raw: ls -1 /opt/benchmark/driver-gateway/gateway-*.yaml
       register: gateway_drivers_list
@@ -347,7 +503,7 @@
         regexp: '^  bootstrap.servers='
         line: '  bootstrap.servers={{ gatewayServers }}'
       with_items: '{{ gateway_drivers_list.stdout_lines }}'
-      tags: [ client-code ]
+      tags: [client-code]
 
     - name: Get list of jms driver config files
       raw: ls -1 /opt/benchmark/driver-jms/kafka*.yaml
@@ -394,7 +550,7 @@
         name: "benchmark-worker"
       tags: [client-code]
 
-- name:  Hosts addresses
+- name: Hosts addresses
   hosts: localhost
   become: false
   tasks:
