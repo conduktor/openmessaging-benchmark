@@ -1,11 +1,17 @@
 # vars.yml
+# SSL/TLS Configuration
 use_tls_and_ssl: false
-kafka_truststore_password: "admin123"
-kafka_keystore_password:  "admin123"
-kafka_key_password: "admin123"
-gateway_truststore_password: "admin123"
-gateway_keystore_password: "admin123"
-gateway_key_password: "admin123"
-client_truststore_password: "admin123"
-client_keystore_password: "admin123"
-client_key_password: "admin123"
+kafka_truststore_password: "truststore123"
+kafka_keystore_password: "keystore123"
+kafka_key_password: "key123"
+gateway_truststore_password: "gtrust123"
+gateway_keystore_password: "gkey123"
+gateway_key_password: "gkey123"
+client_truststore_password: "ctrust123"
+client_keystore_password: "ckey123"
+client_key_password: "ckey123"
+
+# SSL/TLS Paths
+kafka_ssl_dir: "/opt/kafka/ssl"
+gateway_ssl_dir: "/etc/conduktor-gateway/ssl"
+client_ssl_dir: "/opt/client/ssl"

@@ -13,19 +13,24 @@
 #
 
 # SSL Settings
-ssl.keystore.location={{ template_kafka_keystore_path }}
-ssl.keystore.password={{ template_kafka_keystore_password }}
-ssl.key.password={{ template_kafka_key_password }}
-ssl.truststore.location={{ template_kafka_truststore_path }}
-ssl.truststore.password={{ template_kafka_truststore_password }}
+ssl.keystore.location={{ kafka_ssl_dir }}/keystore.jks
+ssl.keystore.password={{ kafka_keystore_password }}
+ssl.key.password={{ kafka_key_password }}
+ssl.truststore.location={{ kafka_ssl_dir }}/truststore.jks
+ssl.truststore.password={{ kafka_truststore_password }}
+ssl.client.auth=required
+ssl.endpoint.identification.algorithm=
 
 # SASL Authentication
 security.protocol=SASL_SSL
-sasl.enabled.mechanisms=PLAIN
-sasl.mechanism.inter.broker.protocol=PLAIN
-advertised.listeners=SASL_SSL://{{ privateIp }}:9094
-security.inter.broker.protocol=ASL_SSL
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="admin";
+sasl.enabled.mechanisms=SCRAM-SHA-256
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-256
+listeners=SASL_SSL://{{ privateIp }}:9092
+advertised.listeners=SASL_SSL://{{ privateIp }}:9092
+security.inter.broker.protocol=SASL_SSL
+
+# SASL SCRAM Configuration
+listener.name.sasl_ssl.scram-sha-256.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required;
 
 # Kafka Broker Config
 broker.id={{ brokerId }}

@@ -1,8 +1,14 @@
+# Gateway Security Configuration
 GATEWAY_SECURITY_PROTOCOL: DELEGATED_SASL_SSL
+GATEWAY_SSL_KEYSTORE_LOCATION: "{{ gateway_ssl_dir }}/keystore.jks"
+GATEWAY_SSL_KEYSTORE_PASSWORD: "{{ gateway_keystore_password }}"
+GATEWAY_SSL_KEY_PASSWORD: "{{ gateway_key_password }}"
+
+# Kafka Connection Configuration
 KAFKA_SASL_MECHANISM: "SCRAM-SHA-256"
-KAFKA_SECURITY_PROTOCOL: SSL
-KAFKA_SSL_TRUSTSTORE_LOCATION: "/etc/conduktor-gateway/truststore.jks"
+KAFKA_SECURITY_PROTOCOL: SASL_SSL
+KAFKA_SSL_TRUSTSTORE_LOCATION: "{{ gateway_ssl_dir }}/kafka-truststore.jks"
 KAFKA_SSL_TRUSTSTORE_PASSWORD: "{{ gateway_truststore_password }}"
-KAFKA_SSL_KEYSTORE_LOCATION: "/etc/conduktor-gateway/keystore.jks"
+KAFKA_SSL_KEYSTORE_LOCATION: "{{ gateway_ssl_dir }}/kafka-keystore.jks"
 KAFKA_SSL_KEYSTORE_PASSWORD: "{{ gateway_keystore_password }}"
 KAFKA_SSL_KEY_PASSWORD: "{{ gateway_key_password }}"
