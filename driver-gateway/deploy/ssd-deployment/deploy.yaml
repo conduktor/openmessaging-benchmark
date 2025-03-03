@@ -108,6 +108,7 @@
       yum: pkg={{ item }} state=installed
       with_items:
         - python3
+        - python3-pip
         - wget
         - java-17-openjdk
         - sysstat
@@ -394,8 +395,8 @@
     - name: Set base environment variables for Gateway
       set_fact:
         gateway_env:
-          LOG4J2_IO_CONDUKTOR_PROXY_SERVICE_LEVEL: "DEBUG"
-          LOG4J2_IO_CONDUKTOR_PROXY_NETWORK_LEVEL: "DEBUG"
+          LOG4J2_IO_CONDUKTOR_PROXY_SERVICE_LEVEL: "INFO"
+          LOG4J2_IO_CONDUKTOR_PROXY_NETWORK_LEVEL: "INFO"
           LOG4J2_IO_NETTY_LEVEL: "INFO"
           KAFKA_BOOTSTRAP_SERVERS: "{{ bootstrapServers }}"
           GATEWAY_ADVERTISED_HOST: "{{ privateIp }}"
@@ -462,6 +463,10 @@
   vars_files:
     - ./ansible-vars.yml
   tasks:
+    - name: Install pygal
+      pip:
+        name: pygal
+        state: present
     - file: path=/opt/benchmark state=absent
       tags: [client-code]
     - name: Copy benchmark code
