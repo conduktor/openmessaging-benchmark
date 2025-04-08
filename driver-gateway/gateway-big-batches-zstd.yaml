@@ -13,7 +13,7 @@
 #
 
 
-name: Gateway Latency
+name: Gateway Big Batch ZSTD
 driverClass: io.openmessaging.benchmark.driver.gateway.KafkaBenchmarkDriver
 
 # Kafka client-specific configuration
@@ -23,12 +23,13 @@ topicConfig: |
   min.insync.replicas=2
 
 commonConfig: |
-  bootstrap.servers=conduktor-gateway:6969
+  bootstrap.servers=localhost:9092
 
 producerConfig: |
   acks=all
   linger.ms=1
-  batch.size=131072
+  batch.size=1048576
+  compression.type=zstd
 
 consumerConfig: |
   auto.offset.reset=earliest
