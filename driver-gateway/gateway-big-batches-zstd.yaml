@@ -28,7 +28,7 @@ commonConfig: |
 producerConfig: |
   acks=all
   linger.ms=200
-  batch.size=1048576
+  batch.size=548576
   compression.type=zstd
 
 consumerConfig: |
