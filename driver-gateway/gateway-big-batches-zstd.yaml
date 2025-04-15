@@ -17,10 +17,10 @@ name: Gateway Big Batch ZSTD
 driverClass: io.openmessaging.benchmark.driver.gateway.KafkaBenchmarkDriver
 
 # Kafka client-specific configuration
-replicationFactor: 3
+replicationFactor: 1
 
 topicConfig: |
-  min.insync.replicas=2
+  min.insync.replicas=1
 
 commonConfig: |
   bootstrap.servers=localhost:9092
@@ -28,7 +28,7 @@ commonConfig: |
 producerConfig: |
   acks=all
   linger.ms=200
-  batch.size=548576
+  batch.size=1048576
   compression.type=zstd
 
 consumerConfig: |
