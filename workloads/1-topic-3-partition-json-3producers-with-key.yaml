@@ -22,6 +22,6 @@ keyDistributor: "KEY_ROUND_ROBIN"
 subscriptionsPerTopic: 1
 consumerPerSubscription: 1
 producersPerTopic: 3
-producerRate: 50
+producerRate: 100
 consumerBacklogSizeGB: 0
-testDurationMinutes: 2
+testDurationMinutes: 15
