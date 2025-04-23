@@ -45,7 +45,7 @@
       "topic": "gatewaykms-fe.*",
       "recordValue": {
         "payload": {
-          "keySecretId": "gateway-kms://fe-username-{{record.key}}",
+          "keySecretId": "gateway-kms://fe-username-{% raw %}{{record.key}}{% endraw %}",
           "algorithm": "AES128_GCM"
         }
       },
@@ -93,17 +93,17 @@
         "fields": [
           {
             "fieldName": "password",
-            "keySecretId": "gateway-kms://fle-username-{{record.key}}",
+            "keySecretId": "gateway-kms://fle-username-{% raw %}{{record.key}}{% endraw %}",
             "algorithm": "AES128_GCM"
           },
           {
             "fieldName": "visa",
-            "keySecretId": "gateway-kms://fle-username-{{record.key}}",
+            "keySecretId": "gateway-kms://fle-username-{% raw %}{{record.key}}{% endraw %}",
             "algorithm": "AES128_GCM"
           },
           {
             "fieldName": "mobile",
-            "keySecretId": "gateway-kms://fle-username-{{record.key}}",
+            "keySecretId": "gateway-kms://fle-username-{% raw %}{{record.key}}{% endraw %}",
             "algorithm": "AES128_GCM"
           }
         ]
