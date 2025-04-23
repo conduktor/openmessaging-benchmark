@@ -12,14 +12,27 @@
 # limitations under the License.
 #
 
-ansible==9.7.0
-ansible-core==2.16.8
----
-collections:
-  - name: community.general
-    version: 9.1.0
-  - name: ansible.posix
-    version: 1.5.4
-  - name: community.docker
-    version: 3.10.4
 
+name: Gateway Latency Field Level Encryption
+driverClass: io.openmessaging.benchmark.driver.gateway.KafkaBenchmarkDriver
+
+# Kafka client-specific configuration
+replicationFactor: 3
+
+topicPrefix: gatewaykms-fe
+
+topicConfig: |
+  min.insync.replicas=2
+
+commonConfig: |
+  bootstrap.servers=conduktor-gateway:6969
+
+producerConfig: |
+  acks=all
+  linger.ms=1
+  batch.size=131072
+
+consumerConfig: |
+  auto.offset.reset=earliest
+  enable.auto.commit=false
+  max.partition.fetch.bytes=10485760

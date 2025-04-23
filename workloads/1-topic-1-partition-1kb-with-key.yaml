@@ -12,14 +12,16 @@
 # limitations under the License.
 #
 
-ansible==9.7.0
-ansible-core==2.16.8
----
-collections:
-  - name: community.general
-    version: 9.1.0
-  - name: ansible.posix
-    version: 1.5.4
-  - name: community.docker
-    version: 3.10.4
+name: 1 topic / 1 partition / 1Kb
 
+topics: 1
+partitionsPerTopic: 1
+keyDistributor: "KEY_ROUND_ROBIN"
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+producerRate: 50
+consumerBacklogSizeGB: 0
+testDurationMinutes: 15
