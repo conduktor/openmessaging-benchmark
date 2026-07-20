@@ -27,18 +27,24 @@ class RateController {
     private final long receiveBacklogLimit;
     private final double minRampingFactor;
     private final double maxRampingFactor;
+    private final double warmupRateFraction;
 
     @Getter(PACKAGE)
     private double rampingFactor;
 
     private long previousTotalPublished = 0;
     private long previousTotalReceived = 0;
+    private boolean warmedUp = false;
 
     RateController() {
         publishBacklogLimit = Env.getLong("PUBLISH_BACKLOG_LIMIT", 1_000);
         receiveBacklogLimit = Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
         minRampingFactor = Env.getDouble("MIN_RAMPING_FACTOR", 0.01);
         maxRampingFactor = Env.getDouble("MAX_RAMPING_FACTOR", 1);
+        // Fraction of the offered rate the producer must reach before the controller starts
+        // adjusting. Until then the rate is HELD (see nextRate) so a still-starting producer
+        // isn't mistaken for a saturated one. 0 disables the guard (legacy behaviour).
+        warmupRateFraction = Env.getDouble("WARMUP_RATE_FRACTION", 0.5);
         rampingFactor = maxRampingFactor;
     }
 
@@ -56,6 +62,19 @@ class RateController {
                     rate,
                     rate(published, periodNanos),
                     rate(received, periodNanos));
+        }
+
+        // Startup guard: hold the offered rate until the producer has proven it can sustain it at
+        // least once. A control window sampled while the producer is still starting sees
+        // published << expected; treating that as saturation would crater the rate toward 0, from
+        // which the multiplicative ramp (rate + rate*factor) cannot recover — the observed encrypt
+        // finder collapse to ~1 msg/s. Once warmed, backoffs settle at the real achieved rate.
+        if (!warmedUp) {
+            if (published >= (long) (expected * warmupRateFraction)) {
+                warmedUp = true;
+            } else {
+                return rate;
+            }
         }
 
         long receiveBacklog = totalPublished - totalReceived;
