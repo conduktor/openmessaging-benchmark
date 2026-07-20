@@ -56,13 +56,14 @@ class RateController {
         previousTotalPublished = totalPublished;
         previousTotalReceived = totalReceived;
 
-        if (log.isDebugEnabled()) {
-            log.debug(
-                    "Current rate: {} -- Publish rate {} -- Receive Rate: {}",
-                    rate,
-                    rate(published, periodNanos),
-                    rate(received, periodNanos));
-        }
+        // DIAGNOSTIC: info (not debug) so the finder trajectory emits regardless of the active
+        // log4j2 config (the slf4j binding is log4j2; debug-level knobs didn't take). Only active
+        // during a producerRate:0 finder, so it's quiet for fixed-rate sweeps/repeats.
+        log.info(
+                "FINDER-TRACE Current rate: {} -- Publish rate {} -- Receive Rate: {}",
+                rate,
+                rate(published, periodNanos),
+                rate(received, periodNanos));
 
         // Startup guard: hold the offered rate until the producer has proven it can sustain it at
         // least once. A control window sampled while the producer is still starting sees
@@ -93,7 +94,7 @@ class RateController {
     }
 
     private double nextRate(long periodNanos, long actual, long expected, long backlog, String type) {
-        log.debug("{} backlog: {}", type, backlog);
+        log.info("FINDER-TRACE {} backlog: {} -> backing off", type, backlog);
         rampDown();
         long nextExpected = Math.max(0, expected - backlog);
         double nextExpectedRate = rate(nextExpected, periodNanos);
