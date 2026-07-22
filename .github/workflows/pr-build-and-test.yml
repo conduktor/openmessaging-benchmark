@@ -3,10 +3,14 @@ name: Build and test
 on:
   pull_request:
     branches:
-      - master
+      - conduktor-gateway
   push:
     branches:
-      - master
+      - conduktor-gateway
+
+permissions:
+  contents: read
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,6 +34,13 @@ jobs:
       - name: Build and Verify
         run: mvn --no-transfer-progress --batch-mode verify
 
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: maven-target
+          path: "**/target/"
+          retention-days: 1
+
       - name: package surefire test results
         if: failure()
         run: |
@@ -43,3 +54,58 @@ jobs:
         with:
           name: test-results
           path: test-results.zip
+
+  publish-image:
+    needs: build
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: maven-target
+          path: .
+
+      - name: Resolve benchmark tarball
+        run: echo "BENCHMARK_TARBALL=$(ls package/target/openmessaging-benchmark-*-bin.tar.gz)" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker multi registries login
+        uses: conduktor/conduktor-actions/docker-multi-registries-login@main
+
+      - name: Docker image metadata
+        id: docker_meta
+        uses: conduktor/conduktor-actions/docker-multi-registries-metadata@main
+        with:
+          tag-harbor: true
+          tag-ghcr: false
+          namespace: conduktor
+          image-names: openmessaging-benchmark
+          tags: |
+            type=ref,event=pr
+            type=raw,value=conduktor-gateway,enable=${{ github.event_name == 'push' }}
+            type=raw,value=conduktor-gateway-${{ github.sha }},enable=${{ github.event_name == 'push' }}
+          labels: |
+            org.opencontainers.image.title=OpenMessaging Benchmark
+            org.opencontainers.image.description=Benchmark suite used to load-test Conduktor Gateway
+            org.opencontainers.image.authors=Conduktor <support@conduktor.io>
+            org.opencontainers.image.vendor=Conduktor.io
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            BENCHMARK_TARBALL=${{ env.BENCHMARK_TARBALL }}
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ github.event_name == 'pull_request' && 'pr' || 'main' }}
+          cache-to: type=gha,scope=${{ github.event_name == 'pull_request' && 'pr' || 'main' }},mode=max
