@@ -1,9 +1,21 @@
 name: Release
+run-name: "Release ${{ inputs.version || github.ref_name }}${{ inputs.dry_run && ' (dry run)' || '' }}"
 
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+        description: Version to simulate, e.g. 1.2.3 or 1.2.3-dryrun
+      dry_run:
+        required: false
+        type: boolean
+        default: true
+        description: Build the image but skip pushing it to GHCR
 
 permissions:
   contents: read
@@ -52,9 +64,9 @@ jobs:
         with:
           images: ghcr.io/conduktor/openmessaging-benchmark
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ inputs.version || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version || github.ref_name }}
+            type=semver,pattern={{major}},value=${{ inputs.version || github.ref_name }}
           labels: |
             org.opencontainers.image.title=OpenMessaging Benchmark
             org.opencontainers.image.description=Benchmark suite used to load-test Conduktor Gateway
@@ -66,7 +78,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          push: true
+          push: ${{ github.event_name == 'push' || inputs.dry_run == false }}
           platforms: linux/amd64,linux/arm64
           build-args: |
             BENCHMARK_TARBALL=${{ env.BENCHMARK_TARBALL }}
