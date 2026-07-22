@@ -12,7 +12,7 @@
 # limitations under the License.
 #
 
-FROM openjdk:8-jdk
+FROM eclipse-temurin:8-jdk
 
 ARG BENCHMARK_TARBALL
 
