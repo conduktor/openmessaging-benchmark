@@ -72,6 +72,11 @@ jobs:
       - name: Resolve benchmark tarball
         run: echo "BENCHMARK_TARBALL=$(ls package/target/openmessaging-benchmark-*-bin.tar.gz)" >> "$GITHUB_ENV"
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -103,7 +108,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           build-args: |
             BENCHMARK_TARBALL=${{ env.BENCHMARK_TARBALL }}
           tags: ${{ steps.docker_meta.outputs.tags }}
