@@ -10,7 +10,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+  packages: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -75,17 +75,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Docker multi registries login
-        uses: conduktor/conduktor-actions/docker-multi-registries-login@main
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker image metadata
         id: docker_meta
-        uses: conduktor/conduktor-actions/docker-multi-registries-metadata@main
+        uses: docker/metadata-action@v5
         with:
-          tag-harbor: true
-          tag-ghcr: false
-          namespace: conduktor
-          image-names: openmessaging-benchmark
+          images: ghcr.io/conduktor/openmessaging-benchmark
           tags: |
             type=ref,event=pr
             type=raw,value=conduktor-gateway,enable=${{ github.event_name == 'push' }}
