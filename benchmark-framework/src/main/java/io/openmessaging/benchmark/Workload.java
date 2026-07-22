@@ -61,6 +61,34 @@ public class Workload {
     public int producerRate;
 
     /**
+     * The following fields only apply when producerRate == 0, i.e. when the generator probes for
+     * the maximum sustainable rate (a "ramp test"). Leave unset to fall back to the existing
+     * env-var / hardcoded defaults.
+     */
+    public RampAlgorithm rampAlgorithm = RampAlgorithm.AIMD;
+
+    /** Initial probe rate for ramp discovery. Defaults to 10000 if unset. */
+    public Integer rampStartRate;
+
+    /** Publish backlog limit used by ramp discovery. Defaults to env PUBLISH_BACKLOG_LIMIT, else 1000. */
+    public Long rampPublishBacklogLimit;
+
+    /** Receive backlog limit used by ramp discovery. Defaults to env RECEIVE_BACKLOG_LIMIT, else 1000. */
+    public Long rampReceiveBacklogLimit;
+
+    /** CHOP only: seconds between bracket-phase steps / hold-phase polls. Defaults to 3. */
+    public Integer rampBracketPeriodSeconds;
+
+    /** CHOP only: seconds to hold and verify each candidate rate. Defaults to 30. */
+    public Integer rampHoldSeconds;
+
+    /** CHOP only: relative (hi - lo) / lo band at which to stop chopping. Defaults to 0.05. */
+    public Double rampConvergenceTolerance;
+
+    /** CHOP only: safety cap on total discovery time, in minutes. Defaults to 10. */
+    public Integer rampMaxDiscoveryMinutes;
+
+    /**
      * If the consumer backlog is > 0, the generator will accumulate messages until the requested
      * amount of storage is retained and then it will start the consumers to drain it.
      *

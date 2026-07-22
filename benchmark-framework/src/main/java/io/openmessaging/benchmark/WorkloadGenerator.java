@@ -83,17 +83,20 @@ public class WorkloadGenerator implements AutoCloseable {
             targetPublishRate = workload.producerRate;
         } else {
             // Producer rate is 0 and we need to discover the sustainable rate
-            targetPublishRate = 10000;
+            targetPublishRate =
+                    workload.rampStartRate != null ? workload.rampStartRate.doubleValue() : 10000.0;
 
-            executor.execute(
-                    () -> {
-                        // Run background controller to adjust rate
-                        try {
-                            findMaximumSustainableRate(targetPublishRate);
-                        } catch (IOException e) {
-                            log.warn("Failure in finding max sustainable rate", e);
-                        }
-                    });
+            if (workload.rampAlgorithm == RampAlgorithm.AIMD) {
+                executor.execute(
+                        () -> {
+                            // Run background controller to adjust rate
+                            try {
+                                findMaximumSustainableRate(targetPublishRate);
+                            } catch (IOException e) {
+                                log.warn("Failure in finding max sustainable rate", e);
+                            }
+                        });
+            }
         }
 
         ProducerWorkAssignment producerWorkAssignment = new ProducerWorkAssignment();
@@ -146,6 +149,10 @@ public class WorkloadGenerator implements AutoCloseable {
         }
 
         worker.startLoad(producerWorkAssignment);
+
+        if (workload.producerRate == 0 && workload.rampAlgorithm == RampAlgorithm.CHOP) {
+            runChopDiscovery();
+        }
 
         if (workload.warmupDurationMinutes > 0) {
             log.info("----- Starting warm-up traffic ({}m) ------", workload.warmupDurationMinutes);
@@ -223,7 +230,8 @@ public class WorkloadGenerator implements AutoCloseable {
         int controlPeriodMillis = 3000;
         long lastControlTimestamp = System.nanoTime();
 
-        RateController rateController = new RateController();
+        RateController rateController =
+                new RateController(workload.rampPublishBacklogLimit, workload.rampReceiveBacklogLimit);
 
         while (!runCompleted) {
             // Check every few seconds and adjust the rate
@@ -245,6 +253,49 @@ public class WorkloadGenerator implements AutoCloseable {
                             currentRate, periodNanos, stats.messagesSent, stats.messagesReceived);
             worker.adjustPublishRate(currentRate);
         }
+    }
+
+    /**
+     * Discovers the maximum sustainable rate via bracket + binary-chop + hold-and-verify
+     * (RampAlgorithm.CHOP), blocking until the search converges or hits its safety cap, so that
+     * warmup/measurement start at an already-verified, fixed rate instead of a rate still being
+     * adjusted.
+     */
+    private void runChopDiscovery() throws IOException {
+        int bracketPeriodSeconds =
+                workload.rampBracketPeriodSeconds != null ? workload.rampBracketPeriodSeconds : 3;
+        long pollMillis = TimeUnit.SECONDS.toMillis(bracketPeriodSeconds);
+
+        RampRateFinder finder = new RampRateFinder(workload);
+        worker.adjustPublishRate(finder.getCurrentRate());
+
+        long lastControlTimestamp = System.nanoTime();
+        boolean done = false;
+
+        while (!done && !runCompleted) {
+            try {
+                Thread.sleep(pollMillis);
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            CountersStats stats = worker.getCountersStats();
+            long currentTime = System.nanoTime();
+            long periodNanos = currentTime - lastControlTimestamp;
+            lastControlTimestamp = currentTime;
+
+            done = finder.poll(periodNanos, stats.messagesSent, stats.messagesReceived);
+            worker.adjustPublishRate(finder.getCurrentRate());
+        }
+
+        if (finder.isNonMonotonic()) {
+            log.warn(
+                    "Ramp discovery detected non-monotonic backlog behavior -- {} msg/s may not"
+                            + " reproduce reliably; consider treating it as a band rather than an exact"
+                            + " figure.",
+                    finder.getCurrentRate());
+        }
+        log.info("----- Ramp discovery (CHOP) complete: {} msg/s -----", finder.getCurrentRate());
     }
 
     @Override

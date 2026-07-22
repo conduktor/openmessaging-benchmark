@@ -35,8 +35,18 @@ class RateController {
     private long previousTotalReceived = 0;
 
     RateController() {
-        publishBacklogLimit = Env.getLong("PUBLISH_BACKLOG_LIMIT", 1_000);
-        receiveBacklogLimit = Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
+        this(null, null);
+    }
+
+    RateController(Long publishBacklogLimit, Long receiveBacklogLimit) {
+        this.publishBacklogLimit =
+                publishBacklogLimit != null
+                        ? publishBacklogLimit
+                        : Env.getLong("PUBLISH_BACKLOG_LIMIT", 1_000);
+        this.receiveBacklogLimit =
+                receiveBacklogLimit != null
+                        ? receiveBacklogLimit
+                        : Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
         minRampingFactor = Env.getDouble("MIN_RAMPING_FACTOR", 0.01);
         maxRampingFactor = Env.getDouble("MAX_RAMPING_FACTOR", 1);
         rampingFactor = maxRampingFactor;

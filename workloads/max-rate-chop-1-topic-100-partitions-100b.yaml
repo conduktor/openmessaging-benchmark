@@ -1,0 +1,41 @@
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Max rate (CHOP) 1 producer on 1 topic / 100 partition / 100 bytes
+
+topics: 1
+partitionsPerTopic: 100
+messageSize: 100
+payloadFile: "payload/payload-100b.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+
+# Discover max-sustainable rate using bracket + binary-chop + hold-and-verify instead of the
+# default continuous AIMD controller. Unlike AIMD, this converges to a fixed rate and stops
+# adjusting well before testDurationMinutes elapses, so the measurement window runs at an
+# already-verified rate.
+producerRate: 0
+rampAlgorithm: CHOP
+
+rampStartRate: 5000
+rampPublishBacklogLimit: 1000
+rampReceiveBacklogLimit: 1000
+rampBracketPeriodSeconds: 3
+rampHoldSeconds: 30
+rampConvergenceTolerance: 0.05
+rampMaxDiscoveryMinutes: 10
+
+consumerBacklogSizeGB: 0
+testDurationMinutes: 5
