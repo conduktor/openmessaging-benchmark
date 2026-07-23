@@ -32,6 +32,7 @@ import io.openmessaging.benchmark.worker.commands.TopicSubscription;
 import io.openmessaging.benchmark.worker.commands.TopicsInfo;
 import java.io.IOException;
 import java.text.DecimalFormat;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -56,6 +57,8 @@ public class WorkloadGenerator implements AutoCloseable {
     private volatile boolean needToWaitForBacklogDraining = false;
 
     private volatile double targetPublishRate;
+
+    private RampVerification rampVerification;
 
     public WorkloadGenerator(String driverName, Workload workload, Worker worker) {
         this.driverName = driverName;
@@ -271,6 +274,8 @@ public class WorkloadGenerator implements AutoCloseable {
 
         long lastControlTimestamp = System.nanoTime();
         boolean done = false;
+        boolean wasConfirming = finder.isConfirming();
+        Instant verificationStartedAt = null;
 
         while (!done && !runCompleted) {
             try {
@@ -286,6 +291,25 @@ public class WorkloadGenerator implements AutoCloseable {
 
             done = finder.poll(periodNanos, stats.messagesSent, stats.messagesReceived);
             worker.adjustPublishRate(finder.getCurrentRate());
+
+            if (!wasConfirming && finder.isConfirming()) {
+                verificationStartedAt = Instant.now();
+            }
+            wasConfirming = finder.isConfirming();
+        }
+
+        if (finder.isConfirmed()) {
+            Instant verificationConfirmedAt = Instant.now();
+            rampVerification = new RampVerification();
+            rampVerification.rate = finder.getCurrentRate();
+            rampVerification.startEpochMillis = verificationStartedAt.toEpochMilli();
+            rampVerification.endEpochMillis = verificationConfirmedAt.toEpochMilli();
+            rampVerification.nonMonotonic = finder.isNonMonotonic();
+            log.info(
+                    "----- CHOP verification window: {} -> {} (rate {} msg/s) -----",
+                    verificationStartedAt,
+                    verificationConfirmedAt,
+                    finder.getCurrentRate());
         }
 
         if (finder.isNonMonotonic()) {
@@ -433,6 +457,7 @@ public class WorkloadGenerator implements AutoCloseable {
                         : workload.messageSize;
         result.producersPerTopic = workload.producersPerTopic;
         result.consumersPerTopic = workload.consumerPerSubscription;
+        result.rampVerification = rampVerification;
 
         while (true) {
             try {

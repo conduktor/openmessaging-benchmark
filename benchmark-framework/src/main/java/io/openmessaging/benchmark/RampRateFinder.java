@@ -61,7 +61,14 @@ class RampRateFinder {
 
     @Getter private boolean nonMonotonic = false;
 
+    @Getter(PACKAGE)
     private boolean confirming = false;
+
+    // True only when discovery ended via a genuine two-hold confirm -- never set by the safety
+    // cap or by a rejected confirmation hold, so callers can tell those apart from the outside.
+    @Getter(PACKAGE)
+    private boolean confirmed = false;
+
     private long previousTotalPublished = 0;
     private long elapsedHoldNanos = 0;
     private long totalElapsedNanos = 0;
@@ -180,6 +187,7 @@ class RampRateFinder {
                 return false;
             }
             currentRate = lo;
+            confirmed = true;
             phase = Phase.DONE;
             return true;
         }

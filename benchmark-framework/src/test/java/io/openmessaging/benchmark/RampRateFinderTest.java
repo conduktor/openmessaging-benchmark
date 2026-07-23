@@ -68,6 +68,8 @@ class RampRateFinderTest {
         assertThat(done).isTrue();
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
         assertThat(finder.isNonMonotonic()).isFalse();
+        assertThat(finder.isConfirming()).isTrue();
+        assertThat(finder.isConfirmed()).isTrue();
         // The backlog limit tolerates a small overshoot past true capacity before it's detected,
         // so the discovered rate lands just above 4500, not below it -- assert closeness instead.
         assertThat(Math.abs(4500.0 - finder.getCurrentRate()) / 4500.0).isLessThan(0.05);
@@ -98,6 +100,9 @@ class RampRateFinderTest {
         assertThat(done).isFalse();
         assertThat(finder.getHi()).isEqualTo(1500.0);
         assertThat(finder.getCurrentRate()).isEqualTo((1000.0 + 1500.0) / 2.0);
+        // Tolerance was never met, so the confirmation hold was never entered.
+        assertThat(finder.isConfirming()).isFalse();
+        assertThat(finder.isConfirmed()).isFalse();
     }
 
     @Test
@@ -113,12 +118,16 @@ class RampRateFinderTest {
         finder.poll(periodNanos, 3000, 3000);
         finder.poll(periodNanos, 6000, 6000);
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.CHOP);
+        assertThat(finder.isConfirming()).isFalse();
 
         // Hold at 1500 passes cleanly -- within tolerance (500/1500 = 0.33 <= 0.5), so this
-        // triggers the one-more confirmation hold at the same rate rather than DONE yet.
+        // triggers the one-more confirmation hold at the same rate rather than DONE yet. This is
+        // the poll() call where isConfirming() flips false -> true.
         boolean done = finder.poll(periodNanos, 6000 + 4500, 6000 + 4500);
         assertThat(done).isFalse();
         assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+        assertThat(finder.isConfirming()).isTrue();
+        assertThat(finder.isConfirmed()).isFalse();
 
         // Confirmation hold at the same rate (1500) now shows a backlog breach -- a direct
         // contradiction of the pass just recorded at the same rate.
@@ -127,6 +136,10 @@ class RampRateFinderTest {
         assertThat(done).isTrue();
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
         assertThat(finder.isNonMonotonic()).isTrue();
+        // Rejected on the confirmation hold, not accepted -- confirmed must stay false even
+        // though confirming (the "we were attempting a confirm" flag) is still true.
+        assertThat(finder.isConfirming()).isTrue();
+        assertThat(finder.isConfirmed()).isFalse();
     }
 
     @Test
@@ -148,6 +161,36 @@ class RampRateFinderTest {
         assertThat(done).isTrue();
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
         assertThat(finder.getCurrentRate()).isEqualTo(1000.0);
+        // The safety cap is never a genuine confirm, even though it never contradicted anything.
+        assertThat(finder.isConfirmed()).isFalse();
+    }
+
+    @Test
+    void safetyCapDuringAPendingConfirmationHoldIsNotTreatedAsAConfirm() {
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampHoldSeconds = 30;
+        workload.rampConvergenceTolerance = 0.5;
+        workload.rampMaxDiscoveryMinutes = 1; // 60s cap
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeSystem system = new FakeSystem(1800); // 1500 (candidate) stays clean, 2000 doesn't
+        long periodNanos = SECONDS.toNanos(3);
+
+        // Bracket (2 polls, 6s) -> CHOP mid=1500. First hold (10 polls, 30s, total 36s) passes
+        // and is within tolerance -> confirming flips true at the 12th poll. The confirmation
+        // hold then needs another 30s (total 66s), but the 60s safety cap fires first (20th poll).
+        boolean done = false;
+        for (int i = 0; i < 20 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
+        assertThat(finder.isConfirming()).isTrue();
+        // The confirmation hold was still pending when the safety cap forced completion --
+        // that must not be mistaken for a genuine confirm.
+        assertThat(finder.isConfirmed()).isFalse();
     }
 
     /** A simple producer-limited system: throughput is capped at {@code capacity} msgs/sec. */
