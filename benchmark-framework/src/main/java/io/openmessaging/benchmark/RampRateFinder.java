@@ -36,6 +36,11 @@ class RampRateFinder {
     private static final long ONE_SECOND_IN_NANOS = SECONDS.toNanos(1);
     private static final int MAX_BRACKET_ITERATIONS = 20;
 
+    // Used only as a last resort when a failed confirmation has no prior passing rate below it
+    // to fall back on (history should always have one via the bracket phase, but this keeps the
+    // reopened search bounded even in that edge case).
+    private static final double CONFIRMATION_BACKOFF_FACTOR = 0.9;
+
     enum Phase {
         BRACKET,
         CHOP,
@@ -44,9 +49,11 @@ class RampRateFinder {
 
     private final long publishBacklogLimit;
     private final long receiveBacklogLimit;
+    private final Double maxBacklogSeconds;
     private final long holdNanos;
     private final double convergenceTolerance;
     private final long maxDiscoveryNanos;
+    private final int requiredConfirmationHolds;
 
     @Getter(PACKAGE)
     private Phase phase = Phase.BRACKET;
@@ -73,6 +80,7 @@ class RampRateFinder {
     private long elapsedHoldNanos = 0;
     private long totalElapsedNanos = 0;
     private int bracketIterations = 0;
+    private int confirmationHoldsPassed = 0;
 
     private final List<RateVerdict> history = new ArrayList<>();
 
@@ -87,6 +95,7 @@ class RampRateFinder {
                 workload.rampReceiveBacklogLimit != null
                         ? workload.rampReceiveBacklogLimit.longValue()
                         : Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
+        this.maxBacklogSeconds = workload.rampMaxBacklogSeconds;
         int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 30;
         this.holdNanos = SECONDS.toNanos(holdSeconds);
         this.convergenceTolerance =
@@ -96,6 +105,8 @@ class RampRateFinder {
         int maxDiscoveryMinutes =
                 workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes.intValue() : 10;
         this.maxDiscoveryNanos = MINUTES.toNanos(maxDiscoveryMinutes);
+        this.requiredConfirmationHolds =
+                workload.rampConfirmationHolds != null ? workload.rampConfirmationHolds.intValue() : 1;
     }
 
     // Advances the state machine given the latest period's counters. Returns true when done.
@@ -116,8 +127,17 @@ class RampRateFinder {
         long publishBacklog = expected - published;
         previousTotalPublished = totalPublished;
 
-        boolean backlogExceeded =
-                receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
+        boolean backlogExceeded;
+        if (maxBacklogSeconds != null) {
+            // A limit that scales with the candidate rate, so the predicate is equally strict
+            // at every rate tested during bracket's exponential range -- a fixed message count
+            // is comparatively loose at high rates and comparatively tight at low ones.
+            double limit = currentRate * maxBacklogSeconds;
+            backlogExceeded = receiveBacklog > limit || publishBacklog > limit;
+        } else {
+            backlogExceeded =
+                    receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
+        }
 
         return phase == Phase.BRACKET
                 ? pollBracket(backlogExceeded)
@@ -154,10 +174,17 @@ class RampRateFinder {
         if (backlogExceeded) {
             recordVerdict(currentRate, false);
             if (confirming) {
-                // The converged rate didn't hold on re-check. Stop anyway (best effort) --
-                // isNonMonotonic() is now true so the caller can warn about reproducibility.
-                phase = Phase.DONE;
-                return true;
+                // The candidate didn't hold on re-check, so it's not actually safe -- reopen the
+                // search instead of handing an unverified rate to the caller. Tighten hi to the
+                // rate that just failed, and fall back to the highest rate we've already seen
+                // pass below it (never a blind guess) as the new lo.
+                hi = currentRate;
+                lo = bestKnownPassBelow(hi);
+                confirming = false;
+                confirmationHoldsPassed = 0;
+                elapsedHoldNanos = 0;
+                currentRate = (lo + hi) / 2.0;
+                return false;
             }
             hi = currentRate;
             elapsedHoldNanos = 0;
@@ -179,17 +206,24 @@ class RampRateFinder {
 
         if ((hi - lo) / lo <= convergenceTolerance) {
             if (!confirming) {
-                // Require one more confirmation hold at the same rate before accepting it --
-                // this is what makes isNonMonotonic() a real, testable signal rather than one
-                // that binary chop's own strictly-nested bracket could never actually trigger.
+                // Require requiredConfirmationHolds more consecutive clean holds at the same
+                // rate before accepting it -- this is what makes isNonMonotonic() a real,
+                // testable signal rather than one that binary chop's own strictly-nested
+                // bracket could never actually trigger.
                 confirming = true;
+                confirmationHoldsPassed = 0;
                 currentRate = lo;
                 return false;
             }
+            confirmationHoldsPassed++;
+            if (confirmationHoldsPassed >= requiredConfirmationHolds) {
+                currentRate = lo;
+                confirmed = true;
+                phase = Phase.DONE;
+                return true;
+            }
             currentRate = lo;
-            confirmed = true;
-            phase = Phase.DONE;
-            return true;
+            return false;
         }
 
         confirming = false;
@@ -202,6 +236,19 @@ class RampRateFinder {
             currentRate = lo;
         }
         phase = Phase.DONE;
+    }
+
+    // The highest rate ever recorded as a pass strictly below `ceiling` -- used to reopen the
+    // search on a safe, already-observed footing after a failed confirmation, rather than a
+    // blind guess. Falls back to a fixed backoff only if history somehow has no such rate yet.
+    private double bestKnownPassBelow(double ceiling) {
+        double best = 0;
+        for (RateVerdict v : history) {
+            if (v.passed && v.rate < ceiling && v.rate > best) {
+                best = v.rate;
+            }
+        }
+        return best > 0 ? best : ceiling * CONFIRMATION_BACKOFF_FACTOR;
     }
 
     private void recordVerdict(double rate, boolean passed) {

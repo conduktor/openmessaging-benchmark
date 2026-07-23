@@ -80,11 +80,26 @@ public class Workload {
      */
     public Long rampReceiveBacklogLimit;
 
+    /**
+     * CHOP only: backlog limit expressed as seconds' worth of the candidate rate (limit = currentRate
+     * * rampMaxBacklogSeconds) instead of a fixed message count, so the check is equally strict at
+     * every rate tested during the bracket phase's exponential range. When set, this replaces
+     * rampPublishBacklogLimit/rampReceiveBacklogLimit for CHOP. Unset by default.
+     */
+    public Double rampMaxBacklogSeconds;
+
     /** CHOP only: seconds between bracket-phase steps / hold-phase polls. Defaults to 3. */
     public Integer rampBracketPeriodSeconds;
 
     /** CHOP only: seconds to hold and verify each candidate rate. Defaults to 30. */
     public Integer rampHoldSeconds;
+
+    /**
+     * CHOP only: number of consecutive clean confirmation holds required at the same rate before
+     * accepting it, beyond the initial tolerance-meeting hold. Defaults to 1. Raising this trades
+     * discovery time for confidence that the accepted rate isn't a one-off pass.
+     */
+    public Integer rampConfirmationHolds;
 
     /** CHOP only: relative (hi - lo) / lo band at which to stop chopping. Defaults to 0.05. */
     public Double rampConvergenceTolerance;

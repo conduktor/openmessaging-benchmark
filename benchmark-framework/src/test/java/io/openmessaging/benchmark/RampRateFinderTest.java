@@ -106,7 +106,7 @@ class RampRateFinderTest {
     }
 
     @Test
-    void nonMonotonicVerdictIsFlaggedWhenConfirmationHoldContradictsThePriorPass() {
+    void failedConfirmationReopensTheSearchInsteadOfAcceptingAnUnverifiedRate() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
         workload.rampHoldSeconds = 3; // one poll completes a hold
@@ -130,16 +130,83 @@ class RampRateFinderTest {
         assertThat(finder.isConfirmed()).isFalse();
 
         // Confirmation hold at the same rate (1500) now shows a backlog breach -- a direct
-        // contradiction of the pass just recorded at the same rate.
+        // contradiction of the pass just recorded at the same rate. Rather than accepting this
+        // unverified rate, the search must reopen: tighten hi to 1500 and fall back to the last
+        // rate we've actually seen pass below it (1000, from the bracket phase).
         done = finder.poll(periodNanos, 10500 + 2000, 10500 + 2000);
 
+        assertThat(done).isFalse();
+        assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.CHOP);
+        assertThat(finder.isNonMonotonic()).isTrue();
+        assertThat(finder.isConfirming()).isFalse();
+        assertThat(finder.isConfirmed()).isFalse();
+        assertThat(finder.getLo()).isEqualTo(1000.0);
+        assertThat(finder.getHi()).isEqualTo(1500.0);
+        assertThat(finder.getCurrentRate()).isEqualTo(1250.0);
+
+        // The reopened search can still converge and genuinely confirm on a new, lower candidate.
+        done = finder.poll(periodNanos, 12500 + 3750, 12500 + 3750); // clean hold @1250
+        assertThat(done).isFalse();
+        assertThat(finder.isConfirming()).isTrue();
+
+        done = finder.poll(periodNanos, 16250 + 3750, 16250 + 3750); // clean confirmation hold
         assertThat(done).isTrue();
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
+        assertThat(finder.isConfirmed()).isTrue();
+        assertThat(finder.getCurrentRate()).isEqualTo(1250.0);
+        // The earlier contradiction is still surfaced even though discovery ultimately confirmed
+        // a (different, lower) rate -- it's evidence the system showed unstable behavior at all.
         assertThat(finder.isNonMonotonic()).isTrue();
-        // Rejected on the confirmation hold, not accepted -- confirmed must stay false even
-        // though confirming (the "we were attempting a confirm" flag) is still true.
+    }
+
+    @Test
+    void multipleConfirmationHoldsAreRequiredWhenConfigured() {
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampHoldSeconds = 3;
+        workload.rampConvergenceTolerance = 0.5;
+        workload.rampConfirmationHolds = 2;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(3);
+
+        finder.poll(periodNanos, 3000, 3000); // bracket: 1000 clean
+        finder.poll(periodNanos, 6000, 6000); // bracket: 2000 exceeds -> CHOP mid=1500
+
+        boolean done = finder.poll(periodNanos, 10500, 10500); // first hold @1500 passes
+        assertThat(done).isFalse();
         assertThat(finder.isConfirming()).isTrue();
+
+        done = finder.poll(periodNanos, 15000, 15000); // 1st confirmation hold passes
+        assertThat(done).isFalse(); // still short of the 2 required confirmation holds
         assertThat(finder.isConfirmed()).isFalse();
+
+        done = finder.poll(periodNanos, 19500, 19500); // 2nd confirmation hold passes
+        assertThat(done).isTrue();
+        assertThat(finder.isConfirmed()).isTrue();
+        assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+    }
+
+    @Test
+    void relativeBacklogLimitScalesWithCandidateRateUnlikeTheFixedAbsoluteLimit() {
+        long periodNanos = SECONDS.toNanos(1);
+
+        // A 500-message backlog at 100,000 msg/s: negligible in relative terms (5ms worth) but
+        // far above the small fixed absolute default (100 messages) that workload() sets.
+        Workload absolute = workload();
+        absolute.rampStartRate = 100000;
+        RampRateFinder absoluteFinder = new RampRateFinder(absolute);
+        absoluteFinder.poll(periodNanos, 99500, 99500);
+        assertThat(absoluteFinder.getHi()).isEqualTo(100000.0); // absolute limit (100) blown
+        assertThat(absoluteFinder.getLo()).isNull();
+
+        Workload relative = workload();
+        relative.rampStartRate = 100000;
+        relative.rampMaxBacklogSeconds = 0.01; // 1,000 messages allowed at this rate
+        RampRateFinder relativeFinder = new RampRateFinder(relative);
+        relativeFinder.poll(periodNanos, 99500, 99500);
+        // Same backlog, but well under the rate-scaled limit -> treated as clean instead.
+        assertThat(relativeFinder.getLo()).isEqualTo(100000.0);
+        assertThat(relativeFinder.getHi()).isNull();
     }
 
     @Test
