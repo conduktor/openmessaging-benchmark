@@ -1,0 +1,27 @@
+name: Verify upstream ancestor
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  verify-upstream-ancestor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/openmessaging/benchmark.git
+
+      - name: Fetch upstream master
+        run: git fetch upstream master
+
+      - name: Refuse anything that isn't upstream's own history
+        run: git merge-base --is-ancestor HEAD upstream/master

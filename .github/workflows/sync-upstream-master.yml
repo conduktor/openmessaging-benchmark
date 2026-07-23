@@ -1,0 +1,31 @@
+name: Sync master from upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # weekly; upstream moves ~5 commits/18mo, no need for daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.CONDUKTORBOT_REPO_WRITE }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/openmessaging/benchmark.git
+
+      - name: Fetch upstream master
+        run: git fetch upstream master
+
+      - name: Refuse anything but a clean fast-forward
+        run: git merge-base --is-ancestor origin/master upstream/master
+
+      - name: Push upstream master to our master
+        run: git push origin upstream/master:refs/heads/master
