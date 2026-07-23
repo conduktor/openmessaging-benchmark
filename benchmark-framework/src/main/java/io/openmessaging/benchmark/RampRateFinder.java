@@ -25,8 +25,8 @@ import lombok.Getter;
 /**
  * Discovers the maximum sustainable producer rate: an exponential bracket phase finds a
  * known-good/known-bad pair around the knee, then a binary-chop phase holds and verifies each
- * candidate rate for a fixed window before accepting it, converging to a rate within a
- * configured tolerance.
+ * candidate rate for a fixed window before accepting it, converging to a rate within a configured
+ * tolerance.
  *
  * <p>Deliberately takes elapsed time and cumulative counters as explicit parameters (rather than
  * reading the clock itself) so it remains a fast, deterministic pure state machine to unit test;
@@ -80,17 +80,14 @@ class RampRateFinder {
                 workload.rampReceiveBacklogLimit != null
                         ? workload.rampReceiveBacklogLimit.longValue()
                         : Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
-        int holdSeconds =
-                workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 30;
+        int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 30;
         this.holdNanos = SECONDS.toNanos(holdSeconds);
         this.convergenceTolerance =
                 workload.rampConvergenceTolerance != null
                         ? workload.rampConvergenceTolerance.doubleValue()
                         : 0.05;
         int maxDiscoveryMinutes =
-                workload.rampMaxDiscoveryMinutes != null
-                        ? workload.rampMaxDiscoveryMinutes.intValue()
-                        : 10;
+                workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes.intValue() : 10;
         this.maxDiscoveryNanos = MINUTES.toNanos(maxDiscoveryMinutes);
     }
 

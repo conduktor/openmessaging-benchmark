@@ -13,6 +13,7 @@
  */
 package io.openmessaging.benchmark;
 
+
 import com.fasterxml.jackson.annotation.JsonEnumDefaultValue;
 
 /** Selects which algorithm discovers the max sustainable rate when producerRate == 0. */
