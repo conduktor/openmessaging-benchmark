@@ -12,20 +12,16 @@
 # limitations under the License.
 #
 
-FROM eclipse-temurin:17
+name: MQTT
+driverClass: io.openmessaging.benchmark.driver.mqtt5.MqttBenchmarkDriver
 
-ARG BENCHMARK_TARBALL
+client:
+  serverUri: tcp://localhost:1883
+  username:
+  password:
+  topicPrefix: benchmark
 
-# Using ADD instead of COPY because ${BENCHMARK_TARBALL} is an archive that needs to be extracted
-ADD ${BENCHMARK_TARBALL} /
-
-RUN mv openmessaging-benchmark-* /benchmark
-
-WORKDIR /benchmark
-
-# Install vim
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y vim tzdata && rm -rf /var/lib/apt/lists/*
-
-# Start a shell by default
-CMD ["/bin/bash"]
+consumer:
+  cleanSession: true
+  sessionExpiryIntervalSeconds: 259200
+  receiveMaximum: 256
