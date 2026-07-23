@@ -1,4 +1,4 @@
-name: Sync master from upstream
+name: Sync upstream into master and conduktor-gateway
 
 on:
   schedule:
@@ -29,3 +29,49 @@ jobs:
 
       - name: Push upstream master to our master
         run: git push origin upstream/master:refs/heads/master
+
+  merge-into-conduktor-gateway:
+    needs: sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: conduktor-gateway
+          fetch-depth: 0
+          token: ${{ secrets.CONDUKTORBOT_REPO_WRITE }}
+
+      - name: Configure ConduktorBot git identity
+        run: |
+          git config user.name "ConduktorBot"
+          git config user.email "96434751+ConduktorBot@users.noreply.github.com"
+
+      - name: Fetch updated master
+        run: git fetch origin master
+
+      - name: Merge master into a bot branch and open/update a PR
+        env:
+          GH_TOKEN: ${{ secrets.CONDUKTORBOT_REPO_WRITE }}
+          BRANCH: chore/sync-upstream-into-conduktor-gateway
+        run: |
+          if git merge-base --is-ancestor origin/master HEAD; then
+            echo "conduktor-gateway already contains master's tip - nothing to do"
+            exit 0
+          fi
+
+          git checkout -B "$BRANCH"
+
+          if ! git merge origin/master --no-edit -m "Merge upstream (via master) into conduktor-gateway"; then
+            git merge --abort
+            echo "::error::Merge conflict pulling master into conduktor-gateway - resolve manually: checkout $BRANCH, merge origin/master, push."
+            exit 1
+          fi
+
+          git push origin "$BRANCH" --force
+
+          if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')" = "0" ]; then
+            gh pr create --base conduktor-gateway --head "$BRANCH" \
+              --title "Merge upstream (via master) into conduktor-gateway" \
+              --body "Automated weekly sync: merges upstream openmessaging/benchmark (via our master mirror) into conduktor-gateway. Review like any other PR before merging."
+          else
+            echo "PR already open for $BRANCH - branch updated in place"
+          fi
