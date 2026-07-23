@@ -15,6 +15,7 @@ package io.openmessaging.benchmark.utils.payload;
 
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -214,6 +215,6 @@ public class MessageSizeDistribution {
     }
 
     public List<Bucket> getBuckets() {
-        return buckets;
+        return Collections.unmodifiableList(buckets);
     }
 }
