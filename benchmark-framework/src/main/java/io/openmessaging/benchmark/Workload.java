@@ -67,6 +67,12 @@ public class Workload {
      */
     public RampAlgorithm rampAlgorithm = RampAlgorithm.AIMD;
 
+    public RampVerdict rampVerdict = RampVerdict.BACKLOG;
+
+    // Minimum fraction of target throughput (and of consumer drain) a candidate must achieve over a
+    // hold to count as clean under rampVerdict: THROUGHPUT. Null -> default 0.95 in RampRateFinder.
+    public Double rampMinThroughputRatio;
+
     /** Initial probe rate for ramp discovery. Defaults to 10000 if unset. */
     public Integer rampStartRate;
 
