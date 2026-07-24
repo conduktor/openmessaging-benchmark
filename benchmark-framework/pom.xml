@@ -27,6 +27,7 @@
 
     <properties>
         <jetty.version>9.4.42.v20210604</jetty.version>
+        <testcontainers.version>1.21.3</testcontainers.version>
     </properties>
 
     <dependencies>
@@ -185,6 +186,21 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${testcontainers.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- Integration tests only (failsafe *IT): drive the real CHOP discovery loop against a
+             throwaway Kafka broker. driver-kafka + kafka-clients are already on the compile
+             classpath above, so Testcontainers is the only addition. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

@@ -424,6 +424,54 @@ class RampRateFinderTest {
         assertThat(finder.isConfirmed()).isFalse();
     }
 
+    @Test
+    void aHoldShorterThanTheBrokerBurstBudgetWronglyAcceptsAnOversubscribedRate() {
+        // Sustained capacity is 1000 msg/s, but the broker can absorb a 4000-message burst before
+        // any backpressure shows (page cache / batching / socket buffers -- what FakeSystem's
+        // instantaneous hard cap cannot model). At a 2000 msg/s candidate the burst buffer fills in
+        // 4000 / (2000 - 1000) = 4 seconds, so a hold shorter than that sees only clean polls and
+        // wrongly accepts 2000 msg/s as sustainable. This is the over-confirm the Kafka integration
+        // test reproduced against a real bursting broker with short holds.
+        Workload workload = workload();
+        workload.rampStartRate = 2000;
+        workload.rampBracketHoldSeconds = 3; // shorter than the 4s burst-fill time
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeBurstySystem system = new FakeBurstySystem(1000, 4000);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        for (int i = 0; i < 3; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.getLo()).isEqualTo(2000.0); // oversubscribed rate accepted as clean
+    }
+
+    @Test
+    void aHoldLongerThanTheBurstBudgetCorrectlyRejectsTheOversubscribedRate() {
+        // Identical bursty broker, but a hold longer than the 4s burst-fill time: once the buffer
+        // saturates, publishes fall behind and the same 2000 msg/s candidate is correctly failed.
+        // The only difference from the test above is rampBracketHoldSeconds -- proving hold length
+        // is the lever, which no hold length could have revealed against FakeSystem's hard cap.
+        Workload workload = workload();
+        workload.rampStartRate = 2000;
+        workload.rampBracketHoldSeconds = 6; // longer than the 4s burst-fill time
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeBurstySystem system = new FakeBurstySystem(1000, 4000);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        boolean done = false;
+        for (int i = 0; i < 6 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.getHi()).isEqualTo(2000.0); // correctly failed once the burst drained
+        assertThat(finder.getLo()).isNull(); // never accepted as a clean lo
+    }
+
     /** A simple producer-limited system: throughput is capped at {@code capacity} msgs/sec. */
     private static final class FakeSystem {
         private final double capacity;
@@ -439,6 +487,37 @@ class RampRateFinderTest {
             long sent = (long) (Math.min(rate, capacity) * periodSeconds);
             totalPublished += sent;
             totalReceived += sent;
+        }
+    }
+
+    /**
+     * A broker that absorbs a burst above its sustained capacity into a finite buffer before any
+     * backpressure appears -- a leaky bucket, unlike {@link FakeSystem}'s instantaneous hard cap. An
+     * oversubscribed rate therefore looks clean until the buffer saturates, so whether the rate
+     * finder detects it depends entirely on how long the candidate is held. This is the property that
+     * makes hold length matter, and the one the old hard-cap model could not express.
+     */
+    private static final class FakeBurstySystem {
+        private final double sustainedCapacity;
+        private final double burstBudget;
+        private double buffer = 0;
+        long totalPublished = 0;
+        long totalReceived = 0;
+
+        FakeBurstySystem(double sustainedCapacity, double burstBudget) {
+            this.sustainedCapacity = sustainedCapacity;
+            this.burstBudget = burstBudget;
+        }
+
+        void advance(double rate, long periodNanos) {
+            double periodSeconds = periodNanos / 1e9;
+            double arrived = rate * periodSeconds;
+            double drained = sustainedCapacity * periodSeconds;
+            // Each period the broker can publish what it drains plus whatever free buffer remains.
+            double accepted = Math.min(arrived, drained + (burstBudget - buffer));
+            buffer = Math.max(0, Math.min(burstBudget, buffer + accepted - drained));
+            totalPublished += (long) accepted;
+            totalReceived += (long) accepted;
         }
     }
 }
