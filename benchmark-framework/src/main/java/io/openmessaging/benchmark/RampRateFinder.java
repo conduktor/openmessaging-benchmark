@@ -58,6 +58,7 @@ class RampRateFinder {
     private final double convergenceTolerance;
     private final long maxDiscoveryNanos;
     private final int requiredConfirmationHolds;
+    private final RampVerdict verdict;
 
     @Getter(PACKAGE)
     private Phase phase = Phase.BRACKET;
@@ -129,6 +130,7 @@ class RampRateFinder {
         this.maxDiscoveryNanos = MINUTES.toNanos(maxDiscoveryMinutes);
         this.requiredConfirmationHolds =
                 workload.rampConfirmationHolds != null ? workload.rampConfirmationHolds.intValue() : 1;
+        this.verdict = workload.rampVerdict != null ? workload.rampVerdict : RampVerdict.BACKLOG;
     }
 
     // Advances the state machine given the latest period's counters. Returns true when done.
@@ -162,7 +164,7 @@ class RampRateFinder {
         long publishBacklog = expected - published;
         previousTotalPublished = totalPublished;
 
-        boolean backlogExceeded;
+        boolean breachedNow;
         if (maxBacklogSeconds != null) {
             // A limit that scales with the candidate rate, so the predicate is equally strict
             // at every rate tested during bracket's exponential range -- a fixed message count
@@ -180,31 +182,32 @@ class RampRateFinder {
                     Math.max(
                             maxBacklogFloor,
                             Math.min(currentRate * maxBacklogSeconds, (double) maxBacklogCeiling));
-            backlogExceeded = receiveBacklog > limit || publishBacklog > limit;
+            breachedNow = receiveBacklog > limit || publishBacklog > limit;
         } else {
-            backlogExceeded =
-                    receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
+            breachedNow = receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
         }
 
         return phase == Phase.BRACKET
-                ? pollBracket(backlogExceeded, periodNanos)
-                : pollChop(backlogExceeded, periodNanos);
+                ? pollBracket(breachedNow, periodNanos)
+                : pollChop(breachedNow, periodNanos);
     }
 
-    private boolean pollBracket(boolean backlogExceeded, long periodNanos) {
-        if (backlogExceeded) {
-            // A breach is immediately actionable -- no need to hold out a failing candidate,
-            // same fail-fast principle the chop phase already uses.
-            recordVerdict(currentRate, false);
-            hi = currentRate;
-            elapsedHoldNanos = 0;
+    private boolean pollBracket(boolean breachedNow, long periodNanos) {
+        boolean failed;
+        if (breachedNow) {
+            failed = true;
         } else {
             elapsedHoldNanos += periodNanos;
             if (elapsedHoldNanos < bracketHoldNanos) {
                 return false;
             }
-            recordVerdict(currentRate, true);
-            elapsedHoldNanos = 0;
+            failed = !holdClean();
+        }
+        elapsedHoldNanos = 0;
+        recordVerdict(currentRate, !failed);
+        if (failed) {
+            hi = currentRate;
+        } else {
             lo = currentRate;
         }
 
@@ -220,13 +223,25 @@ class RampRateFinder {
             return true;
         }
 
-        currentRate = backlogExceeded ? currentRate / 2.0 : currentRate * 2.0;
+        currentRate = failed ? currentRate / 2.0 : currentRate * 2.0;
         return false;
     }
 
-    private boolean pollChop(boolean backlogExceeded, long periodNanos) {
-        if (backlogExceeded) {
+    private boolean pollChop(boolean breachedNow, long periodNanos) {
+        boolean failed;
+        if (breachedNow) {
+            failed = true;
+        } else {
+            elapsedHoldNanos += periodNanos;
+            if (elapsedHoldNanos < holdNanos) {
+                return false;
+            }
+            failed = !holdClean();
+        }
+
+        if (failed) {
             recordVerdict(currentRate, false);
+            elapsedHoldNanos = 0;
             if (confirming) {
                 // The candidate didn't hold on re-check, so it's not actually safe -- reopen the
                 // search instead of handing an unverified rate to the caller. Tighten hi to the
@@ -236,24 +251,16 @@ class RampRateFinder {
                 lo = bestKnownPassBelow(hi);
                 confirming = false;
                 confirmationHoldsPassed = 0;
-                elapsedHoldNanos = 0;
                 currentRate = (lo + hi) / 2.0;
                 return false;
             }
             hi = currentRate;
-            elapsedHoldNanos = 0;
             currentRate = (lo + hi) / 2.0;
-            return false;
-        }
-
-        elapsedHoldNanos += periodNanos;
-        if (elapsedHoldNanos < holdNanos) {
             return false;
         }
 
         recordVerdict(currentRate, true);
         elapsedHoldNanos = 0;
-
         if (!confirming) {
             lo = currentRate;
         }
@@ -303,6 +310,13 @@ class RampRateFinder {
             }
         }
         return best > 0 ? best : ceiling * CONFIRMATION_BACKOFF_FACTOR;
+    }
+
+    // Whether the just-completed hold counts as clean. For BACKLOG this is always true: a real
+    // breach fast-fails per-poll before the hold ever completes, so reaching completion means clean.
+    // THROUGHPUT overrides this in a later task.
+    private boolean holdClean() {
+        return true;
     }
 
     private void recordVerdict(double rate, boolean passed) {
