@@ -50,6 +50,7 @@ class RampRateFinder {
     private final long publishBacklogLimit;
     private final long receiveBacklogLimit;
     private final Double maxBacklogSeconds;
+    private final long maxBacklogFloor;
     private final long maxBacklogCeiling;
     private final long settleNanos;
     private final long bracketHoldNanos;
@@ -103,6 +104,8 @@ class RampRateFinder {
                         ? workload.rampReceiveBacklogLimit.longValue()
                         : Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
         this.maxBacklogSeconds = workload.rampMaxBacklogSeconds;
+        this.maxBacklogFloor =
+                workload.rampMaxBacklogFloor != null ? workload.rampMaxBacklogFloor.longValue() : 1_000L;
         this.maxBacklogCeiling =
                 workload.rampMaxBacklogCeiling != null
                         ? workload.rampMaxBacklogCeiling.longValue()
@@ -163,13 +166,20 @@ class RampRateFinder {
         if (maxBacklogSeconds != null) {
             // A limit that scales with the candidate rate, so the predicate is equally strict
             // at every rate tested during bracket's exponential range -- a fixed message count
-            // is comparatively loose at high rates and comparatively tight at low ones. Capped by
-            // maxBacklogCeiling so the tolerance itself can't grow unbounded as bracket's
+            // is comparatively loose at high rates and comparatively tight at low ones. Clamped
+            // at both ends: maxBacklogCeiling stops the tolerance growing unbounded as bracket's
             // exponential doubling runs away past the real ceiling (a real incident: at a
             // 1,000,000+ msg/s candidate, an uncapped 1.0s tolerance meant a million messages of
             // backlog still counted as "clean," and the search reported a two-orders-of-magnitude
-            // wrong rate as confirmed).
-            double limit = Math.min(currentRate * maxBacklogSeconds, (double) maxBacklogCeiling);
+            // wrong rate as confirmed). maxBacklogFloor stops the opposite: without it, a single
+            // early false failure halves the rate and, in the same stroke, halves the tolerance --
+            // the wrong direction for a recovery mechanism -- letting one bad reading cascade all
+            // the way down to a near-zero "confirmed" rate (also a real incident, reproduced
+            // deterministically twice on the same starting conditions).
+            double limit =
+                    Math.max(
+                            maxBacklogFloor,
+                            Math.min(currentRate * maxBacklogSeconds, (double) maxBacklogCeiling));
             backlogExceeded = receiveBacklog > limit || publishBacklog > limit;
         } else {
             backlogExceeded =

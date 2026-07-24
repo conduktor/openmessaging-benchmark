@@ -89,6 +89,16 @@ public class Workload {
     public Double rampMaxBacklogSeconds;
 
     /**
+     * CHOP only: hard floor (in messages) on the limit rampMaxBacklogSeconds computes. Without it, a
+     * single early false failure halves the candidate rate and, in the same stroke, halves the
+     * tolerance too -- the wrong direction for a recovery mechanism -- letting one bad reading
+     * cascade all the way down to a near-zero "confirmed" rate. Defaults to 1000, matching the old
+     * fixed-count default so the relative check can never become stricter than a fixed-count check
+     * would have been. Only meaningful when rampMaxBacklogSeconds is set.
+     */
+    public Long rampMaxBacklogFloor;
+
+    /**
      * CHOP only: hard cap (in messages) on the limit rampMaxBacklogSeconds computes, so the tolerance
      * can't grow unbounded as bracket's exponential doubling searches far past the real ceiling --
      * without it, a high enough candidate rate can make the relative check tolerate an enormous

@@ -308,6 +308,64 @@ class RampRateFinderTest {
     }
 
     @Test
+    void uncappedRelativeLimitCanBecomeStricterThanUsefulAtLowRates() {
+        // The symmetric incident to the ceiling one above: at a low candidate rate,
+        // rampMaxBacklogSeconds alone gives a tiny tolerance -- smaller than a fixed-count check
+        // would ever have been -- so an ordinary, harmless blip gets treated as a capacity
+        // failure. Without a floor high enough to catch it, one such false failure (which halves
+        // the rate, and in the same stroke halves the tolerance again) can cascade all the way
+        // down to a near-zero "confirmed" rate.
+        Workload workload = workload();
+        workload.rampStartRate = 100;
+        workload.rampMaxBacklogSeconds = 0.1; // limit would be only 10 messages at this rate
+        workload.rampMaxBacklogFloor = 1L; // deliberately low so the floor isn't what saves this
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        finder.poll(periodNanos, 50, 50); // only 50 of the expected 100 published
+
+        assertThat(finder.getHi()).isEqualTo(100.0); // wrongly treated as a capacity failure
+        assertThat(finder.getLo()).isNull();
+    }
+
+    @Test
+    void backlogFloorPreventsToleranceFromShrinkingBelowFloorAtLowRates() {
+        Workload workload = workload();
+        workload.rampStartRate = 100;
+        workload.rampMaxBacklogSeconds = 0.1; // limit would be only 10 messages without a floor
+        workload.rampMaxBacklogFloor = 1000L;
+        workload.rampBracketHoldSeconds = 1; // one poll completes the hold for a clean verdict
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        finder.poll(periodNanos, 50, 50); // same shortfall as above
+
+        // The floor applies, so the same modest shortfall is correctly tolerated as clean.
+        assertThat(finder.getLo()).isEqualTo(100.0);
+        assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
+    void backlogFloorDefaultsTo1000MessagesWhenUnset() {
+        Workload workload = workload();
+        workload.rampStartRate = 100;
+        workload.rampMaxBacklogSeconds = 0.1; // limit would be only 10 messages without a floor
+        workload.rampBracketHoldSeconds = 1; // one poll completes the hold for a clean verdict
+        RampRateFinder finder = new RampRateFinder(workload); // rampMaxBacklogFloor left unset
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        // 800 messages of cumulative receive backlog -- below the default floor (1000) but would
+        // exceed a smaller one (e.g. 500), pinning the default's exact value.
+        finder.poll(periodNanos, 800, 0);
+
+        assertThat(finder.getLo()).isEqualTo(100.0);
+        assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
     void safetyCapForcesCompletionWithBestKnownRate() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
