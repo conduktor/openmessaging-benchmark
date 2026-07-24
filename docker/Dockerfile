@@ -12,16 +12,16 @@
 # limitations under the License.
 #
 
-FROM eclipse-temurin:17
+FROM eclipse-temurin:21
 
 ARG BENCHMARK_TARBALL
 
 # Using ADD instead of COPY because ${BENCHMARK_TARBALL} is an archive that needs to be extracted
 ADD ${BENCHMARK_TARBALL} /
 
-RUN mv openmessaging-benchmark-* /benchmark
+RUN mv openmessaging-benchmark-* /opt/benchmark
 
-WORKDIR /benchmark
+WORKDIR /opt/benchmark
 
 # Install vim
 ENV DEBIAN_FRONTEND=noninteractive
