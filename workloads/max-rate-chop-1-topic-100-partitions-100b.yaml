@@ -33,6 +33,8 @@ rampStartRate: 5000
 rampPublishBacklogLimit: 1000
 rampReceiveBacklogLimit: 1000
 rampBracketPeriodSeconds: 3
+rampSettleSeconds: 30
+rampBracketHoldSeconds: 30
 rampHoldSeconds: 30
 rampConvergenceTolerance: 0.05
 rampMaxDiscoveryMinutes: 10

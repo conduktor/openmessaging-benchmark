@@ -70,30 +70,40 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 
 ### Algorithm
 
-1. **Bracket** — starting at `rampStartRate` (default 10000), double the rate every
-   `rampBracketPeriodSeconds` (default 3s) while backlog stays clean. The first breach sets a
-   known-bad `hi`; the last clean rate is the known-good `lo`. (Handles the reverse case too — if
-   even the start rate is already overloaded, it halves downward until it finds a clean `lo`.)
-2. **Chop** — binary search the `[lo, hi]` bracket. Each candidate is held for `rampHoldSeconds`
-   (default 30s), not just glanced at — a single 3s reactive snapshot (AIMD's approach) isn't
-   enough to know a rate actually holds.
-3. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
+1. **Settle** — run at `rampStartRate` for `rampSettleSeconds` (default 30s) before evaluating
+   backlog *at all*. Right after `startLoad()`, a consumer-group rebalance tail or producer
+   connection warm-up can still be settling; without this grace period, that transient gets
+   evaluated exactly like a real capacity problem and can permanently cap the search too low (see
+   "Known limitation" below — this is the fix for it).
+2. **Bracket** — starting at `rampStartRate`, double the rate every poll while backlog stays
+   clean. A breach is immediately actionable (fail-fast, no need to hold out a rate that's already
+   failing) and sets a known-bad `hi`; a clean reading must hold for `rampBracketHoldSeconds`
+   (defaults to the resolved `rampHoldSeconds` — i.e. bracket is exactly as rigorous as chop unless
+   you deliberately shorten it) before being accepted as the known-good `lo`. (Handles the reverse
+   case too — if even the start rate is already overloaded, it halves downward until it finds a
+   clean `lo`.)
+3. **Chop** — binary search the `[lo, hi]` bracket. Each candidate is held for `rampHoldSeconds`
+   (default 30s), not just glanced at — a single reactive snapshot (AIMD's approach) isn't enough
+   to know a rate actually holds.
+4. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
    isn't accepted immediately. It must pass `rampConfirmationHolds` (default 1) additional,
    consecutive clean holds at the *same* rate before being accepted. This is what makes "verified"
    mean something more than "passed once."
-4. **Reopen on a failed confirmation** — if a confirmation hold fails (the rate looked fine, then
+5. **Reopen on a failed confirmation** — if a confirmation hold fails (the rate looked fine, then
    didn't hold up), CHOP does not accept it anyway. It reopens the search: tightens `hi` to the
    failed rate, and falls back to the highest rate already *observed* to pass below it (never a
    blind guess — `lo` is always sourced from a real, recorded pass) as the new `lo`, then restarts
    the hold-and-confirm cycle from there.
-5. **Non-monotonic flag** — every tested `(rate, passed/failed)` outcome is recorded. If a later
+6. **Non-monotonic flag** — every tested `(rate, passed/failed)` outcome is recorded. If a later
    verdict ever contradicts an earlier one (e.g. a lower rate fails after a higher one already
    passed), `isNonMonotonic()` is set and stays set for the rest of the run, even if the reopened
    search goes on to confirm cleanly. It's a signal that the system showed unstable behavior
    *somewhere* during discovery, so the final number may not reproduce as cleanly as a clean run
    would.
-6. **Safety cap** — `rampMaxDiscoveryMinutes` (default 10) bounds total discovery time; if hit,
-   discovery stops and reports the best confirmed-or-passed `lo` found so far.
+7. **Safety cap** — `rampMaxDiscoveryMinutes` (default 10) bounds total discovery time; if hit,
+   discovery stops and reports the best confirmed-or-passed `lo` found so far. Bear in mind the
+   settle period and every bracket/chop hold all draw from this same budget — with generous hold
+   settings, raise this alongside them.
 
 ### Configuration (workload YAML fields, all optional, only apply when `producerRate: 0`)
 
@@ -104,8 +114,10 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 | `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                   |
 | `rampReceiveBacklogLimit`  | env `RECEIVE_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                   |
 | `rampMaxBacklogSeconds`    | unset                                  | CHOP only — when set, replaces the two fields above with a limit that scales with the candidate rate (`limit = currentRate * rampMaxBacklogSeconds`), so the check is equally strict at every rate tried during bracket's exponential range instead of being loose at high rates and tight at low ones |
-| `rampBracketPeriodSeconds` | 3                                      | CHOP only                                                                                                                                                                                                                                                                                              |
-| `rampHoldSeconds`          | 30                                     | CHOP only                                                                                                                                                                                                                                                                                              |
+| `rampBracketPeriodSeconds` | 3                                      | CHOP only — poll cadence, not a hold duration                                                                                                                                                                                                                                                          |
+| `rampSettleSeconds`        | 30                                     | CHOP only — grace period at start before backlog counts at all                                                                                                                                                                                                                                         |
+| `rampBracketHoldSeconds`   | resolved `rampHoldSeconds`             | CHOP only — how long a bracket candidate must hold clean; shorten independently once you trust bracket's coarser candidates need less scrutiny                                                                                                                                                         |
+| `rampHoldSeconds`          | 30                                     | CHOP only — how long a chop candidate must hold clean                                                                                                                                                                                                                                                  |
 | `rampConfirmationHolds`    | 1                                      | CHOP only                                                                                                                                                                                                                                                                                              |
 | `rampConvergenceTolerance` | 0.05                                   | CHOP only                                                                                                                                                                                                                                                                                              |
 | `rampMaxDiscoveryMinutes`  | 10                                     | CHOP only                                                                                                                                                                                                                                                                                              |
@@ -136,7 +148,15 @@ Bracket phase deliberately overshoots (2x) past the real limit before backing of
 That overshoot's fallout (backlog, GC pressure, broker load) isn't drained before the first chop
 candidate starts its hold clock — so an early chop reading can still be affected by bracket's own
 overshoot rather than reflecting steady state at that candidate alone. Not yet addressed; would
-need an explicit drain/settle sub-phase between bracket and chop.
+need an explicit drain sub-phase between bracket and chop (distinct from `rampSettleSeconds`
+above, which only runs once, before bracket starts).
+
+This used to also apply to the very *first* bracket reading: a consumer-group rebalance tail or
+producer connection warm-up still settling right after `startLoad()` could be evaluated exactly
+like a real capacity problem, permanently capping `hi` far below the system's actual ceiling — one
+bad early reading, and chop would only ever search inside the too-small bracket it produced, with
+no way to recover (unlike AIMD, which just keeps retrying for the rest of the test). `rampSettleSeconds`
+and requiring bracket's clean readings to hold (`rampBracketHoldSeconds`) fixed that specific case.
 
 ## Which to use
 

@@ -91,7 +91,22 @@ public class Workload {
     /** CHOP only: seconds between bracket-phase steps / hold-phase polls. Defaults to 3. */
     public Integer rampBracketPeriodSeconds;
 
-    /** CHOP only: seconds to hold and verify each candidate rate. Defaults to 30. */
+    /**
+     * CHOP only: seconds to run at rampStartRate before backlog is evaluated at all, so a
+     * consumer-group rebalance tail or producer connection warm-up still settling right after the
+     * load starts can never be mistaken for the candidate rate being unsustainable. Defaults to 30.
+     */
+    public Integer rampSettleSeconds;
+
+    /**
+     * CHOP only: seconds a bracket-phase candidate (the exponential doubling/halving search that
+     * finds the initial [lo, hi] window) must hold clean before being accepted. Defaults to the
+     * resolved rampHoldSeconds, i.e. bracket and chop are equally rigorous unless you explicitly
+     * shorten this once you trust bracket's coarser candidates need less scrutiny.
+     */
+    public Integer rampBracketHoldSeconds;
+
+    /** CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 30. */
     public Integer rampHoldSeconds;
 
     /**

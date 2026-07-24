@@ -24,18 +24,54 @@ class RampRateFinderTest {
         Workload workload = new Workload();
         workload.rampPublishBacklogLimit = 100L;
         workload.rampReceiveBacklogLimit = 100L;
+        workload.rampSettleSeconds = 0; // most tests don't care about settling; a few override it
         return workload;
+    }
+
+    @Test
+    void settlePeriodIgnoresBacklogEntirelyBeforeRealEvaluationBegins() {
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampSettleSeconds = 6;
+        workload.rampBracketHoldSeconds = 3;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(3);
+
+        // A huge, transient apparent backlog during settling -- e.g. residual consumer-group
+        // rebalance catch-up right after startLoad() -- must not be evaluated at all.
+        boolean done = finder.poll(periodNanos, 100, 0);
+        assertThat(done).isFalse();
+        assertThat(finder.isSettled()).isFalse();
+        assertThat(finder.getLo()).isNull();
+        assertThat(finder.getHi()).isNull();
+
+        // 6s total elapsed -- settle threshold reached on this call, but this call only marks
+        // settled and resets the baseline; it doesn't evaluate backlog either.
+        done = finder.poll(periodNanos, 200, 100);
+        assertThat(done).isFalse();
+        assertThat(finder.isSettled()).isTrue();
+        assertThat(finder.getLo()).isNull();
+        assertThat(finder.getHi()).isNull();
+
+        // First real evaluation, using the baseline reset at the end of settling: clean.
+        done = finder.poll(periodNanos, 200 + 3000, 200 + 3000);
+        assertThat(done).isFalse();
+        assertThat(finder.getLo()).isEqualTo(1000.0);
     }
 
     @Test
     void bracketDoublesUntilBacklogThenTransitionsToChop() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
+        workload.rampHoldSeconds = 3; // one poll completes a bracket hold too (default ties them)
         RampRateFinder finder = new RampRateFinder(workload);
         FakeSystem system = new FakeSystem(4500);
         long periodNanos = SECONDS.toNanos(3);
 
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.BRACKET);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        assertThat(finder.isSettled()).isTrue();
 
         // 1000 -> clean, 2000 -> clean, 4000 -> clean, 8000 -> exceeds capacity
         for (int i = 0; i < 4; i++) {
@@ -79,10 +115,13 @@ class RampRateFinderTest {
     void holdFailsPartwayExitsEarlyWithoutWaitingOutTheFullHold() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
-        workload.rampHoldSeconds = 30; // long hold -- a single failing poll must not wait this out
+        workload.rampBracketHoldSeconds = 3; // fast bracket setup
+        workload.rampHoldSeconds = 30; // long chop hold -- a single failing poll must not wait this out
         workload.rampConvergenceTolerance = 0.05;
         RampRateFinder finder = new RampRateFinder(workload);
         long periodNanos = SECONDS.toNanos(3);
+
+        finder.poll(periodNanos, 0, 0); // settle
 
         // Bracket: 1000 clean, 2000 exceeds -> CHOP with lo=1000, hi=2000, mid=1500
         finder.poll(periodNanos, 3000, 3000);
@@ -109,10 +148,12 @@ class RampRateFinderTest {
     void failedConfirmationReopensTheSearchInsteadOfAcceptingAnUnverifiedRate() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
-        workload.rampHoldSeconds = 3; // one poll completes a hold
+        workload.rampHoldSeconds = 3; // one poll completes a hold (bracket and chop alike)
         workload.rampConvergenceTolerance = 0.5; // converge quickly for this test
         RampRateFinder finder = new RampRateFinder(workload);
         long periodNanos = SECONDS.toNanos(3);
+
+        finder.poll(periodNanos, 0, 0); // settle
 
         // Bracket: 1000 clean, 2000 exceeds -> CHOP, lo=1000, hi=2000, mid=1500
         finder.poll(periodNanos, 3000, 3000);
@@ -169,6 +210,7 @@ class RampRateFinderTest {
         RampRateFinder finder = new RampRateFinder(workload);
         long periodNanos = SECONDS.toNanos(3);
 
+        finder.poll(periodNanos, 0, 0); // settle
         finder.poll(periodNanos, 3000, 3000); // bracket: 1000 clean
         finder.poll(periodNanos, 6000, 6000); // bracket: 2000 exceeds -> CHOP mid=1500
 
@@ -195,6 +237,7 @@ class RampRateFinderTest {
         Workload absolute = workload();
         absolute.rampStartRate = 100000;
         RampRateFinder absoluteFinder = new RampRateFinder(absolute);
+        absoluteFinder.poll(periodNanos, 0, 0); // settle
         absoluteFinder.poll(periodNanos, 99500, 99500);
         assertThat(absoluteFinder.getHi()).isEqualTo(100000.0); // absolute limit (100) blown
         assertThat(absoluteFinder.getLo()).isNull();
@@ -202,7 +245,9 @@ class RampRateFinderTest {
         Workload relative = workload();
         relative.rampStartRate = 100000;
         relative.rampMaxBacklogSeconds = 0.01; // 1,000 messages allowed at this rate
+        relative.rampBracketHoldSeconds = 1; // one poll completes the hold for a clean verdict
         RampRateFinder relativeFinder = new RampRateFinder(relative);
+        relativeFinder.poll(periodNanos, 0, 0); // settle
         relativeFinder.poll(periodNanos, 99500, 99500);
         // Same backlog, but well under the rate-scaled limit -> treated as clean instead.
         assertThat(relativeFinder.getLo()).isEqualTo(100000.0);
@@ -213,17 +258,22 @@ class RampRateFinderTest {
     void safetyCapForcesCompletionWithBestKnownRate() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
-        workload.rampMaxDiscoveryMinutes = 1;
+        workload.rampHoldSeconds = 10;
+        workload.rampMaxDiscoveryMinutes = 1; // 60s cap
         RampRateFinder finder = new RampRateFinder(workload);
 
-        // First poll: clean, establishes lo=1000, well within the 60s cap.
-        boolean done = finder.poll(SECONDS.toNanos(30), 30000, 30000);
+        // First poll consumes the (zero-length, per workload()) settle step.
+        boolean done = finder.poll(SECONDS.toNanos(10), 10000, 10000);
+        assertThat(done).isFalse();
+        assertThat(finder.getLo()).isNull();
+
+        // Second poll: one full 10s hold at 1000, clean -> lo=1000. Total elapsed 20s, within cap.
+        done = finder.poll(SECONDS.toNanos(10), 20000, 20000);
         assertThat(done).isFalse();
         assertThat(finder.getLo()).isEqualTo(1000.0);
 
-        // Second poll pushes total elapsed time past the 60s cap -- forces completion
-        // regardless of what the counters say.
-        done = finder.poll(SECONDS.toNanos(40), 30000, 30000);
+        // Third poll pushes total elapsed time past the 60s cap -- forces completion regardless.
+        done = finder.poll(SECONDS.toNanos(45), 20000, 20000);
 
         assertThat(done).isTrue();
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
@@ -236,18 +286,21 @@ class RampRateFinderTest {
     void safetyCapDuringAPendingConfirmationHoldIsNotTreatedAsAConfirm() {
         Workload workload = workload();
         workload.rampStartRate = 1000;
-        workload.rampHoldSeconds = 30;
+        workload.rampBracketHoldSeconds = 3; // fast bracket setup
+        workload.rampHoldSeconds = 30; // slow chop hold (applies to first pass and confirmation)
         workload.rampConvergenceTolerance = 0.5;
         workload.rampMaxDiscoveryMinutes = 1; // 60s cap
         RampRateFinder finder = new RampRateFinder(workload);
         FakeSystem system = new FakeSystem(1800); // 1500 (candidate) stays clean, 2000 doesn't
         long periodNanos = SECONDS.toNanos(3);
 
-        // Bracket (2 polls, 6s) -> CHOP mid=1500. First hold (10 polls, 30s, total 36s) passes
-        // and is within tolerance -> confirming flips true at the 12th poll. The confirmation
-        // hold then needs another 30s (total 66s), but the 60s safety cap fires first (20th poll).
+        finder.poll(periodNanos, 0, 0); // settle
+
+        // Bracket (2 polls) -> CHOP mid=1500. First hold (10 polls, 30s) passes and is within
+        // tolerance -> confirming flips true. The confirmation hold then needs another 30s, but
+        // the 60s safety cap fires first, partway through it.
         boolean done = false;
-        for (int i = 0; i < 20 && !done; i++) {
+        for (int i = 0; i < 25 && !done; i++) {
             system.advance(finder.getCurrentRate(), periodNanos);
             done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
         }

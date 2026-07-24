@@ -23,10 +23,10 @@ import java.util.List;
 import lombok.Getter;
 
 /**
- * Discovers the maximum sustainable producer rate: an exponential bracket phase finds a
- * known-good/known-bad pair around the knee, then a binary-chop phase holds and verifies each
- * candidate rate for a fixed window before accepting it, converging to a rate within a configured
- * tolerance.
+ * Discovers the maximum sustainable producer rate: after an initial settle period, an exponential
+ * bracket phase finds a known-good/known-bad pair around the knee, then a binary-chop phase narrows
+ * within it -- both phases hold every candidate for a configured duration before trusting it clean,
+ * converging to a rate within a configured tolerance.
  *
  * <p>Deliberately takes elapsed time and cumulative counters as explicit parameters (rather than
  * reading the clock itself) so it remains a fast, deterministic pure state machine to unit test;
@@ -50,6 +50,8 @@ class RampRateFinder {
     private final long publishBacklogLimit;
     private final long receiveBacklogLimit;
     private final Double maxBacklogSeconds;
+    private final long settleNanos;
+    private final long bracketHoldNanos;
     private final long holdNanos;
     private final double convergenceTolerance;
     private final long maxDiscoveryNanos;
@@ -76,7 +78,11 @@ class RampRateFinder {
     @Getter(PACKAGE)
     private boolean confirmed = false;
 
+    @Getter(PACKAGE)
+    private boolean settled = false;
+
     private long previousTotalPublished = 0;
+    private long elapsedSettleNanos = 0;
     private long elapsedHoldNanos = 0;
     private long totalElapsedNanos = 0;
     private int bracketIterations = 0;
@@ -96,8 +102,16 @@ class RampRateFinder {
                         ? workload.rampReceiveBacklogLimit.longValue()
                         : Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
         this.maxBacklogSeconds = workload.rampMaxBacklogSeconds;
+        int settleSeconds =
+                workload.rampSettleSeconds != null ? workload.rampSettleSeconds.intValue() : 30;
+        this.settleNanos = SECONDS.toNanos(settleSeconds);
         int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 30;
         this.holdNanos = SECONDS.toNanos(holdSeconds);
+        int bracketHoldSeconds =
+                workload.rampBracketHoldSeconds != null
+                        ? workload.rampBracketHoldSeconds.intValue()
+                        : holdSeconds;
+        this.bracketHoldNanos = SECONDS.toNanos(bracketHoldSeconds);
         this.convergenceTolerance =
                 workload.rampConvergenceTolerance != null
                         ? workload.rampConvergenceTolerance.doubleValue()
@@ -121,6 +135,19 @@ class RampRateFinder {
             return true;
         }
 
+        if (!settled) {
+            elapsedSettleNanos += periodNanos;
+            // Keep the published baseline current while ignoring backlog entirely, so whatever
+            // happened during settling (consumer-group rebalance tail, producer connection
+            // warm-up) can never be mistaken for the candidate rate being unsustainable.
+            previousTotalPublished = totalPublished;
+            if (elapsedSettleNanos < settleNanos) {
+                return false;
+            }
+            settled = true;
+            return false;
+        }
+
         long expected = (long) ((currentRate / ONE_SECOND_IN_NANOS) * periodNanos);
         long published = totalPublished - previousTotalPublished;
         long receiveBacklog = totalPublished - totalReceived;
@@ -140,22 +167,29 @@ class RampRateFinder {
         }
 
         return phase == Phase.BRACKET
-                ? pollBracket(backlogExceeded)
+                ? pollBracket(backlogExceeded, periodNanos)
                 : pollChop(backlogExceeded, periodNanos);
     }
 
-    private boolean pollBracket(boolean backlogExceeded) {
-        recordVerdict(currentRate, !backlogExceeded);
-
+    private boolean pollBracket(boolean backlogExceeded, long periodNanos) {
         if (backlogExceeded) {
+            // A breach is immediately actionable -- no need to hold out a failing candidate,
+            // same fail-fast principle the chop phase already uses.
+            recordVerdict(currentRate, false);
             hi = currentRate;
+            elapsedHoldNanos = 0;
         } else {
+            elapsedHoldNanos += periodNanos;
+            if (elapsedHoldNanos < bracketHoldNanos) {
+                return false;
+            }
+            recordVerdict(currentRate, true);
+            elapsedHoldNanos = 0;
             lo = currentRate;
         }
 
         if (lo != null && hi != null) {
             phase = Phase.CHOP;
-            elapsedHoldNanos = 0;
             currentRate = (lo + hi) / 2.0;
             return false;
         }
