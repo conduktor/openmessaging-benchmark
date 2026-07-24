@@ -54,6 +54,23 @@ class RateControllerTest {
     }
 
     @Test
+    void heldDuringProducerStartupThenRampsUp() {
+        // The finder starts at 10k msg/s, but the first control window(s) can be sampled while the
+        // producer is still starting up (published ~ 0) — pronounced with the encrypt interceptor.
+        // Treating that as saturation craters the rate to ~0, from which the multiplicative ramp
+        // cannot recover (the observed encrypt-finder collapse to ~1 msg/s despite ~70k capacity).
+        // The controller must HOLD the offered rate until the producer proves it can sustain it.
+        rate = rateController.nextRate(rate, periodNanos, 0, 0);
+        assertThat(rate).isEqualTo(10_000);
+        // still basically nothing published — keep holding, do not crater
+        rate = rateController.nextRate(rate, periodNanos, 100, 100);
+        assertThat(rate).isEqualTo(10_000);
+        // producer comes up and sustains the offered rate -> controller engages and ramps up
+        rate = rateController.nextRate(rate, periodNanos, 10_100, 10_100);
+        assertThat(rate).isEqualTo(20_000);
+    }
+
+    @Test
     void rampUp() {
         assertThat(rateController.getRampingFactor()).isEqualTo(1);
 
