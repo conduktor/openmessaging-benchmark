@@ -59,6 +59,7 @@ class RampRateFinder {
     private final long maxDiscoveryNanos;
     private final int requiredConfirmationHolds;
     private final RampVerdict verdict;
+    private final double minThroughputRatio;
 
     @Getter(PACKAGE)
     private Phase phase = Phase.BRACKET;
@@ -85,11 +86,15 @@ class RampRateFinder {
     private boolean settled = false;
 
     private long previousTotalPublished = 0;
+    private long previousTotalReceived = 0;
     private long elapsedSettleNanos = 0;
     private long elapsedHoldNanos = 0;
     private long totalElapsedNanos = 0;
     private int bracketIterations = 0;
     private int confirmationHoldsPassed = 0;
+    private long holdExpected = 0;
+    private long holdPublished = 0;
+    private long holdReceived = 0;
 
     private final List<RateVerdict> history = new ArrayList<>();
 
@@ -131,6 +136,10 @@ class RampRateFinder {
         this.requiredConfirmationHolds =
                 workload.rampConfirmationHolds != null ? workload.rampConfirmationHolds.intValue() : 1;
         this.verdict = workload.rampVerdict != null ? workload.rampVerdict : RampVerdict.BACKLOG;
+        this.minThroughputRatio =
+                workload.rampMinThroughputRatio != null
+                        ? workload.rampMinThroughputRatio.doubleValue()
+                        : 0.95;
     }
 
     // Advances the state machine given the latest period's counters. Returns true when done.
@@ -151,6 +160,7 @@ class RampRateFinder {
             // happened during settling (consumer-group rebalance tail, producer connection
             // warm-up) can never be mistaken for the candidate rate being unsustainable.
             previousTotalPublished = totalPublished;
+            previousTotalReceived = totalReceived;
             if (elapsedSettleNanos < settleNanos) {
                 return false;
             }
@@ -164,8 +174,24 @@ class RampRateFinder {
         long publishBacklog = expected - published;
         previousTotalPublished = totalPublished;
 
+        long received = totalReceived - previousTotalReceived;
+        previousTotalReceived = totalReceived;
+
+        // A fresh hold starts whenever elapsedHoldNanos was reset to 0 by the previous poll's
+        // transition (or after settle). Reset the per-hold accumulators at that first poll.
+        if (elapsedHoldNanos == 0) {
+            holdExpected = 0;
+            holdPublished = 0;
+            holdReceived = 0;
+        }
+        holdExpected += expected;
+        holdPublished += published;
+        holdReceived += received;
+
         boolean breachedNow;
-        if (maxBacklogSeconds != null) {
+        if (verdict == RampVerdict.THROUGHPUT) {
+            breachedNow = false; // throughput verdict is decided at hold completion (see holdClean)
+        } else if (maxBacklogSeconds != null) {
             // A limit that scales with the candidate rate, so the predicate is equally strict
             // at every rate tested during bracket's exponential range -- a fixed message count
             // is comparatively loose at high rates and comparatively tight at low ones. Clamped
@@ -314,9 +340,16 @@ class RampRateFinder {
 
     // Whether the just-completed hold counts as clean. For BACKLOG this is always true: a real
     // breach fast-fails per-poll before the hold ever completes, so reaching completion means clean.
-    // THROUGHPUT overrides this in a later task.
+    // For THROUGHPUT, breachedNow never fast-fails (see poll()), so this is where the verdict is
+    // actually decided: the producer must have kept up with the candidate rate, and the consumer
+    // must have kept up with (drained) what the producer actually published.
     private boolean holdClean() {
-        return true;
+        if (verdict != RampVerdict.THROUGHPUT) {
+            return true;
+        }
+        boolean producerKeepsUp = holdPublished >= minThroughputRatio * holdExpected;
+        boolean consumerKeepsUp = holdReceived >= minThroughputRatio * holdPublished;
+        return producerKeepsUp && consumerKeepsUp;
     }
 
     private void recordVerdict(double rate, boolean passed) {

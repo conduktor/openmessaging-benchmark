@@ -520,4 +520,134 @@ class RampRateFinderTest {
             totalReceived += (long) accepted;
         }
     }
+
+    private static Workload throughputWorkload() {
+        Workload workload = new Workload();
+        workload.rampVerdict = RampVerdict.THROUGHPUT;
+        workload.rampMinThroughputRatio = 0.95;
+        workload.rampSettleSeconds = 0;
+        workload.rampBracketHoldSeconds = 1; // one 1s poll completes a hold
+        workload.rampHoldSeconds = 1;
+        workload.rampConvergenceTolerance = 0.05;
+        return workload;
+    }
+
+    @Test
+    void throughputVerdictConvergesNearProducerCapacity() {
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 1000;
+        RampRateFinder finder = new RampRateFinder(workload);
+        // Producer caps at 4500 msg/s; consumer never the bottleneck.
+        FakeThroughputSystem system = new FakeThroughputSystem(4500, 1_000_000_000L);
+        long periodNanos = SECONDS.toNanos(1);
+
+        boolean done = false;
+        for (int i = 0; i < 200 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
+        assertThat(Math.abs(4500.0 - finder.getCurrentRate()) / 4500.0).isLessThan(0.1);
+    }
+
+    @Test
+    void throughputVerdictRejectsRatesWhereTheConsumerCannotKeepUp() {
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 1000;
+        RampRateFinder finder = new RampRateFinder(workload);
+        // Producer could do 100k, but the consumer only drains 3000 msg/s -> consumer is the ceiling.
+        FakeThroughputSystem system = new FakeThroughputSystem(100_000, 3000);
+        long periodNanos = SECONDS.toNanos(1);
+
+        boolean done = false;
+        for (int i = 0; i < 200 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        // Discovery is pinned by consumer drain (~3000), far below producer capacity.
+        assertThat(finder.getCurrentRate()).isLessThan(6000.0);
+        assertThat(finder.getCurrentRate()).isGreaterThan(1500.0);
+    }
+
+    @Test
+    void throughputIgnoresLargeButStableInFlightBacklogThatTheCountVerdictRejects() {
+        // A stable 50,000-message in-flight backlog is always present; the consumer keeps pace with
+        // it (drain ratio ~1.0) but never closes it. Producer caps at 50,000 msg/s. THROUGHPUT
+        // rides through the stable backlog to the real ~50k ceiling.
+        Workload throughput = throughputWorkload();
+        throughput.rampStartRate = 1000;
+        RampRateFinder throughputFinder = new RampRateFinder(throughput);
+        driveToCompletion(throughputFinder, new FakeStableBacklogSystem(50_000, 50_000));
+        assertThat(Math.abs(50_000.0 - throughputFinder.getCurrentRate()) / 50_000.0).isLessThan(0.1);
+
+        // The same broker under the default count-based BACKLOG verdict sees 50,000 >> its
+        // 100-message limit at every rate and can never confirm anywhere near the ceiling.
+        Workload backlog = workload();
+        backlog.rampStartRate = 1000;
+        backlog.rampBracketHoldSeconds = 1;
+        backlog.rampHoldSeconds = 1;
+        RampRateFinder backlogFinder = new RampRateFinder(backlog);
+        driveToCompletion(backlogFinder, new FakeStableBacklogSystem(50_000, 50_000));
+        assertThat(backlogFinder.getCurrentRate()).isLessThan(25_000.0);
+    }
+
+    /** A producer/consumer pair with independent sustained capacities, seeded from zero. */
+    private static final class FakeThroughputSystem {
+        private final double producerCapacity;
+        private final double consumerCapacity;
+        long totalPublished;
+        long totalReceived;
+
+        FakeThroughputSystem(double producerCapacity, double consumerCapacity) {
+            this.producerCapacity = producerCapacity;
+            this.consumerCapacity = consumerCapacity;
+            this.totalPublished = 0;
+            this.totalReceived = 0;
+        }
+
+        void advance(double rate, long periodNanos) {
+            double periodSeconds = periodNanos / 1e9;
+            totalPublished += (long) (Math.min(rate, producerCapacity) * periodSeconds);
+            long lag = totalPublished - totalReceived;
+            totalReceived += (long) Math.min(consumerCapacity * periodSeconds, lag);
+        }
+    }
+
+    /**
+     * A producer capped at {@code producerCapacity} behind an already-established, stable in-flight
+     * backlog: the consumer keeps pace (drain ratio ~1.0) but never closes the constant lag, so
+     * receiveBacklog stays large-but-constant -- the case an absolute-count verdict mishandles.
+     */
+    private static final class FakeStableBacklogSystem {
+        private final double producerCapacity;
+        private final long standingBacklog;
+        long totalPublished;
+        long totalReceived;
+
+        FakeStableBacklogSystem(double producerCapacity, long standingBacklog) {
+            this.producerCapacity = producerCapacity;
+            this.standingBacklog = standingBacklog;
+            this.totalPublished = standingBacklog; // pre-established, stable in-flight backlog
+            this.totalReceived = 0;
+        }
+
+        void advance(double rate, long periodNanos) {
+            totalPublished += (long) (Math.min(rate, producerCapacity) * (periodNanos / 1e9));
+            totalReceived = totalPublished - standingBacklog; // consumer keeps pace; lag stays constant
+        }
+    }
+
+    private static void driveToCompletion(RampRateFinder finder, FakeStableBacklogSystem system) {
+        long periodNanos = SECONDS.toNanos(1);
+        boolean done = false;
+        for (int i = 0; i < 500 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+        assertThat(done).isTrue();
+    }
 }
