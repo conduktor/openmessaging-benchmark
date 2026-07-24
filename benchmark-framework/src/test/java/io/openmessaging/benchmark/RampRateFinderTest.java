@@ -255,6 +255,59 @@ class RampRateFinderTest {
     }
 
     @Test
+    void uncappedRelativeLimitCanRunAwayAtHighCandidateRates() {
+        // The incident this guards against: at 1,000,000 msg/s with rampMaxBacklogSeconds=1.0,
+        // the relative limit alone would tolerate a full 1,000,000-message backlog -- so a
+        // candidate that only actually published 5,000 of an expected 1,000,000 messages (a
+        // massive shortfall) still gets called "clean" without a ceiling low enough to catch it.
+        Workload workload = workload();
+        workload.rampStartRate = 1000000;
+        workload.rampMaxBacklogSeconds = 1.0;
+        workload.rampMaxBacklogCeiling = 2_000_000L; // high enough not to clamp anything here
+        workload.rampBracketHoldSeconds = 1; // one poll completes the hold for a clean verdict
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        finder.poll(periodNanos, 5000, 5000);
+
+        assertThat(finder.getLo()).isEqualTo(1000000.0); // wrongly "clean"
+        assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
+    void backlogCeilingCapsTheRelativeLimitAtHighCandidateRates() {
+        Workload workload = workload();
+        workload.rampStartRate = 1000000;
+        workload.rampMaxBacklogSeconds = 1.0; // would allow 1,000,000 messages without a ceiling
+        workload.rampMaxBacklogCeiling = 1000L; // deliberately low so the cap is what decides
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        finder.poll(periodNanos, 5000, 5000); // same massive shortfall as above
+
+        assertThat(finder.getHi()).isEqualTo(1000000.0); // caught by the ceiling this time
+        assertThat(finder.getLo()).isNull();
+    }
+
+    @Test
+    void backlogCeilingDefaultsTo100000MessagesWhenUnset() {
+        Workload workload = workload();
+        workload.rampStartRate = 1000000;
+        workload.rampMaxBacklogSeconds = 1.0; // would allow 1,000,000 messages without a ceiling
+        RampRateFinder finder = new RampRateFinder(workload); // rampMaxBacklogCeiling left unset
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        finder.poll(periodNanos, 5000, 5000);
+
+        // The default ceiling (100,000) applies since none was set, catching the runaway
+        // tolerance just like an explicit low ceiling would.
+        assertThat(finder.getHi()).isEqualTo(1000000.0);
+    }
+
+    @Test
     void safetyCapForcesCompletionWithBestKnownRate() {
         Workload workload = workload();
         workload.rampStartRate = 1000;

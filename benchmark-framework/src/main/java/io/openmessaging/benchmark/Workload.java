@@ -88,6 +88,15 @@ public class Workload {
      */
     public Double rampMaxBacklogSeconds;
 
+    /**
+     * CHOP only: hard cap (in messages) on the limit rampMaxBacklogSeconds computes, so the tolerance
+     * can't grow unbounded as bracket's exponential doubling searches far past the real ceiling --
+     * without it, a high enough candidate rate can make the relative check tolerate an enormous
+     * backlog and report a wildly implausible "confirmed" rate. Only meaningful when
+     * rampMaxBacklogSeconds is set. Defaults to 100000.
+     */
+    public Long rampMaxBacklogCeiling;
+
     /** CHOP only: seconds between bracket-phase steps / hold-phase polls. Defaults to 3. */
     public Integer rampBracketPeriodSeconds;
 

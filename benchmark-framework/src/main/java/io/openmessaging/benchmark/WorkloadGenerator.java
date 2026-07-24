@@ -298,13 +298,13 @@ public class WorkloadGenerator implements AutoCloseable {
             wasConfirming = finder.isConfirming();
         }
 
-        if (finder.isConfirmed()) {
+        if (finder.isConfirmed() && !finder.isNonMonotonic()) {
             Instant verificationConfirmedAt = Instant.now();
             rampVerification = new RampVerification();
             rampVerification.rate = finder.getCurrentRate();
             rampVerification.startEpochMillis = verificationStartedAt.toEpochMilli();
             rampVerification.endEpochMillis = verificationConfirmedAt.toEpochMilli();
-            rampVerification.nonMonotonic = finder.isNonMonotonic();
+            rampVerification.nonMonotonic = false;
             log.info(
                     "----- CHOP verification window: {} -> {} (rate {} msg/s) -----",
                     verificationStartedAt,
@@ -313,10 +313,13 @@ public class WorkloadGenerator implements AutoCloseable {
         }
 
         if (finder.isNonMonotonic()) {
+            // A discovery that contradicted itself anywhere isn't verified, however it ended --
+            // rampVerification is deliberately withheld above rather than reporting a specific
+            // rate that might not reproduce.
             log.warn(
                     "Ramp discovery detected non-monotonic backlog behavior -- {} msg/s may not"
-                            + " reproduce reliably; consider treating it as a band rather than an exact"
-                            + " figure.",
+                            + " reproduce reliably; rampVerification will not be attached to the"
+                            + " result. Treat this as a band rather than an exact figure.",
                     finder.getCurrentRate());
         }
         log.info("----- Ramp discovery (CHOP) complete: {} msg/s -----", finder.getCurrentRate());

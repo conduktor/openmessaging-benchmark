@@ -15,8 +15,12 @@ package io.openmessaging.benchmark;
 
 /**
  * The window during which a CHOP ramp discovery held and confirmed its final accepted rate.
- * Attached to {@link TestResult} only when {@code rampAlgorithm == CHOP} and discovery ended in a
- * genuine confirm, not a safety-cap or rejected-confirmation outcome.
+ * Attached to {@link TestResult} only when {@code rampAlgorithm == CHOP}, discovery ended in a
+ * genuine confirm (not a safety-cap or rejected-confirmation outcome), and nothing during discovery
+ * ever contradicted anything else -- so {@code nonMonotonic} is always {@code false} whenever this
+ * object is actually present; a contradicted discovery is withheld entirely rather than reported as
+ * a specific, possibly-unreproducible rate. The field is kept (rather than removed) for JSON schema
+ * stability.
  */
 public class RampVerification {
     public double rate;

@@ -107,27 +107,31 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 
 ### Configuration (workload YAML fields, all optional, only apply when `producerRate: 0`)
 
-|           Field            |                Default                 |                                                                                                                                               Applies to                                                                                                                                               |
-|----------------------------|----------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `rampAlgorithm`            | `AIMD`                                 | Selects the algorithm                                                                                                                                                                                                                                                                                  |
-| `rampStartRate`            | 10000                                  | Both                                                                                                                                                                                                                                                                                                   |
-| `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                   |
-| `rampReceiveBacklogLimit`  | env `RECEIVE_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                   |
-| `rampMaxBacklogSeconds`    | unset                                  | CHOP only — when set, replaces the two fields above with a limit that scales with the candidate rate (`limit = currentRate * rampMaxBacklogSeconds`), so the check is equally strict at every rate tried during bracket's exponential range instead of being loose at high rates and tight at low ones |
-| `rampBracketPeriodSeconds` | 3                                      | CHOP only — poll cadence, not a hold duration                                                                                                                                                                                                                                                          |
-| `rampSettleSeconds`        | 30                                     | CHOP only — grace period at start before backlog counts at all                                                                                                                                                                                                                                         |
-| `rampBracketHoldSeconds`   | resolved `rampHoldSeconds`             | CHOP only — how long a bracket candidate must hold clean; shorten independently once you trust bracket's coarser candidates need less scrutiny                                                                                                                                                         |
-| `rampHoldSeconds`          | 30                                     | CHOP only — how long a chop candidate must hold clean                                                                                                                                                                                                                                                  |
-| `rampConfirmationHolds`    | 1                                      | CHOP only                                                                                                                                                                                                                                                                                              |
-| `rampConvergenceTolerance` | 0.05                                   | CHOP only                                                                                                                                                                                                                                                                                              |
-| `rampMaxDiscoveryMinutes`  | 10                                     | CHOP only                                                                                                                                                                                                                                                                                              |
+|           Field            |                Default                 |                                                                                                                                                             Applies to                                                                                                                                                             |
+|----------------------------|----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `rampAlgorithm`            | `AIMD`                                 | Selects the algorithm                                                                                                                                                                                                                                                                                                              |
+| `rampStartRate`            | 10000                                  | Both                                                                                                                                                                                                                                                                                                                               |
+| `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                               |
+| `rampReceiveBacklogLimit`  | env `RECEIVE_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                               |
+| `rampMaxBacklogSeconds`    | unset                                  | CHOP only — when set, replaces the two fields above with a limit that scales with the candidate rate (`limit = min(currentRate * rampMaxBacklogSeconds, rampMaxBacklogCeiling)`), so the check is equally strict at every rate tried during bracket's exponential range instead of being loose at high rates and tight at low ones |
+| `rampMaxBacklogCeiling`    | 100000                                 | CHOP only — hard cap (messages) on the limit `rampMaxBacklogSeconds` computes; only meaningful when `rampMaxBacklogSeconds` is set (see "Trial finding" below for why this exists)                                                                                                                                                 |
+| `rampBracketPeriodSeconds` | 3                                      | CHOP only — poll cadence, not a hold duration                                                                                                                                                                                                                                                                                      |
+| `rampSettleSeconds`        | 30                                     | CHOP only — grace period at start before backlog counts at all                                                                                                                                                                                                                                                                     |
+| `rampBracketHoldSeconds`   | resolved `rampHoldSeconds`             | CHOP only — how long a bracket candidate must hold clean; shorten independently once you trust bracket's coarser candidates need less scrutiny                                                                                                                                                                                     |
+| `rampHoldSeconds`          | 30                                     | CHOP only — how long a chop candidate must hold clean                                                                                                                                                                                                                                                                              |
+| `rampConfirmationHolds`    | 1                                      | CHOP only                                                                                                                                                                                                                                                                                                                          |
+| `rampConvergenceTolerance` | 0.05                                   | CHOP only                                                                                                                                                                                                                                                                                                                          |
+| `rampMaxDiscoveryMinutes`  | 10                                     | CHOP only                                                                                                                                                                                                                                                                                                                          |
 
 See `workloads/max-rate-chop-1-topic-100-partitions-100b.yaml` for a runnable example.
 
 ### Output
 
-When discovery ends in a genuine confirm, the result JSON gets an extra `rampVerification` object
-absent from AIMD runs and from CHOP runs that only hit the safety cap:
+When discovery ends in a genuine confirm *and* nothing during discovery ever contradicted anything
+else, the result JSON gets an extra `rampVerification` object — absent from AIMD runs, from CHOP
+runs that only hit the safety cap, and from CHOP runs that flagged `isNonMonotonic()` at any point
+(see "Trial finding" below — a contradicted discovery is withheld entirely rather than reported as
+a specific, possibly-unreproducible rate):
 
 ```json
 "rampVerification": {
@@ -138,9 +142,10 @@ absent from AIMD runs and from CHOP runs that only hit the safety cap:
 }
 ```
 
-`startEpochMillis`/`endEpochMillis` bracket the *final* confirmation hold specifically — useful for
-attributing resource usage (CPU/memory) to the verified rate rather than the whole warmup +
-discovery + measurement run.
+`nonMonotonic` is therefore always `false` whenever this object is present (kept in the schema for
+stability rather than removed). `startEpochMillis`/`endEpochMillis` bracket the *final* confirmation
+hold specifically — useful for attributing resource usage (CPU/memory) to the verified rate rather
+than the whole warmup + discovery + measurement run.
 
 ### Known limitation
 
@@ -157,6 +162,84 @@ like a real capacity problem, permanently capping `hi` far below the system's ac
 bad early reading, and chop would only ever search inside the too-small bracket it produced, with
 no way to recover (unlike AIMD, which just keeps retrying for the rest of the test). `rampSettleSeconds`
 and requiring bracket's clean readings to hold (`rampBracketHoldSeconds`) fixed that specific case.
+
+### Trial finding: `rampMaxBacklogSeconds` can defeat its own backlog check at high rates
+
+Found running the consuming harness's (`conduktor/benchmarks`) AKS integration test against this
+branch's image, 2026-07-24. Reported here (not just as harness-side feedback) because it looks
+like a real gap in this algorithm, independent of the harness.
+
+**Setup**: AKS, `representative` infra preset (dedicated node pools, node-isolated brokers/gateway/
+workers), direct-to-Kafka (no gateway), 1 topic / 100 partitions / 100-byte messages, single
+producer/consumer. Two loads on the same topology for comparison: `rampAlgorithm: AIMD` (default)
+and `rampAlgorithm: CHOP` with:
+
+```yaml
+rampStartRate: 20000
+rampMaxBacklogSeconds: 1.0
+rampBracketHoldSeconds: 30
+rampHoldSeconds: 60
+rampConvergenceTolerance: 0.05
+rampMaxDiscoveryMinutes: 12
+testDurationMinutes: 15
+```
+
+(`rampBracketPeriodSeconds` and `rampSettleSeconds` left at their defaults, 3s and 30s.)
+
+**Result**: CHOP reported a genuine confirm —
+
+```
+WARN  WorkloadGenerator - Ramp discovery detected non-monotonic backlog behavior --
+      1800000.0 msg/s may not reproduce reliably; consider treating it as a band rather
+      than an exact figure.
+INFO  WorkloadGenerator - ----- Ramp discovery (CHOP) complete: 1800000.0 msg/s -----
+```
+
+`rampVerification.rate = 1800000.0`, `nonMonotonic = true`. That is not a plausible sustainable
+rate for this setup: **AIMD topped out at ~28,000 msg/s** on the identical topology/hardware in
+the same run (a separate trial on the same cluster shape previously saw AIMD peak ~65,000), and
+CHOP's own subsequent fixed-rate measurement window — running at the "confirmed" 1,800,000 target —
+only *achieved* ~1.3-1.5M, i.e. it couldn't even sustain the number it had just certified. Off by
+roughly two orders of magnitude from anything AIMD ever observed.
+
+**Diagnosis**: `rampMaxBacklogSeconds` scales the backlog tolerance *with the candidate rate*
+(`limit = currentRate * rampMaxBacklogSeconds`) — correct in spirit (fixed-count limits are loose
+at high rates, tight at low ones), but nothing bounds how large that limit gets as bracket's
+exponential doubling runs away. At a 1,000,000 msg/s candidate, `rampMaxBacklogSeconds: 1.0` means
+tolerating **1,000,000 messages** of backlog before flagging a problem — by that point the check is
+essentially disabled. The bracket phase (or a reopened search) apparently kept finding *some*
+combination of candidates that looked clean under that ballooning tolerance, occasionally
+contradicting each other (hence `nonMonotonic: true` — the flag did its job and caught that
+something was wrong), but the search still landed on and reported a concrete, confidently-wrong
+number rather than stopping or refusing to confirm.
+
+**Suggested follow-ups** (not implemented here — flagging for whoever picks this up):
+- Cap the rate-relative limit with an absolute ceiling too, e.g.
+`min(currentRate * rampMaxBacklogSeconds, someAbsoluteMax)`, so it can't grow unbounded during
+exponential bracket doubling.
+- Consider treating `nonMonotonic: true` as more than an advisory flag — e.g. refusing to attach
+`rampVerification` at all (or attaching a band instead of a point value) when the discovery that
+produced it was internally contradictory, rather than reporting a specific rate that the
+docstring itself says "may not reproduce reliably."
+- Document a **guideline value** for `rampMaxBacklogSeconds` (this trial used 1.0s, which in
+hindsight is far too generous once compounded with rate — something like 0.05-0.1s is probably
+closer to what fixed-count defaults were achieving at realistic rates) rather than leaving the
+right order of magnitude to guesswork.
+
+Harness-side note (not a CHOP issue): the resource-sampling integration this trial was validating
+worked correctly regardless — a `rampVerification`-scoped Prometheus capture was produced
+alongside the whole-job one, with sensible (lower) CPU/mem numbers in the narrower window. The bad
+data here is a confirmed *rate*, not a broken capture mechanism.
+
+**Fixed**: both suggested follow-ups above are now implemented.
+`rampMaxBacklogCeiling` (default 100000) caps the relative limit so it can't grow unbounded as
+bracket's exponential doubling runs away, and `isNonMonotonic()` is no longer purely advisory —
+`rampVerification` is now withheld entirely (not attached, at any rate) whenever discovery flagged
+non-monotonic behavior anywhere, confirmed or not, rather than reporting a specific number the log
+message itself admits may not reproduce. The third suggestion (a documented guideline value for `rampMaxBacklogSeconds` itself) remains
+open — this trial used `1.0`, and while the ceiling now guards against that value running away, it
+was still a somewhat arbitrary starting point rather than one derived from what fixed-count limits
+were actually achieving at realistic rates.
 
 ## Which to use
 
