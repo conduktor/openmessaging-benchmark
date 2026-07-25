@@ -105,11 +105,34 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    settle period and every bracket/chop hold all draw from this same budget — with generous hold
    settings, raise this alongside them.
 
+### Verdict modes
+
+Each hold (bracket or chop) needs a clean/not-clean verdict before CHOP can act on it. Which
+predicate decides that is controlled by `rampVerdict`, with two modes:
+
+- **`BACKLOG`** (default) — the predicate described above: a hold is clean if `receiveBacklog`/
+  `publishBacklog` never exceeds the configured limit (`rampMaxBacklogSeconds`/`Floor`/`Ceiling`,
+  or the fixed `rampPublishBacklogLimit`/`rampReceiveBacklogLimit` when the relative one is unset).
+  Structural weakness: a healthy pipeline's in-flight backlog scales with throughput, so any
+  fixed-ish count is too strict at high rates and too loose at low ones — see the two "Trial
+  finding" sections below, both of which are this predicate misfiring in opposite directions.
+- **`THROUGHPUT`** (opt-in) — a scale-free alternative. Per hold: `clean ⇔ published ≥
+  ratio·expected AND received ≥ ratio·published`, where `ratio = rampMinThroughputRatio` (default
+  0.95). It checks that the pipeline both kept up with the target rate *and* drained what it
+  published, as ratios rather than message counts, so the same threshold applies unchanged whether
+  the candidate rate is 100 msg/s or 1,000,000 msg/s. There's no per-poll fast-fail — the verdict
+  is decided once, at hold completion, from the hold's aggregate published/received counts, not
+  from intermediate backlog snapshots. It does **not** solve hold-length sensitivity: a hold still
+  has to run longer than the broker's burst-absorption time in either mode, or a genuinely
+  unsustainable rate can still look clean for the duration of a too-short hold.
+
 ### Configuration (workload YAML fields, all optional, only apply when `producerRate: 0`)
 
 |           Field            |                Default                 |                                                                                                                                                                        Applies to                                                                                                                                                                         |
 |----------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `rampAlgorithm`            | `AIMD`                                 | Selects the algorithm                                                                                                                                                                                                                                                                                                                                     |
+| `rampVerdict`              | `BACKLOG`                              | Both — selects the clean/not-clean predicate for holds; `THROUGHPUT` is the scale-free alternative (see "Verdict modes" above)                                                                                                                                                                                                                            |
+| `rampMinThroughputRatio`   | 0.95                                   | CHOP only — THROUGHPUT verdict                                                                                                                                                                                                                                                                                                                            |
 | `rampStartRate`            | 10000                                  | Both                                                                                                                                                                                                                                                                                                                                                      |
 | `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                      |
 | `rampReceiveBacklogLimit`  | env `RECEIVE_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                      |
@@ -305,6 +328,40 @@ time. Confirms the diagnosis above rather than just being a one-off fluke.
 suggested follow-up above) now clamps the same limit from below, symmetric to
 `rampMaxBacklogCeiling`. The relative check can no longer become stricter than a fixed-count check
 would have been at any rate, however far the search has already fallen.
+
+### Trial finding: `BACKLOG` under-reported the true sustainable rate by up to ~320x on a healthy cluster
+
+Found re-running the same harness integration test (`conduktor/benchmarks`, workflow run
+`30103329337`), 2026-07-24, same AKS `representative` preset, same topology (1 topic / 100
+partitions / 100-byte messages, direct-to-Kafka, single producer/consumer) as the trial findings
+above. This is the finding that motivated adding `rampVerdict: THROUGHPUT`.
+
+**Setup**: three loads on the same cluster for comparison — `rampAlgorithm: AIMD` (default,
+`BACKLOG` verdict, no alternative available), `rampAlgorithm: CHOP` with
+`rampMaxBacklogSeconds: 0.1` (`BACKLOG` verdict), and `rampAlgorithm: CHOP` with
+`rampMaxBacklogSeconds: 1.0` (`BACKLOG` verdict).
+
+**Result**: both `BACKLOG`-based runs reported low numbers relative to what the cluster could
+actually sustain — AIMD peaked at ~13,500 msg/s, and CHOP with `rampMaxBacklogSeconds: 0.1`
+"confirmed" 2,734 msg/s. The `rampMaxBacklogSeconds: 1.0` run, by contrast, discovered 880,000
+msg/s and that rate then held cleanly for the *entire* 15-minute measurement window — publish and
+consume rates both tracking ~880k, backlog bounded (max ~16,432 messages, not growing over the
+window), average publish-delay 0.12ms. That's the true sustainable rate for this cluster; the
+other two runs under-reported it by roughly 65x (AIMD) and 320x (`chop-floor`) respectively.
+
+**Diagnosis**: same root cause as the two trial findings above, just observed on a cluster healthy
+enough to make the scale mismatch obvious rather than merely wrong. A fixed-ish backlog-count
+limit is calibrated for *some* rate; at 880k msg/s, thousands of messages of in-flight backlog is
+normal pipeline depth, not a problem — but a `BACKLOG`-style check tuned tight enough to be
+meaningful at low rates will flag that depth as a breach and cap discovery far below what the
+system can actually do. `rampMaxBacklogSeconds: 1.0` happened to be loose enough to let the search
+reach the real ceiling here; `0.1` was not.
+
+**Fixed**: added the opt-in `rampVerdict: THROUGHPUT` mode (see "Verdict modes" above), which
+checks published/received ratios against the target rate instead of an absolute or rate-scaled
+backlog count, so the same threshold is neither too strict nor too loose regardless of what rate
+is being tested. `BACKLOG` remains the default — `THROUGHPUT` is opt-in until it has more runs
+behind it.
 
 ## Which to use
 
