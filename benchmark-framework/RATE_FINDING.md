@@ -421,6 +421,45 @@ backlog count, so the same threshold is neither too strict nor too loose regardl
 is being tested. `BACKLOG` remains the default — `THROUGHPUT` is opt-in until it has more runs
 behind it.
 
+### Trial finding: hold length, not the verdict predicate, is now the dominant error
+
+Found running the strengthened `ChopRateFinderKafkaIT` against a single-broker Testcontainers Kafka
+on 2026-07-27, after the confirm-below-the-knee and achieved-rate-reporting changes. Three discovery
+runs on the same broker, identical config apart from `rampVerdict` (1 topic / 10 partitions /
+100-byte messages, `rampSettleSeconds: 5`, `rampBracketHoldSeconds: 10`, `rampHoldSeconds: 15`,
+`testDurationMinutes: 1`):
+
+| Run |   Verdict    | Confirmed target | Reported (achieved) | Measurement-window publish delay |
+|-----|--------------|------------------|---------------------|----------------------------------|
+| 1   | `BACKLOG`    | withheld         | none                | 0.7 ms                           |
+| 2   | `BACKLOG`    | 1,292,594        | 1,291,997           | 37.8 ms                          |
+| 3   | `THROUGHPUT` | 1,406,000        | 1,380,771           | **3,037 ms**                     |
+
+Three things to take from this:
+
+- **Achieved-rate reporting works.** Reported vs confirmed target agree to 0.05% (run 2) and 1.8%
+  (run 3), so `rampVerification.rate` is now a number the confirmation hold really delivered.
+- **`isNonMonotonic()` fires on real hardware, and still costs the whole answer.** Run 1 found
+  ~984k, contradicted itself during the search, and reported nothing. Confirming below the knee
+  removes the *coin-flip-at-the-confirm* source of this, but not contradictions arising earlier in
+  the search. Runs 1 and 2 differ only in luck, so a `BACKLOG` run's success here is not
+  reproducible.
+- **A confirmed, achieved rate can still be unsustainable.** Run 3 held 1.38M for a 15-second hold
+  at `achievedRatio` 0.982, then averaged **3 seconds** of publish delay over the following
+  60-second measurement window. The producer was not keeping up at all; the hold was simply shorter
+  than the broker's burst-absorption time at that rate. This is the hold-length sensitivity the
+  `THROUGHPUT` design explicitly listed as out of scope, and with the scale and count problems now
+  fixed it is the largest remaining source of error — not the verdict predicate.
+
+**Open, not fixed.** `rampHoldSeconds` has no principled default: it must exceed the broker's
+burst-absorption time at the candidate rate, which is itself unknown before the measurement. Two
+directions worth considering, neither implemented: scale the hold with the candidate rate (absorption
+time is roughly buffer-depth / overshoot, so higher rates need longer, not equal, holds); or judge a
+hold on whether achieved throughput is *flat across its own second half* rather than on its aggregate
+ratio, which detects a filling buffer regardless of hold length. Until then, treat a discovered rate
+as unverified unless `rampHoldSeconds` is comfortably longer than the measurement window's own
+settling behaviour, and check publish delay in the run that follows.
+
 ## Which to use
 
 AIMD if you just want *a* number and don't care whether it's reproducible in a follow-up run at a

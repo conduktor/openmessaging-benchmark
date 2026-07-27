@@ -54,18 +54,93 @@ class ChopRateFinderKafkaIT {
 
     /**
      * The claim CHOP makes that AIMD never did: the rate it confirms is one you can actually hold.
-     * This drives real discovery against a real broker with a realistic starting rate, then checks
-     * the measurement window that ran at the confirmed rate -- if that rate is genuinely sustainable,
-     * publish-delay (the rate limiter's backlog of un-sent messages) stays bounded rather than
-     * growing without limit. This is the end-to-end analogue of the manual AKS check that first
-     * exposed CHOP over-confirming (converged 8062 msg/s, then 35k messages of backlog in the very
-     * next window).
+     * Drives real discovery against a real broker, then checks the measurement window that ran at the
+     * confirmed rate.
+     *
+     * <p>Every assertion here exists because its absence let a real incident through. Asserting only
+     * that publish delay stayed bounded -- the original check -- passes when {@code rampVerification}
+     * is null, and passes when discovery collapsed to 1 msg/s, since a flatline has no publish delay
+     * either. So the test could not fail for the incident it was written to catch.
      */
     @Test
-    void chopConfirmedRateIsActuallySustainableAgainstARealBroker() throws Exception {
+    void backlogVerdictConfirmsARateItCanActuallyHold() throws Exception {
+        Discovery discovery = runDiscovery(RampVerdict.BACKLOG);
+        assertVerifiedAndSustainable(discovery);
+    }
+
+    /**
+     * THROUGHPUT exists because BACKLOG under-reported the true sustainable rate by up to ~320x on a
+     * healthy cluster (see RATE_FINDING.md). The assertion is deliberately *relative* -- "at least as
+     * high as the count-based path on this same broker" -- so it means the same thing on a laptop and
+     * in CI, where an absolute msg/s threshold would not.
+     */
+    @Test
+    void throughputVerdictDoesNotUnderReportRelativeToBacklog() throws Exception {
+        Discovery backlog = runDiscovery(RampVerdict.BACKLOG);
+        Discovery throughput = runDiscovery(RampVerdict.THROUGHPUT);
+
+        assertVerifiedAndSustainable(throughput);
+        assertThat(throughput.confirmedRate)
+                .as(
+                        "THROUGHPUT (%s msg/s) must not under-report against BACKLOG (%s msg/s) on the"
+                                + " same broker -- under-reporting is the whole reason it exists",
+                        throughput.confirmedRate, backlog.confirmedRate)
+                .isGreaterThanOrEqualTo(backlog.confirmedRate);
+    }
+
+    private static void assertVerifiedAndSustainable(Discovery discovery) {
+        // A withheld rampVerification means discovery did not reach a genuine confirm. The original
+        // test read confirmedRate only to build a failure message, so a null sailed through.
+        assertThat(discovery.confirmedRate)
+                .as("discovery must reach a genuine confirm and attach rampVerification")
+                .isNotNull();
+
+        // Guards against the collapse-to-1-msg/s failure mode, which satisfies every
+        // "is it sustainable" check trivially. A single-broker container handles far more than this.
+        assertThat(discovery.confirmedRate)
+                .as("a plausible rate for a real broker, not a collapsed one")
+                .isGreaterThan(COLLAPSE_FLOOR);
+
+        // Sustainability: at a rate that was truly verified the producer keeps up, so the average
+        // send delay over the measurement window stays small. A rate that only survived discovery by
+        // bursting shows delay climbing into the seconds -- the signature of an over-confirm.
+        assertThat(discovery.publishDelayAvgMs)
+                .as(
+                        "confirmed rate %s msg/s should be sustainable, but the measurement window's"
+                                + " average publish delay says the producer could not keep up",
+                        discovery.confirmedRate)
+                .isLessThan(500.0);
+
+        // The reported rate must be one the measurement window actually delivered. This is what the
+        // 1.8M-msg/s incident violated: CHOP certified a rate its own measurement window then missed
+        // by 25%. rampVerification.rate is now the achieved throughput of the confirmation hold, so
+        // the window running at that rate should match it closely.
+        assertThat(discovery.measuredPublishRate)
+                .as(
+                        "measurement window achieved %s msg/s while discovery reported %s msg/s",
+                        discovery.measuredPublishRate, discovery.confirmedRate)
+                .isGreaterThan(0.85 * discovery.confirmedRate);
+    }
+
+    private static final double COLLAPSE_FLOOR = 500.0;
+
+    /** What one discovery run produced, plus how the measurement window that followed behaved. */
+    private static final class Discovery {
+        final Double confirmedRate;
+        final double publishDelayAvgMs;
+        final double measuredPublishRate;
+
+        Discovery(Double confirmedRate, double publishDelayAvgMs, double measuredPublishRate) {
+            this.confirmedRate = confirmedRate;
+            this.publishDelayAvgMs = publishDelayAvgMs;
+            this.measuredPublishRate = measuredPublishRate;
+        }
+    }
+
+    private static Discovery runDiscovery(RampVerdict verdict) throws Exception {
         File driverConfig = writeKafkaDriverConfig(KAFKA.getBootstrapServers());
 
-        Workload workload = discoveryWorkload();
+        Workload workload = discoveryWorkload(verdict);
         LocalWorker worker = new LocalWorker();
         worker.initializeDriver(driverConfig);
 
@@ -75,29 +150,24 @@ class ChopRateFinderKafkaIT {
         }
 
         Double confirmedRate = result.rampVerification == null ? null : result.rampVerification.rate;
-        double pubDelayAvgMs = result.aggregatedPublishDelayLatencyAvg / 1000.0;
+        double publishDelayAvgMs = result.aggregatedPublishDelayLatencyAvg / 1000.0;
+        double measuredPublishRate =
+                result.publishRate.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
         long maxBacklog = result.backlog.stream().mapToLong(Long::longValue).max().orElse(0L);
         log.info(
-                "CHOP confirmedRate={} msg/s | measurement window: avgPublishDelay={} ms,"
-                        + " maxBacklog={} msgs",
+                "{} confirmedRate={} msg/s | measurement window: achieved={} msg/s,"
+                        + " avgPublishDelay={} ms, maxBacklog={} msgs",
+                verdict,
                 confirmedRate,
-                String.format("%.1f", pubDelayAvgMs),
+                String.format("%.0f", measuredPublishRate),
+                String.format("%.1f", publishDelayAvgMs),
                 maxBacklog);
-
-        // Sustainability: at a rate that was truly verified, the producer keeps up, so the average
-        // send delay over the measurement window stays small. A rate that only survived discovery
-        // by bursting shows delay climbing into the seconds -- the signature of an over-confirm.
-        assertThat(pubDelayAvgMs)
-                .as(
-                        "confirmed rate %s msg/s should be sustainable, but the measurement window's"
-                                + " average publish delay indicates the producer could not keep up",
-                        confirmedRate)
-                .isLessThan(500.0);
+        return new Discovery(confirmedRate, publishDelayAvgMs, measuredPublishRate);
     }
 
-    private static Workload discoveryWorkload() {
+    private static Workload discoveryWorkload(RampVerdict verdict) {
         Workload workload = new Workload();
-        workload.name = "chop-sustainability-it";
+        workload.name = "chop-sustainability-it-" + verdict;
         workload.topics = 1;
         workload.partitionsPerTopic = 10;
         workload.messageSize = 100;
@@ -111,15 +181,17 @@ class ChopRateFinderKafkaIT {
 
         workload.producerRate = 0; // discover the rate
         workload.rampAlgorithm = RampAlgorithm.CHOP;
+        workload.rampVerdict = verdict;
         workload.rampStartRate = 5000; // a realistic starting point, not an adversarial one
         workload.rampMaxBacklogSeconds = 0.1;
 
-        // Short timings so the IT finishes quickly; the clamp behaviour is per-poll, not
-        // hold-length dependent, so shrinking these doesn't weaken what's under test.
+        // Short timings so the IT finishes in a few minutes. The hold must still outlast the
+        // broker's burst-absorption time or an unsustainable rate can look clean in either verdict
+        // mode, so these are the floor rather than an arbitrary choice.
         workload.rampBracketPeriodSeconds = 2;
         workload.rampSettleSeconds = 5;
-        workload.rampBracketHoldSeconds = 15;
-        workload.rampHoldSeconds = 20; // long enough that a burst cannot masquerade as sustainable
+        workload.rampBracketHoldSeconds = 10;
+        workload.rampHoldSeconds = 15;
         workload.rampConvergenceTolerance = 0.05;
         workload.rampMaxDiscoveryMinutes = 6; // safety cap
 
