@@ -747,6 +747,71 @@ class RampRateFinderTest {
     }
 
     @Test
+    void anOvershootIsDrainedAtAKnownGoodRateBeforeTheNextCandidateIsJudged() {
+        // A failed candidate leaves the system carrying its overshoot -- deep queues, consumer lag,
+        // GC pressure. Judging the next candidate immediately measures that fallout rather than the
+        // candidate, and since bracket only ever moves lo upward, one contaminated reading is
+        // unrecoverable. So after a failure, run at a rate already known to be sustainable (lo)
+        // until the backlog clears, and evaluate nothing while doing it.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 1;
+        workload.rampDrainSeconds = 5;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        // 1000 holds clean, so lo = 1000 -- the rate the drain will later fall back to.
+        finder.poll(periodNanos, 1000, 1000);
+        assertThat(finder.getLo()).isEqualTo(1000.0);
+        assertThat(finder.isDraining()).isFalse();
+
+        // 2000 breaches (500 messages of receive backlog against the 100 limit) -> overshoot.
+        finder.poll(periodNanos, 3000, 2500);
+        assertThat(finder.getHi()).isEqualTo(2000.0);
+        assertThat(finder.isDraining()).as("a failure must trigger recovery").isTrue();
+        assertThat(finder.getCurrentRate())
+                .as("drain runs at the known-good lo, not at the next candidate")
+                .isEqualTo(1000.0);
+
+        // While draining, nothing is judged: the backlog still present is the overshoot's, not the
+        // next candidate's, so no verdict may be recorded from it.
+        finder.poll(periodNanos, 4000, 3000);
+        assertThat(finder.isDraining()).isTrue();
+        assertThat(finder.getHi()).isEqualTo(2000.0); // unchanged -- no new verdict
+    }
+
+    @Test
+    void drainEndsEarlyOnceTheBacklogHasCleared() {
+        // The drain is capped, not fixed: waiting out the full cap when the system already recovered
+        // just burns the discovery budget. Once the backlog is back within the limit it is judged
+        // against, carry on.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 1;
+        workload.rampDrainSeconds = 600; // far longer than this test will need
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0);
+        finder.poll(periodNanos, 1000, 1000);
+        finder.poll(periodNanos, 3000, 2500); // breach -> drain
+        assertThat(finder.isDraining()).isTrue();
+
+        // Consumers catch up: backlog back to 0, inside the 100-message limit.
+        finder.poll(periodNanos, 4000, 4000);
+
+        assertThat(finder.isDraining())
+                .as("recovered well inside the 600s cap, so the drain should not wait it out")
+                .isFalse();
+        assertThat(finder.getCurrentRate())
+                .as("resumes the candidate the search had queued up, not the drain rate")
+                .isEqualTo(1500.0);
+    }
+
+    @Test
     void safetyCapIsDistinguishableFromAGenuineConfirm() {
         // Running out of time budget reports the best rate found so far, which from the outside is
         // indistinguishable from a verified one: isConfirmed() is false either way when a hold was

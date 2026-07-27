@@ -213,6 +213,10 @@ class ChopRateFinderKafkaIT {
         workload.rampSettleSeconds = 10;
         workload.rampBracketHoldSeconds = 45;
         workload.rampHoldSeconds = 45;
+        // Recover between candidates. The same 800k candidate was observed returning opposite
+        // verdicts on this broker minutes apart, so a failed candidate's fallout was demonstrably
+        // being measured as the next candidate's.
+        workload.rampDrainSeconds = 45;
         workload.rampConvergenceTolerance = 0.05;
         workload.rampMaxDiscoveryMinutes = 15; // safety cap, sized for 45s holds
 

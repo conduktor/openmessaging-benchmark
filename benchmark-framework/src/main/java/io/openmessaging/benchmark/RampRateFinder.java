@@ -58,6 +58,7 @@ class RampRateFinder {
     private final long settleNanos;
     private final long bracketHoldNanos;
     private final long holdNanos;
+    private final long drainNanos;
     private final double convergenceTolerance;
     private final long maxDiscoveryNanos;
     private final int requiredConfirmationHolds;
@@ -99,6 +100,10 @@ class RampRateFinder {
     @Getter(PACKAGE)
     private boolean safetyCapped = false;
 
+    // True while recovering from a failed candidate's overshoot. Nothing is evaluated while set.
+    @Getter(PACKAGE)
+    private boolean draining = false;
+
     private long previousTotalPublished = 0;
     private long previousTotalReceived = 0;
     private long elapsedSettleNanos = 0;
@@ -110,6 +115,8 @@ class RampRateFinder {
     private long holdPublished = 0;
     private long holdReceived = 0;
     private long holdElapsedNanos = 0;
+    private long elapsedDrainNanos = 0;
+    private double pendingRate = 0;
 
     private final List<RateVerdict> history = new ArrayList<>();
 
@@ -141,6 +148,11 @@ class RampRateFinder {
                         ? workload.rampBracketHoldSeconds.intValue()
                         : holdSeconds;
         this.bracketHoldNanos = SECONDS.toNanos(bracketHoldSeconds);
+        // Defaults to 0 (off). Enabling it changes the search trajectory after every failure, so it
+        // is opt-in first -- the same way CHOP and the THROUGHPUT verdict were introduced -- until
+        // there are integration runs behind it. A good starting value is the resolved rampHoldSeconds.
+        int drainSeconds = workload.rampDrainSeconds != null ? workload.rampDrainSeconds.intValue() : 0;
+        this.drainNanos = SECONDS.toNanos(drainSeconds);
         this.convergenceTolerance =
                 workload.rampConvergenceTolerance != null
                         ? workload.rampConvergenceTolerance.doubleValue()
@@ -185,6 +197,30 @@ class RampRateFinder {
             return false;
         }
 
+        if (draining) {
+            elapsedDrainNanos += periodNanos;
+            // Re-baseline so the recovery period's traffic is never attributed to the next
+            // candidate's hold, exactly as the settle phase does for start-up transients.
+            previousTotalPublished = totalPublished;
+            previousTotalReceived = totalReceived;
+            long drainBacklog = subscriptions * totalPublished - totalReceived;
+            boolean recovered = drainBacklog <= receiveBacklogLimitFor(currentRate);
+            boolean outOfPatience = elapsedDrainNanos >= drainNanos;
+            if (recovered || outOfPatience) {
+                log.info(
+                        "FINDER-DRAIN recovery {} after {}s at {} msg/s (backlog {}); resuming at {} msg/s",
+                        recovered ? "complete" : "capped",
+                        SECONDS.convert(elapsedDrainNanos, NANOSECONDS),
+                        currentRate,
+                        drainBacklog,
+                        pendingRate);
+                draining = false;
+                elapsedDrainNanos = 0;
+                currentRate = pendingRate;
+            }
+            return false;
+        }
+
         long expected = (long) ((currentRate / ONE_SECOND_IN_NANOS) * periodNanos);
         long published = totalPublished - previousTotalPublished;
         long receiveBacklog = subscriptions * totalPublished - totalReceived;
@@ -225,10 +261,7 @@ class RampRateFinder {
             // the wrong direction for a recovery mechanism -- letting one bad reading cascade all
             // the way down to a near-zero "confirmed" rate (also a real incident, reproduced
             // deterministically twice on the same starting conditions).
-            double limit =
-                    Math.max(
-                            maxBacklogFloor,
-                            Math.min(currentRate * maxBacklogSeconds, (double) maxBacklogCeiling));
+            double limit = receiveBacklogLimitFor(currentRate);
             breachedNow = receiveBacklog > limit || publishBacklog > limit;
         } else {
             breachedNow = receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
@@ -260,8 +293,8 @@ class RampRateFinder {
 
         if (lo != null && hi != null) {
             phase = Phase.CHOP;
-            currentRate = (lo + hi) / 2.0;
-            return false;
+            double next = (lo + hi) / 2.0;
+            return failed ? beginDrain(next) : setRate(next);
         }
 
         bracketIterations++;
@@ -270,8 +303,8 @@ class RampRateFinder {
             return true;
         }
 
-        currentRate = failed ? currentRate / 2.0 : currentRate * 2.0;
-        return false;
+        double next = failed ? currentRate / 2.0 : currentRate * 2.0;
+        return failed ? beginDrain(next) : setRate(next);
     }
 
     private boolean pollChop(boolean breachedNow, long periodNanos) {
@@ -298,12 +331,10 @@ class RampRateFinder {
                 lo = bestKnownPassBelow(hi);
                 confirming = false;
                 confirmationHoldsPassed = 0;
-                currentRate = (lo + hi) / 2.0;
-                return false;
+                return beginDrain((lo + hi) / 2.0);
             }
             hi = currentRate;
-            currentRate = (lo + hi) / 2.0;
-            return false;
+            return beginDrain((lo + hi) / 2.0);
         }
 
         recordVerdict(currentRate, true);
@@ -346,6 +377,36 @@ class RampRateFinder {
     // within convergenceTolerance, so lo may sit fractionally above the real ceiling -- and under
     // THROUGHPUT it provably can, since that gate accepts any rate up to capacity / ratio. Backing
     // off by the same width the search is uncertain over keeps the reported number on the safe side.
+    // The receive-side backlog the current mode tolerates at a given rate. Shared by the BACKLOG
+    // verdict and by the recovery period's "has it drained yet" check, so the two agree on what
+    // "clear" means rather than the drain inventing its own threshold.
+    private double receiveBacklogLimitFor(double rate) {
+        if (maxBacklogSeconds == null) {
+            return receiveBacklogLimit;
+        }
+        return Math.max(
+                maxBacklogFloor, Math.min(rate * maxBacklogSeconds, (double) maxBacklogCeiling));
+    }
+
+    private boolean setRate(double next) {
+        currentRate = next;
+        return false;
+    }
+
+    // Enter recovery after a failed candidate: run at the highest rate already observed to hold
+    // (falling back to the queued candidate when nothing has passed yet, e.g. bracket halving down
+    // from a start rate that was already too high) and evaluate nothing until the backlog clears.
+    private boolean beginDrain(double next) {
+        if (drainNanos == 0) {
+            return setRate(next);
+        }
+        pendingRate = next;
+        currentRate = lo != null ? lo : next;
+        draining = true;
+        elapsedDrainNanos = 0;
+        return false;
+    }
+
     private double confirmRate() {
         return lo * (1.0 - convergenceTolerance);
     }
@@ -399,7 +460,8 @@ class RampRateFinder {
     String describeConfig() {
         return String.format(
                 "verdict=%s subscriptions=%d startRate=%s settle=%ds bracketHold=%ds hold=%ds"
-                        + " tolerance=%s confirmHolds=%d budget=%dmin minThroughputRatio=%s"
+                        + " drainCap=%ds tolerance=%s confirmHolds=%d budget=%dmin"
+                        + " minThroughputRatio=%s"
                         + " backlogLimits=[publish=%d receive=%d maxBacklogSeconds=%s floor=%d"
                         + " ceiling=%d]",
                 verdict,
@@ -408,6 +470,7 @@ class RampRateFinder {
                 SECONDS.convert(settleNanos, NANOSECONDS),
                 SECONDS.convert(bracketHoldNanos, NANOSECONDS),
                 SECONDS.convert(holdNanos, NANOSECONDS),
+                SECONDS.convert(drainNanos, NANOSECONDS),
                 convergenceTolerance,
                 requiredConfirmationHolds,
                 MINUTES.convert(maxDiscoveryNanos, NANOSECONDS),

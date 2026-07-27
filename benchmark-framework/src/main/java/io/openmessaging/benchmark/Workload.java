@@ -131,6 +131,21 @@ public class Workload {
      */
     public Integer rampBracketHoldSeconds;
 
+    /**
+     * CHOP only: upper bound, in seconds, on the recovery period run after a candidate rate fails. A
+     * failed candidate leaves the system carrying its overshoot (deep queues, consumer lag, GC
+     * pressure); judging the next candidate immediately measures that fallout instead of the
+     * candidate, and since the bracket phase only ever raises lo, one contaminated reading cannot be
+     * recovered from. During recovery the load runs at the highest rate already known to be
+     * sustainable and nothing is evaluated. This is a cap, not a fixed wait: recovery ends as soon as
+     * the backlog is back within the limit it is judged against, so when there is nothing to drain it
+     * costs a single poll.
+     *
+     * <p>Defaults to 0 (off), because enabling it changes the search trajectory after every failed
+     * candidate; a good starting value is the resolved rampHoldSeconds.
+     */
+    public Integer rampDrainSeconds;
+
     /** CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 30. */
     public Integer rampHoldSeconds;
 
