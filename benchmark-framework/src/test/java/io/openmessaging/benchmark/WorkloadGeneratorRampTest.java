@@ -71,6 +71,47 @@ class WorkloadGeneratorRampTest {
     }
 
     @Test
+    void impossibleThroughputRatioIsRejected() {
+        // A ratio above 1 asks the producer to publish more than it was told to, which the rate
+        // limiter's fixed virtual schedule makes impossible: every candidate fails and the search
+        // halves to nothing. Cheaper to reject than to diagnose from a collapsed run.
+        Workload workload = discoveryWorkload();
+        workload.rampVerdict = RampVerdict.THROUGHPUT;
+        workload.rampMinThroughputRatio = 1.5;
+
+        assertThatThrownBy(() -> new WorkloadGenerator("Kafka", workload, new StalledConsumerWorker()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("rampMinThroughputRatio");
+    }
+
+    @Test
+    void convergenceToleranceOfOneOrMoreIsRejected() {
+        // Confirmation holds run at lo x (1 - rampConvergenceTolerance), so a tolerance of 1 or
+        // more drives the confirmed rate to zero or negative.
+        Workload workload = discoveryWorkload();
+        workload.rampConvergenceTolerance = 1.0;
+
+        assertThatThrownBy(() -> new WorkloadGenerator("Kafka", workload, new StalledConsumerWorker()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("rampConvergenceTolerance");
+    }
+
+    @Test
+    void backlogFloorAboveCeilingIsRejected() {
+        // Math.max(floor, min(rate x seconds, ceiling)) means the floor silently wins and the
+        // ceiling is never applied -- the exact combination that let a runaway bracket confirm a
+        // two-orders-of-magnitude-wrong rate.
+        Workload workload = discoveryWorkload();
+        workload.rampMaxBacklogSeconds = 0.1;
+        workload.rampMaxBacklogFloor = 50_000L;
+        workload.rampMaxBacklogCeiling = 1_000L;
+
+        assertThatThrownBy(() -> new WorkloadGenerator("Kafka", workload, new StalledConsumerWorker()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("rampMaxBacklogFloor");
+    }
+
+    @Test
     void discoveryThatNeverFindsASustainableRateFailsInsteadOfReportingNearZero() throws Exception {
         // Consumers never drain, so every candidate breaches and the bracket phase halves all the
         // way down. finishWithBestKnown() only assigns lo when one exists, so currentRate is left at

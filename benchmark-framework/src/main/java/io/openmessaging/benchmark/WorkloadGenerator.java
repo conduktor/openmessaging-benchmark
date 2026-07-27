@@ -86,6 +86,37 @@ public class WorkloadGenerator implements AutoCloseable {
                             + "): there is no drain signal to judge a candidate rate against."
                             + " Set both to at least 1, or set a fixed producerRate.");
         }
+
+        // The ramp knobs all default silently, so an out-of-range value shows up as a collapsed or
+        // runaway discovery rather than as an error. Reject the combinations that cannot work.
+        if (workload.rampMinThroughputRatio != null
+                && (workload.rampMinThroughputRatio <= 0 || workload.rampMinThroughputRatio > 1)) {
+            throw new IllegalArgumentException(
+                    "rampMinThroughputRatio must be in (0, 1] but was "
+                            + workload.rampMinThroughputRatio
+                            + ": it is the fraction of the target rate a candidate must achieve, and"
+                            + " the rate limiter's fixed schedule means published can never exceed"
+                            + " the target, so a ratio above 1 fails every candidate.");
+        }
+        if (workload.rampConvergenceTolerance != null
+                && (workload.rampConvergenceTolerance <= 0 || workload.rampConvergenceTolerance >= 1)) {
+            throw new IllegalArgumentException(
+                    "rampConvergenceTolerance must be in (0, 1) but was "
+                            + workload.rampConvergenceTolerance
+                            + ": confirmation holds run at lo x (1 - tolerance), so 1 or more drives"
+                            + " the confirmed rate to zero, and 0 never converges.");
+        }
+        if (workload.rampMaxBacklogFloor != null
+                && workload.rampMaxBacklogCeiling != null
+                && workload.rampMaxBacklogFloor > workload.rampMaxBacklogCeiling) {
+            throw new IllegalArgumentException(
+                    "rampMaxBacklogFloor ("
+                            + workload.rampMaxBacklogFloor
+                            + ") must not exceed rampMaxBacklogCeiling ("
+                            + workload.rampMaxBacklogCeiling
+                            + "): the limit is max(floor, min(rate x seconds, ceiling)), so the floor"
+                            + " would silently win and the ceiling never apply.");
+        }
     }
 
     public TestResult run() throws Exception {
@@ -291,6 +322,7 @@ public class WorkloadGenerator implements AutoCloseable {
 
         RampRateFinder finder = new RampRateFinder(workload);
         double startRate = finder.getCurrentRate();
+        double appliedRate = startRate;
         log.info(
                 "----- Ramp discovery (CHOP) starting: pollPeriod={}s {} -----",
                 bracketPeriodSeconds,
@@ -315,7 +347,15 @@ public class WorkloadGenerator implements AutoCloseable {
             lastControlTimestamp = currentTime;
 
             done = finder.poll(periodNanos, stats.messagesSent, stats.messagesReceived);
-            worker.adjustPublishRate(finder.getCurrentRate());
+
+            // Only re-apply on an actual change. adjustPublishRate builds a fresh
+            // UniformRateLimiter, which resets its virtual schedule -- calling it every poll threw
+            // away publish-delay accumulation every few seconds, and publish delay is the signal
+            // this file's own integration test uses to decide whether a rate was sustainable.
+            if (finder.getCurrentRate() != appliedRate) {
+                appliedRate = finder.getCurrentRate();
+                worker.adjustPublishRate(appliedRate);
+            }
 
             if (!wasConfirming && finder.isConfirming()) {
                 verificationStartedAt = Instant.now();

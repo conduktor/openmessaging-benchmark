@@ -37,7 +37,7 @@ That thread loops every `controlPeriodMillis = 3000` (hardcoded, 3 seconds):
 
 - Compute `expected` throughput for the period from the current rate, and compare it against what
   was actually `published`/`received`.
-- If `receiveBacklog` (`totalPublished - totalReceived`) or `publishBacklog`
+- If `receiveBacklog` (`subscriptionsPerTopic * totalPublished - totalReceived`) or `publishBacklog`
   (`expected - published`) exceeds a limit → **ramp down**: halve `rampingFactor` (floored at
   `minRampingFactor`) and return a reduced rate computed from actual throughput.
 - Otherwise → **ramp up**: double `rampingFactor` (capped at `maxRampingFactor`) and return
@@ -87,19 +87,32 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    to know a rate actually holds.
 4. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
    isn't accepted immediately. It must pass `rampConfirmationHolds` (default 1) additional,
-   consecutive clean holds at the *same* rate before being accepted. This is what makes "verified"
-   mean something more than "passed once."
+   consecutive clean holds before being accepted. This is what makes "verified" mean something more
+   than "passed once."
+
+   Those confirmation holds run at **`lo × (1 − rampConvergenceTolerance)`**, not at `lo` itself.
+   Chop converges to within the tolerance of a *failing* rate, so `lo` sits right at the knee: it is
+   the highest rate observed to pass, but the search only knows the knee to within the tolerance, so
+   `lo` can be fractionally above the real ceiling — and under `THROUGHPUT` it provably can be, since
+   that gate accepts anything up to `capacity / rampMinThroughputRatio`. Confirming just below the
+   knee has two effects: the re-check stops being a coin flip at the boundary (a flip there used to
+   latch `isNonMonotonic()` and withhold the whole result), and the rate finally reported is one that
+   was actually held for a full hold. Note the coupling: `rampConvergenceTolerance` therefore doubles
+   as the size of the safety margin.
+
 5. **Reopen on a failed confirmation** — if a confirmation hold fails (the rate looked fine, then
    didn't hold up), CHOP does not accept it anyway. It reopens the search: tightens `hi` to the
    failed rate, and falls back to the highest rate already *observed* to pass below it (never a
    blind guess — `lo` is always sourced from a real, recorded pass) as the new `lo`, then restarts
    the hold-and-confirm cycle from there.
+
 6. **Non-monotonic flag** — every tested `(rate, passed/failed)` outcome is recorded. If a later
    verdict ever contradicts an earlier one (e.g. a lower rate fails after a higher one already
    passed), `isNonMonotonic()` is set and stays set for the rest of the run, even if the reopened
    search goes on to confirm cleanly. It's a signal that the system showed unstable behavior
    *somewhere* during discovery, so the final number may not reproduce as cleanly as a clean run
    would.
+
 7. **Safety cap** — `rampMaxDiscoveryMinutes` (default 10) bounds total discovery time; if hit,
    discovery stops and reports the best confirmed-or-passed `lo` found so far. Bear in mind the
    settle period and every bracket/chop hold all draw from this same budget — with generous hold
@@ -131,7 +144,7 @@ predicate decides that is controlled by `rampVerdict`, with two modes:
 |           Field            |                Default                 |                                                                                                                                                                        Applies to                                                                                                                                                                         |
 |----------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `rampAlgorithm`            | `AIMD`                                 | Selects the algorithm                                                                                                                                                                                                                                                                                                                                     |
-| `rampVerdict`              | `BACKLOG`                              | Both — selects the clean/not-clean predicate for holds; `THROUGHPUT` is the scale-free alternative (see "Verdict modes" above)                                                                                                                                                                                                                            |
+| `rampVerdict`              | `BACKLOG`                              | CHOP only — selects the clean/not-clean predicate for holds; `THROUGHPUT` is the scale-free alternative (see "Verdict modes" above). AIMD never builds a `RampRateFinder`, so this field has no effect on it                                                                                                                                              |
 | `rampMinThroughputRatio`   | 0.95                                   | CHOP only — THROUGHPUT verdict                                                                                                                                                                                                                                                                                                                            |
 | `rampStartRate`            | 10000                                  | Both                                                                                                                                                                                                                                                                                                                                                      |
 | `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                      |
@@ -166,10 +179,55 @@ a specific, possibly-unreproducible rate):
 }
 ```
 
+`rate` is the throughput the confirmation hold **actually achieved** (`published / holdSeconds`),
+not the target it was asked for. The two agree at a sustainable rate; where they disagree, the
+achieved figure is the true one, and it is the figure the window below actually brackets. Because
+confirmation runs at `lo x (1 - rampConvergenceTolerance)` (see "Confirm" above), this number is
+deliberately on the conservative side of the knee — read it as "a rate you can run", not as a
+capacity ceiling.
+
 `nonMonotonic` is therefore always `false` whenever this object is present (kept in the schema for
-stability rather than removed). `startEpochMillis`/`endEpochMillis` bracket the *final* confirmation
-hold specifically — useful for attributing resource usage (CPU/memory) to the verified rate rather
-than the whole warmup + discovery + measurement run.
+stability rather than removed). `startEpochMillis`/`endEpochMillis` bracket the confirmation holds —
+useful for attributing resource usage (CPU/memory) to the verified rate rather than the whole warmup
++ discovery + measurement run. With `rampConfirmationHolds > 1` the window spans all of them, not
+just the last.
+
+### When discovery refuses to answer, and how to see why
+
+Discovery used to be able to return a number in situations where it had not actually found one. It
+now fails loudly instead:
+
+- **Rejected up front** (`IllegalArgumentException` from the `WorkloadGenerator` constructor):
+  `producerRate: 0` with `subscriptionsPerTopic` or `consumerPerSubscription` at `0` — with no
+  consumers there is no drain signal, so no candidate can ever be judged sustainable. Both are
+  primitive `int`s and the YAML mapper ignores unknown properties, so an omitted *or misspelled*
+  field silently arrives as `0`. Also rejected: `rampMinThroughputRatio` outside `(0, 1]`,
+  `rampConvergenceTolerance` outside `(0, 1)`, and `rampMaxBacklogFloor` above
+  `rampMaxBacklogCeiling` (the limit is `max(floor, min(rate x seconds, ceiling))`, so the floor
+  would silently win and the ceiling never apply).
+- **Nothing ever held** (`IllegalStateException`): the bracket phase halves on every failure, so if
+  no candidate holds cleanly it bottoms out at `rampStartRate / 2^20` with no `lo` to report.
+  `LocalWorker` clamps anything under `1.0` to `1 msg/s`, so this previously ran the whole
+  measurement window at a flatline and certified it — the shape of the `0.9155 msg/s` trial finding
+  below.
+- **Out of time** (`WARN`, not a failure): hitting `rampMaxDiscoveryMinutes` reports the best rate
+  that held but *without* a confirmation, which otherwise looks identical to a converged run from
+  the outside. Worth watching under `THROUGHPUT`, which has no per-poll fast-fail, so every
+  candidate — including doomed bracket overshoots — costs a full hold. Budget roughly
+  `settle + (bracket steps + chop steps + confirmation holds) x hold`.
+
+For diagnosis, discovery logs its **resolved** configuration once at start (every ramp field defaults
+silently, so a misspelled one otherwise looks like it applied), and one `FINDER-HOLD` line per
+completed hold at `INFO`:
+
+```
+FINDER-HOLD phase=CHOP rate=4750.0 verdict=exceeded confirming=false expected=4750 published=4500
+            received=4500 achievedRatio=0.947 drainRatio=1.000 bracket=[4500.0, 5000.0]
+```
+
+`achievedRatio` is `published / expected` and `drainRatio` is
+`received / (subscriptionsPerTopic x published)` — the two quantities the `THROUGHPUT` verdict
+compares against `rampMinThroughputRatio`, shown in both modes.
 
 ### Known limitation
 
