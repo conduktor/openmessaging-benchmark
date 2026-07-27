@@ -13,17 +13,17 @@
 #
 
 # Build the Project
-FROM maven:3.9.9-eclipse-temurin-17 as build
+FROM maven:3.9.9-eclipse-temurin-21 as build
 COPY . /benchmark
 WORKDIR /benchmark
 RUN mvn install
 
 # Create the benchmark image
-FROM eclipse-temurin:17
+FROM eclipse-temurin:21
 COPY --from=build /benchmark/package/target/openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz /
-RUN mkdir /benchmark && tar -xzf openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz -C /benchmark --strip=1
+RUN mkdir /opt/benchmark && tar -xzf openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz -C /opt/benchmark --strip=1
 RUN rm /openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz
-WORKDIR /benchmark
+WORKDIR /opt/benchmark
 
 # Install vim
 ENV DEBIAN_FRONTEND=noninteractive

@@ -90,7 +90,7 @@
         <!-- Integration tests (failsafe *IT) are skipped by default so PR CI stays fast and
              Docker-free; enable with the integration-tests profile or -DskipITs=false. -->
         <skipITs>true</skipITs>
-        <spotbugs.plugin.version>4.7.2.0</spotbugs.plugin.version>
+        <spotbugs.plugin.version>4.7.3.6</spotbugs.plugin.version>
         <spotless.plugin.version>2.25.0</spotless.plugin.version>
     </properties>
 
