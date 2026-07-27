@@ -188,7 +188,51 @@ backlog count, so the same threshold is neither too strict nor too loose regardl
 is being tested. `BACKLOG` remains the default — `THROUGHPUT` is opt-in until it has more runs
 behind it.
 
-### Trial finding: hold length, not the verdict predicate, is now the dominant error
+### Trial finding: THROUGHPUT over-reports ~1.7x vs BACKLOG, and longer holds do not fix it
+
+Superseded the entry below, on 2026-07-27, with `rampHoldSeconds` tripled from 15s to 45s (bracket
+held to the same duration) and `rampDrainSeconds: 45` enabled. Same single-broker Testcontainers
+Kafka, `rampStartRate: 5000`, 2-minute measurement window.
+
+|   Verdict    | Holds | Confirmed | Window achieved | Avg publish delay | Max backlog |
+|--------------|-------|-----------|-----------------|-------------------|-------------|
+| `BACKLOG`    | 45s   | 841,158   | 841,088         | **0.9 ms**        | 154         |
+| `BACKLOG`    | 45s   | withheld  | 760,584         | 0.1 ms            | 1,199       |
+| `THROUGHPUT` | 45s   | withheld  | 1,421,630       | **2,612 ms**      | 54,622      |
+
+**The earlier conclusion was wrong, and wrong for a specific reason: it compared across verdict
+modes.** It set `THROUGHPUT` at a 15s hold (3,037 ms delay) against `BACKLOG` at a 45s hold (0.9 ms)
+and attributed the difference to hold length. Holding the verdict constant instead:
+
+- `THROUGHPUT`, 15s hold → 3,037 ms delay. `THROUGHPUT`, 45s hold → 2,612 ms delay. Tripling the
+  hold barely moved it.
+- `BACKLOG` at 45s lands on 841k and the window sustains it with sub-millisecond delay.
+
+So hold length is not the dominant error. `THROUGHPUT` selects ~1.7x `BACKLOG`'s rate, and that rate
+is not sustainable: 2.6 seconds of average publish delay and a 54,622-message backlog over the
+window.
+
+**Diagnosis: the achieved-rate ratio is a lagging indicator of saturation; a backlog count is a
+leading one.** At 1.42M the broker really does ack 1.42M/s for the whole 45-second hold, absorbing
+the excess into page cache and socket/producer buffers — so `published/expected` reads ~1.0 and the
+consumer keeps pace with what was published, and both `THROUGHPUT` gates pass honestly. Throughput
+only droops once absorption is exhausted, which on this hardware takes longer than the hold *and*
+longer than the measurement window. A backlog-count check sees the queue depth rise immediately,
+which is why `BACKLOG` gets the right answer here.
+
+This partially vindicates the predicate the `THROUGHPUT` design set out to replace. The count-based
+check is genuinely wrong about *scale* — that is what the ~320x under-report below demonstrates — but
+it is watching the right variable: queue growth, which leads, rather than achieved throughput, which
+lags.
+
+**Suggested direction** (not implemented): keep the scale-free ratio for what it is good at, and add
+a trend gate for what it is not — require that the backlog is not *growing* across the hold, or that
+achieved throughput in the hold's second half matches its first. Both detect a filling buffer at any
+hold length, which no aggregate-over-the-whole-hold statistic can. Note also that 3 of 5 real runs
+here withheld their answer to `isNonMonotonic()`, so neither mode currently produces a reliable
+point value on this broker.
+
+### Superseded: hold length, not the verdict predicate, is the dominant error
 
 Found running the strengthened `ChopRateFinderKafkaIT` against a single-broker Testcontainers Kafka
 on 2026-07-27, after the confirm-below-the-knee and achieved-rate-reporting changes. Three discovery
