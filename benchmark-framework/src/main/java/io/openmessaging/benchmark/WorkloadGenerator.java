@@ -291,6 +291,10 @@ public class WorkloadGenerator implements AutoCloseable {
 
         RampRateFinder finder = new RampRateFinder(workload);
         double startRate = finder.getCurrentRate();
+        log.info(
+                "----- Ramp discovery (CHOP) starting: pollPeriod={}s {} -----",
+                bracketPeriodSeconds,
+                finder.describeConfig());
         worker.adjustPublishRate(startRate);
 
         long lastControlTimestamp = System.nanoTime();
@@ -346,6 +350,18 @@ public class WorkloadGenerator implements AutoCloseable {
                     "----- CHOP verification window: {} -> {} (rate {} msg/s) -----",
                     verificationStartedAt,
                     verificationConfirmedAt,
+                    finder.getCurrentRate());
+        }
+
+        if (finder.isSafetyCapped()) {
+            // Without this, a discovery that simply ran out of time logs exactly like one that
+            // converged -- the rate is reported either way and rampVerification is quietly absent.
+            log.warn(
+                    "Ramp discovery hit its {} minute budget (rampMaxDiscoveryMinutes) before"
+                            + " converging; reporting the best rate that held ({} msg/s) without a"
+                            + " confirmation. This is not a verified result -- raise the budget, or"
+                            + " shorten rampHoldSeconds/rampBracketHoldSeconds, to let it finish.",
+                    workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes : 10,
                     finder.getCurrentRate());
         }
 

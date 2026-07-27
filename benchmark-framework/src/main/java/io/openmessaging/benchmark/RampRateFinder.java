@@ -14,6 +14,7 @@
 package io.openmessaging.benchmark;
 
 import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static lombok.AccessLevel.PACKAGE;
 
@@ -21,6 +22,7 @@ import io.openmessaging.benchmark.utils.Env;
 import java.util.ArrayList;
 import java.util.List;
 import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Discovers the maximum sustainable producer rate: after an initial settle period, an exponential
@@ -32,6 +34,7 @@ import lombok.Getter;
  * reading the clock itself) so it remains a fast, deterministic pure state machine to unit test;
  * the caller owns real sleeping/timing.
  */
+@Slf4j
 class RampRateFinder {
     private static final long ONE_SECOND_IN_NANOS = SECONDS.toNanos(1);
     private static final int MAX_BRACKET_ITERATIONS = 20;
@@ -90,6 +93,11 @@ class RampRateFinder {
 
     @Getter(PACKAGE)
     private boolean settled = false;
+
+    // Set only when the time budget forced completion, so a truncated discovery can be told apart
+    // from one that ran to a genuine confirm -- otherwise both just return a rate.
+    @Getter(PACKAGE)
+    private boolean safetyCapped = false;
 
     private long previousTotalPublished = 0;
     private long previousTotalReceived = 0;
@@ -157,6 +165,7 @@ class RampRateFinder {
 
         totalElapsedNanos += periodNanos;
         if (totalElapsedNanos >= maxDiscoveryNanos) {
+            safetyCapped = true;
             finishWithBestKnown();
             return true;
         }
@@ -359,7 +368,57 @@ class RampRateFinder {
         return producerKeepsUp && consumerKeepsUp;
     }
 
+    // A one-line resolved-config summary. Rendered by the caller at discovery start so a run's log
+    // shows the values actually in effect -- the ramp fields all default silently, and the YAML
+    // mapper ignores unknown properties, so a misspelled field otherwise looks like it applied.
+    String describeConfig() {
+        return String.format(
+                "verdict=%s subscriptions=%d startRate=%s settle=%ds bracketHold=%ds hold=%ds"
+                        + " tolerance=%s confirmHolds=%d budget=%dmin minThroughputRatio=%s"
+                        + " backlogLimits=[publish=%d receive=%d maxBacklogSeconds=%s floor=%d"
+                        + " ceiling=%d]",
+                verdict,
+                subscriptions,
+                currentRate,
+                SECONDS.convert(settleNanos, NANOSECONDS),
+                SECONDS.convert(bracketHoldNanos, NANOSECONDS),
+                SECONDS.convert(holdNanos, NANOSECONDS),
+                convergenceTolerance,
+                requiredConfirmationHolds,
+                MINUTES.convert(maxDiscoveryNanos, NANOSECONDS),
+                minThroughputRatio,
+                publishBacklogLimit,
+                receiveBacklogLimit,
+                maxBacklogSeconds,
+                maxBacklogFloor,
+                maxBacklogCeiling);
+    }
+
+    private static double ratio(long numerator, long denominator) {
+        return denominator == 0 ? 0.0 : (double) numerator / denominator;
+    }
+
     private void recordVerdict(double rate, boolean passed) {
+        // Every completed hold funnels through here exactly once, so this is the single place that
+        // can show why a candidate was judged the way it was. The AKS incidents in RATE_FINDING.md
+        // were diagnosed as "hard to say without instrumenting the actual hold windows"; this is
+        // that instrumentation. INFO (not debug) to match RateController's FINDER-TRACE, which
+        // emits regardless of the active log4j2 config.
+        log.info(
+                "FINDER-HOLD phase={} rate={} verdict={} confirming={} expected={} published={}"
+                        + " received={} achievedRatio={} drainRatio={} bracket=[{}, {}]",
+                phase,
+                rate,
+                passed ? "clean" : "exceeded",
+                confirming,
+                holdExpected,
+                holdPublished,
+                holdReceived,
+                String.format("%.3f", ratio(holdPublished, holdExpected)),
+                String.format("%.3f", ratio(holdReceived, subscriptions * holdPublished)),
+                lo,
+                hi);
+
         for (RateVerdict v : history) {
             if (passed && !v.passed && rate >= v.rate) {
                 nonMonotonic = true;

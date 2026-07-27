@@ -660,6 +660,52 @@ class RampRateFinderTest {
     }
 
     @Test
+    void safetyCapIsDistinguishableFromAGenuineConfirm() {
+        // Running out of time budget reports the best rate found so far, which from the outside is
+        // indistinguishable from a verified one: isConfirmed() is false either way when a hold was
+        // still pending, and getCurrentRate() returns a number regardless. A truncated discovery
+        // needs to say so, or it gets read as a completed one.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampHoldSeconds = 3;
+        workload.rampMaxDiscoveryMinutes = 1;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeSystem system = new FakeSystem(4500);
+        long periodNanos = SECONDS.toNanos(10);
+
+        boolean done = false;
+        for (int i = 0; i < 10 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.isSafetyCapped()).isTrue();
+        assertThat(finder.isConfirmed()).isFalse();
+        assertThat(finder.getLo()).isEqualTo(4000.0); // truncated, but with a real answer to report
+    }
+
+    @Test
+    void aGenuineConfirmIsNotFlaggedAsSafetyCapped() {
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampHoldSeconds = 6;
+        workload.rampConvergenceTolerance = 0.05;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeSystem system = new FakeSystem(4500);
+        long periodNanos = SECONDS.toNanos(3);
+
+        boolean done = false;
+        for (int i = 0; i < 100 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.isConfirmed()).isTrue();
+        assertThat(finder.isSafetyCapped()).isFalse();
+    }
+
+    @Test
     void consumerDrainIsMeasuredPerSubscriptionNotPerPublish() {
         // Every publish is delivered once per subscription, so with 3 subscriptions the consumers
         // must move 3x the publish rate. Aggregate drain caps at 3000 deliveries/s, which pins the
