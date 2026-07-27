@@ -15,6 +15,7 @@ package io.openmessaging.benchmark;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 
 import org.junit.jupiter.api.Test;
 
@@ -22,6 +23,7 @@ class RampRateFinderTest {
 
     private static Workload workload() {
         Workload workload = new Workload();
+        workload.subscriptionsPerTopic = 1; // one delivery per publish, so received tracks published
         workload.rampPublishBacklogLimit = 100L;
         workload.rampReceiveBacklogLimit = 100L;
         workload.rampSettleSeconds = 0; // most tests don't care about settling; a few override it
@@ -523,6 +525,7 @@ class RampRateFinderTest {
 
     private static Workload throughputWorkload() {
         Workload workload = new Workload();
+        workload.subscriptionsPerTopic = 1; // one delivery per publish, so received tracks published
         workload.rampVerdict = RampVerdict.THROUGHPUT;
         workload.rampMinThroughputRatio = 0.95;
         workload.rampSettleSeconds = 0;
@@ -649,5 +652,103 @@ class RampRateFinderTest {
             done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
         }
         assertThat(done).isTrue();
+    }
+
+    @Test
+    void consumerDrainIsMeasuredPerSubscriptionNotPerPublish() {
+        // Every publish is delivered once per subscription, so with 3 subscriptions the consumers
+        // must move 3x the publish rate. Aggregate drain caps at 3000 deliveries/s, which pins the
+        // sustainable *publish* rate at 3000 / 3 = 1000 msg/s -- the producer itself could do 100k.
+        // Comparing received against published rather than against subscriptions x published makes
+        // the drain look 3x healthier than it is, and discovery climbs to ~3x the real ceiling.
+        Workload workload = throughputWorkload();
+        workload.subscriptionsPerTopic = 3;
+        workload.rampStartRate = 500;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeFanOutSystem system = new FakeFanOutSystem(100_000, 3000, 3);
+        long periodNanos = SECONDS.toNanos(1);
+
+        boolean done = false;
+        for (int i = 0; i < 200 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.getCurrentRate())
+                .as("sustainable publish rate is aggregate drain / subscriptions = 3000 / 3")
+                .isCloseTo(1000.0, within(150.0));
+    }
+
+    @Test
+    void receiveBacklogCountsDeliveriesPerSubscription() {
+        // A standing 150-delivery backlog across 3 subscriptions exceeds the 100-message limit and
+        // must fail the candidate. Subtracting raw received from raw published, rather than from
+        // subscriptions x published, turns that genuine backlog into a large negative number -- so
+        // the receive gate can never fire at all once there is more than one subscription.
+        Workload workload = workload();
+        workload.subscriptionsPerTopic = 3;
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeFanOutStandingBacklogSystem system = new FakeFanOutStandingBacklogSystem(3, 150);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, system.totalPublished, system.totalReceived); // settle + baseline
+        system.advance(finder.getCurrentRate(), periodNanos);
+        finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+
+        assertThat(finder.getHi())
+                .as("3 x 1000 published - 2850 received = 150 > 100")
+                .isEqualTo(1000.0);
+        assertThat(finder.getLo()).isNull();
+    }
+
+    /**
+     * Fans each publish out to every subscription and holds a constant total delivery backlog, so the
+     * per-subscription lag is small but the aggregate lag is {@code subscriptions} times larger.
+     */
+    private static final class FakeFanOutStandingBacklogSystem {
+        private final int subscriptions;
+        private final long standingDeliveryBacklog;
+        long totalPublished;
+        long totalReceived;
+
+        FakeFanOutStandingBacklogSystem(int subscriptions, long standingDeliveryBacklog) {
+            this.subscriptions = subscriptions;
+            this.standingDeliveryBacklog = standingDeliveryBacklog;
+        }
+
+        void advance(double rate, long periodNanos) {
+            totalPublished += (long) (rate * (periodNanos / 1e9));
+            totalReceived = Math.max(0, subscriptions * totalPublished - standingDeliveryBacklog);
+        }
+    }
+
+    /**
+     * A broker that fans each publish out to every subscription: the consumers must move {@code
+     * subscriptions * publishRate} deliveries to keep up, and {@code consumerCapacity} is the
+     * aggregate delivery rate they can manage across all of them. The sustainable publish rate is
+     * therefore {@code consumerCapacity / subscriptions}, independent of the producer's own ceiling.
+     */
+    private static final class FakeFanOutSystem {
+        private final double producerCapacity;
+        private final double consumerCapacity;
+        private final int subscriptions;
+        long totalPublished;
+        long totalReceived;
+
+        FakeFanOutSystem(double producerCapacity, double consumerCapacity, int subscriptions) {
+            this.producerCapacity = producerCapacity;
+            this.consumerCapacity = consumerCapacity;
+            this.subscriptions = subscriptions;
+        }
+
+        void advance(double rate, long periodNanos) {
+            double periodSeconds = periodNanos / 1e9;
+            totalPublished += (long) (Math.min(rate, producerCapacity) * periodSeconds);
+            long pendingDeliveries = subscriptions * totalPublished - totalReceived;
+            totalReceived += (long) Math.min(consumerCapacity * periodSeconds, pendingDeliveries);
+        }
     }
 }

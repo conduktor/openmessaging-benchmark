@@ -61,6 +61,12 @@ class RampRateFinder {
     private final RampVerdict verdict;
     private final double minThroughputRatio;
 
+    // Every publish is delivered once per subscription, so the consumers must move
+    // subscriptions x published to keep up. Comparing raw counters would make the drain look
+    // subscriptions-times healthier than it is. WorkloadGenerator applies the same factor wherever
+    // it reports backlog.
+    private final long subscriptions;
+
     @Getter(PACKAGE)
     private Phase phase = Phase.BRACKET;
 
@@ -140,6 +146,7 @@ class RampRateFinder {
                 workload.rampMinThroughputRatio != null
                         ? workload.rampMinThroughputRatio.doubleValue()
                         : 0.95;
+        this.subscriptions = workload.subscriptionsPerTopic;
     }
 
     // Advances the state machine given the latest period's counters. Returns true when done.
@@ -170,7 +177,7 @@ class RampRateFinder {
 
         long expected = (long) ((currentRate / ONE_SECOND_IN_NANOS) * periodNanos);
         long published = totalPublished - previousTotalPublished;
-        long receiveBacklog = totalPublished - totalReceived;
+        long receiveBacklog = subscriptions * totalPublished - totalReceived;
         long publishBacklog = expected - published;
         previousTotalPublished = totalPublished;
 
@@ -348,7 +355,7 @@ class RampRateFinder {
             return true;
         }
         boolean producerKeepsUp = holdPublished >= minThroughputRatio * holdExpected;
-        boolean consumerKeepsUp = holdReceived >= minThroughputRatio * holdPublished;
+        boolean consumerKeepsUp = holdReceived >= minThroughputRatio * subscriptions * holdPublished;
         return producerKeepsUp && consumerKeepsUp;
     }
 

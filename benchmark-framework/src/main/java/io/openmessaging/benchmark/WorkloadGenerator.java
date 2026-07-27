@@ -234,7 +234,10 @@ public class WorkloadGenerator implements AutoCloseable {
         long lastControlTimestamp = System.nanoTime();
 
         RateController rateController =
-                new RateController(workload.rampPublishBacklogLimit, workload.rampReceiveBacklogLimit);
+                new RateController(
+                        workload.rampPublishBacklogLimit,
+                        workload.rampReceiveBacklogLimit,
+                        workload.subscriptionsPerTopic);
 
         while (!runCompleted) {
             // Check every few seconds and adjust the rate

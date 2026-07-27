@@ -39,6 +39,24 @@ class RateControllerTest {
     }
 
     @Test
+    void receiveBacklogCountsDeliveriesPerSubscription() {
+        // 3 subscriptions means each publish is delivered 3 times, so 30,000 publishes owe 90,000
+        // deliveries. Only 87,000 have landed -- a 3,000-delivery backlog, 3x the 1,000 limit, so
+        // the controller must back off. Comparing raw published against raw received instead makes
+        // that look like a 57,000-message surplus, and the controller ramps *up* into consumers
+        // that are already falling behind. Publish backlog is 0 in both windows, so the receive
+        // gate is the only thing under test here.
+        RateController controller = new RateController(null, null, 3);
+
+        rate = controller.nextRate(rate, periodNanos, 10_000, 30_000);
+        assertThat(rate).isEqualTo(20_000); // consumers exactly keeping up: 3 x 10,000 delivered
+
+        rate = controller.nextRate(rate, periodNanos, 30_000, 87_000);
+        assertThat(rate).isLessThan(20_000);
+        assertThat(controller.getRampingFactor()).isEqualTo(0.5);
+    }
+
+    @Test
     void publishBacklog() {
         assertThat(rateController.getRampingFactor()).isEqualTo(1);
 
