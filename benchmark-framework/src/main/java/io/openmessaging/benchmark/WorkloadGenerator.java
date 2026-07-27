@@ -69,6 +69,23 @@ public class WorkloadGenerator implements AutoCloseable {
             throw new IllegalArgumentException(
                     "Cannot probe producer sustainable rate when building backlog");
         }
+
+        // Discovery judges a candidate rate partly on whether the consumers drain what was
+        // published, so with no consumers there is no drain signal and every candidate fails --
+        // the search then halves its way down to a meaningless near-zero "sustainable" rate. Both
+        // fields are primitive ints, so an omitted (or, since the YAML mapper runs with
+        // FAIL_ON_UNKNOWN_PROPERTIES disabled, a misspelled) field silently arrives as 0.
+        if (workload.producerRate == 0
+                && (workload.subscriptionsPerTopic == 0 || workload.consumerPerSubscription == 0)) {
+            throw new IllegalArgumentException(
+                    "Cannot discover a sustainable producer rate without consumers"
+                            + " (subscriptionsPerTopic="
+                            + workload.subscriptionsPerTopic
+                            + ", consumerPerSubscription="
+                            + workload.consumerPerSubscription
+                            + "): there is no drain signal to judge a candidate rate against."
+                            + " Set both to at least 1, or set a fixed producerRate.");
+        }
     }
 
     public TestResult run() throws Exception {
@@ -273,7 +290,8 @@ public class WorkloadGenerator implements AutoCloseable {
         long pollMillis = TimeUnit.SECONDS.toMillis(bracketPeriodSeconds);
 
         RampRateFinder finder = new RampRateFinder(workload);
-        worker.adjustPublishRate(finder.getCurrentRate());
+        double startRate = finder.getCurrentRate();
+        worker.adjustPublishRate(startRate);
 
         long lastControlTimestamp = System.nanoTime();
         boolean done = false;
@@ -299,6 +317,22 @@ public class WorkloadGenerator implements AutoCloseable {
                 verificationStartedAt = Instant.now();
             }
             wasConfirming = finder.isConfirming();
+        }
+
+        // The bracket phase halves on every failure, so a run where nothing ever holds cleanly ends
+        // with currentRate at startRate / 2^n and no lo to fall back on. Reporting that would hand
+        // the measurement window a near-zero rate (LocalWorker clamps anything below 1 to 1 msg/s)
+        // and then certify it -- the shape of a reproduced field incident. There is no answer here,
+        // so say so rather than inventing one.
+        if (finder.getLo() == null) {
+            throw new IllegalStateException(
+                    "Ramp discovery found no candidate rate that held cleanly, starting from "
+                            + startRate
+                            + " msg/s and halving down to "
+                            + finder.getCurrentRate()
+                            + " msg/s. Check that consumers are draining, and that the verdict"
+                            + " thresholds (rampVerdict, backlog limits / rampMinThroughputRatio)"
+                            + " are not impossibly strict for this setup.");
         }
 
         if (finder.isConfirmed() && !finder.isNonMonotonic()) {

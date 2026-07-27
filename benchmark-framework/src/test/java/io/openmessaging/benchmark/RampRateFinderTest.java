@@ -588,14 +588,19 @@ class RampRateFinderTest {
         assertThat(Math.abs(50_000.0 - throughputFinder.getCurrentRate()) / 50_000.0).isLessThan(0.1);
 
         // The same broker under the default count-based BACKLOG verdict sees 50,000 >> its
-        // 100-message limit at every rate and can never confirm anywhere near the ceiling.
+        // 100-message limit at *every* rate, so no candidate ever holds: the bracket phase halves
+        // all the way down and never establishes a lo at all. Asserting a loose upper bound here
+        // (the original "< 25,000") passes for entirely the wrong reason -- it hides the collapse
+        // rather than pinning it. WorkloadGeneratorRampTest covers the generator refusing to report
+        // this outcome as a rate.
         Workload backlog = workload();
         backlog.rampStartRate = 1000;
         backlog.rampBracketHoldSeconds = 1;
         backlog.rampHoldSeconds = 1;
         RampRateFinder backlogFinder = new RampRateFinder(backlog);
         driveToCompletion(backlogFinder, new FakeStableBacklogSystem(50_000, 50_000));
-        assertThat(backlogFinder.getCurrentRate()).isLessThan(25_000.0);
+        assertThat(backlogFinder.getLo()).as("no candidate ever held cleanly").isNull();
+        assertThat(backlogFinder.getCurrentRate()).isLessThan(1.0);
     }
 
     /** A producer/consumer pair with independent sustained capacities, seeded from zero. */
