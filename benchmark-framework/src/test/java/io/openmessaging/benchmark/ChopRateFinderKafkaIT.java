@@ -151,8 +151,18 @@ class ChopRateFinderKafkaIT {
 
         Double confirmedRate = result.rampVerification == null ? null : result.rampVerification.rate;
         double publishDelayAvgMs = result.aggregatedPublishDelayLatencyAvg / 1000.0;
+        // Median, not mean. LocalWorker.resetStats() only calls stats.resetLatencies() and never
+        // stats.reset(), so the message counters are NOT cleared between discovery and measurement:
+        // the first interval of a producerRate:0 run reports every message published during
+        // discovery as if it arrived in that one 10s window. Observed at 15,439,670 msg/s against a
+        // steady-state 481,000. A mean is wrecked by that single sample; the median ignores it.
         double measuredPublishRate =
-                result.publishRate.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+                result.publishRate.stream()
+                        .mapToDouble(Double::doubleValue)
+                        .sorted()
+                        .skip(Math.max(0, result.publishRate.size() / 2))
+                        .findFirst()
+                        .orElse(0.0);
         long maxBacklog = result.backlog.stream().mapToLong(Long::longValue).max().orElse(0L);
         log.info(
                 "{} confirmedRate={} msg/s | measurement window: achieved={} msg/s,"
@@ -182,22 +192,36 @@ class ChopRateFinderKafkaIT {
         workload.producerRate = 0; // discover the rate
         workload.rampAlgorithm = RampAlgorithm.CHOP;
         workload.rampVerdict = verdict;
-        workload.rampStartRate = 5000; // a realistic starting point, not an adversarial one
+        // Start LOW, and resist the temptation to start near the expected knee to save holds.
+        // Bracket's two directions are not symmetric under hysteresis. Climbing from below keeps
+        // every early candidate in the healthy regime, so lo is banked from genuinely clean
+        // readings and the knee is crossed exactly once. Starting above the knee inverts that: the
+        // first hold overloads the broker, and because rampSettleSeconds runs only once before
+        // bracket, nothing drains that fallout before the halved candidate is judged -- so it fails
+        // for reasons unrelated to its own rate, and the halving cascades without ever establishing
+        // a lo. Doubling is logarithmic, so starting low costs only a few extra holds.
+        workload.rampStartRate = 5000;
         workload.rampMaxBacklogSeconds = 0.1;
 
-        // Short timings so the IT finishes in a few minutes. The hold must still outlast the
-        // broker's burst-absorption time or an unsustainable rate can look clean in either verdict
-        // mode, so these are the floor rather than an arbitrary choice.
+        // Hold length is the lever that decides whether a bursting broker can masquerade an
+        // unsustainable rate as clean, so it is set generously and, crucially, bracket is held to
+        // the SAME duration as chop. A short bracket hold over-confirms a high rate into lo, and lo
+        // only ever moves upward -- so no chop hold length can recover from it afterwards. This is
+        // why rampBracketHoldSeconds defaults to rampHoldSeconds; do not shorten it here to save
+        // wall-clock.
         workload.rampBracketPeriodSeconds = 2;
-        workload.rampSettleSeconds = 5;
-        workload.rampBracketHoldSeconds = 10;
-        workload.rampHoldSeconds = 15;
+        workload.rampSettleSeconds = 10;
+        workload.rampBracketHoldSeconds = 45;
+        workload.rampHoldSeconds = 45;
         workload.rampConvergenceTolerance = 0.05;
-        workload.rampMaxDiscoveryMinutes = 6; // safety cap
+        workload.rampMaxDiscoveryMinutes = 15; // safety cap, sized for 45s holds
 
         workload.consumerBacklogSizeGB = 0;
         workload.warmupDurationMinutes = 0;
-        workload.testDurationMinutes = 1; // measurement window whose delay reveals (un)sustainability
+        // Deliberately longer than the hold (45s): if the window were the same length, "held for a
+        // hold" and "sustained for the window" would be the same claim and the check would not be
+        // independent of the thing it is checking.
+        workload.testDurationMinutes = 2;
         return workload;
     }
 

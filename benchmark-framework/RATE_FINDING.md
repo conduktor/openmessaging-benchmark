@@ -421,6 +421,22 @@ backlog count, so the same threshold is neither too strict nor too loose regardl
 is being tested. `BACKLOG` remains the default — `THROUGHPUT` is opt-in until it has more runs
 behind it.
 
+### Caveat when reading a ramp run's reported rates
+
+`LocalWorker.resetStats()` calls only `stats.resetLatencies()`, never `stats.reset()` — so the
+message counters are *not* cleared between discovery and the measurement window. The first 10-second
+interval of `printAndCollectStats` therefore attributes everything published during discovery to that
+one window. On a `producerRate: 0` run this was observed reporting **15,439,670 msg/s** for the first
+interval against a steady-state **481,000 msg/s**: roughly six minutes of discovery folded into one
+sample.
+
+So the first entry of `publishRate` / `consumeRate` (and the byte-rate equivalents) is junk on any
+`producerRate: 0` run, AIMD included, and a mean over those lists inherits it — use the median, or
+drop the first sample. Latency figures are unaffected: `resetLatencies()` does clear both the
+interval and cumulative recorders, so `aggregatedPublishDelayLatencyAvg` and the quantiles describe
+the measurement window only. Not fixed here because `WorkerStats.reset()` also clears
+`totalMessagesSent`/`totalMessagesReceived`, which the backlog-drain logic depends on.
+
 ### Trial finding: hold length, not the verdict predicate, is now the dominant error
 
 Found running the strengthened `ChopRateFinderKafkaIT` against a single-broker Testcontainers Kafka
