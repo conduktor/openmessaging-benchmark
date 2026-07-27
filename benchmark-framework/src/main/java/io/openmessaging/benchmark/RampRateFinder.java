@@ -109,6 +109,7 @@ class RampRateFinder {
     private long holdExpected = 0;
     private long holdPublished = 0;
     private long holdReceived = 0;
+    private long holdElapsedNanos = 0;
 
     private final List<RateVerdict> history = new ArrayList<>();
 
@@ -199,10 +200,14 @@ class RampRateFinder {
             holdExpected = 0;
             holdPublished = 0;
             holdReceived = 0;
+            holdElapsedNanos = 0;
         }
         holdExpected += expected;
         holdPublished += published;
         holdReceived += received;
+        // Tracked separately from elapsedHoldNanos, which the bracket path zeroes before recording
+        // its verdict -- this one stays valid for as long as the hold's totals do.
+        holdElapsedNanos += periodNanos;
 
         boolean breachedNow;
         if (verdict == RampVerdict.THROUGHPUT) {
@@ -309,29 +314,49 @@ class RampRateFinder {
 
         if ((hi - lo) / lo <= convergenceTolerance) {
             if (!confirming) {
-                // Require requiredConfirmationHolds more consecutive clean holds at the same
-                // rate before accepting it -- this is what makes isNonMonotonic() a real,
-                // testable signal rather than one that binary chop's own strictly-nested
-                // bracket could never actually trigger.
+                // Require requiredConfirmationHolds more consecutive clean holds before accepting
+                // -- but hold them at confirmRate(), not at lo. Chop converges to within
+                // convergenceTolerance of a *failing* rate, so lo sits right at the knee and
+                // re-passing it is close to a coin flip; that flip then latches nonMonotonic and
+                // withholds the whole result. Confirming just below the knee makes the re-check
+                // meaningful again, and means the rate we report is one that was actually held.
                 confirming = true;
                 confirmationHoldsPassed = 0;
-                currentRate = lo;
+                currentRate = confirmRate();
                 return false;
             }
             confirmationHoldsPassed++;
             if (confirmationHoldsPassed >= requiredConfirmationHolds) {
-                currentRate = lo;
+                currentRate = confirmRate();
                 confirmed = true;
                 phase = Phase.DONE;
                 return true;
             }
-            currentRate = lo;
+            currentRate = confirmRate();
             return false;
         }
 
         confirming = false;
         currentRate = (lo + hi) / 2.0;
         return false;
+    }
+
+    // The rate actually held and reported: the converged lo, less a convergenceTolerance-wide
+    // safety margin. lo is the highest rate observed to pass, but chop only knows the knee to
+    // within convergenceTolerance, so lo may sit fractionally above the real ceiling -- and under
+    // THROUGHPUT it provably can, since that gate accepts any rate up to capacity / ratio. Backing
+    // off by the same width the search is uncertain over keeps the reported number on the safe side.
+    private double confirmRate() {
+        return lo * (1.0 - convergenceTolerance);
+    }
+
+    // Throughput actually achieved over the most recently completed hold, in msg/s. currentRate is
+    // what was asked for; this is what the system delivered. After discovery ends these totals are
+    // still those of the final confirmation hold, so this is the honest figure to report.
+    double lastHoldAchievedRate() {
+        return holdElapsedNanos == 0
+                ? 0.0
+                : holdPublished / (holdElapsedNanos / (double) ONE_SECOND_IN_NANOS);
     }
 
     private void finishWithBestKnown() {

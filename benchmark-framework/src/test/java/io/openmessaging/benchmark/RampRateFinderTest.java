@@ -164,18 +164,26 @@ class RampRateFinderTest {
         assertThat(finder.isConfirming()).isFalse();
 
         // Hold at 1500 passes cleanly -- within tolerance (500/1500 = 0.33 <= 0.5), so this
-        // triggers the one-more confirmation hold at the same rate rather than DONE yet. This is
-        // the poll() call where isConfirming() flips false -> true.
+        // triggers the one-more confirmation hold rather than DONE yet, at lo x (1 - 0.5) = 750
+        // rather than at 1500 itself. This is the poll() call where isConfirming() flips
+        // false -> true.
         boolean done = finder.poll(periodNanos, 6000 + 4500, 6000 + 4500);
         assertThat(done).isFalse();
-        assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+        assertThat(finder.getCurrentRate()).isEqualTo(750.0);
         assertThat(finder.isConfirming()).isTrue();
         assertThat(finder.isConfirmed()).isFalse();
 
-        // Confirmation hold at the same rate (1500) now shows a backlog breach -- a direct
-        // contradiction of the pass just recorded at the same rate. Rather than accepting this
-        // unverified rate, the search must reopen: tighten hi to 1500 and fall back to the last
-        // rate we've actually seen pass below it (1000, from the bracket phase).
+        // The confirmation hold runs at lo x (1 - tolerance) = 750, and now shows a backlog breach.
+        // A rate *below* one that already passed failing is a genuine contradiction, so
+        // nonMonotonic latches -- unlike the old same-rate re-check, where a flip at the knee was
+        // just boundary noise being recorded as instability. The search must reopen rather than
+        // accept: tighten hi to the rate that failed.
+        //
+        // Note the interaction this exposes: because the confirmation rate sits below every rate
+        // recorded as passing, bestKnownPassBelow(750) finds nothing and falls back to its blind
+        // 0.9 backoff (675) for the new lo. With the 0.05 default the confirm rate is only 5% under
+        // lo, so a real recorded pass is normally available; this test's outsized 0.5 tolerance is
+        // what pushes it past all of them.
         done = finder.poll(periodNanos, 10500 + 2000, 10500 + 2000);
 
         assertThat(done).isFalse();
@@ -183,12 +191,12 @@ class RampRateFinderTest {
         assertThat(finder.isNonMonotonic()).isTrue();
         assertThat(finder.isConfirming()).isFalse();
         assertThat(finder.isConfirmed()).isFalse();
-        assertThat(finder.getLo()).isEqualTo(1000.0);
-        assertThat(finder.getHi()).isEqualTo(1500.0);
-        assertThat(finder.getCurrentRate()).isEqualTo(1250.0);
+        assertThat(finder.getLo()).isEqualTo(675.0);
+        assertThat(finder.getHi()).isEqualTo(750.0);
+        assertThat(finder.getCurrentRate()).isEqualTo(712.5);
 
         // The reopened search can still converge and genuinely confirm on a new, lower candidate.
-        done = finder.poll(periodNanos, 12500 + 3750, 12500 + 3750); // clean hold @1250
+        done = finder.poll(periodNanos, 12500 + 3750, 12500 + 3750); // clean hold @712.5
         assertThat(done).isFalse();
         assertThat(finder.isConfirming()).isTrue();
 
@@ -196,7 +204,7 @@ class RampRateFinderTest {
         assertThat(done).isTrue();
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.DONE);
         assertThat(finder.isConfirmed()).isTrue();
-        assertThat(finder.getCurrentRate()).isEqualTo(1250.0);
+        assertThat(finder.getCurrentRate()).isEqualTo(356.25); // 712.5 x (1 - 0.5)
         // The earlier contradiction is still surfaced even though discovery ultimately confirmed
         // a (different, lower) rate -- it's evidence the system showed unstable behavior at all.
         assertThat(finder.isNonMonotonic()).isTrue();
@@ -227,7 +235,11 @@ class RampRateFinderTest {
         done = finder.poll(periodNanos, 19500, 19500); // 2nd confirmation hold passes
         assertThat(done).isTrue();
         assertThat(finder.isConfirmed()).isTrue();
-        assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+        // Confirmation holds run at lo x (1 - convergenceTolerance), i.e. deliberately just below
+        // the knee. This test uses an outsized 0.5 tolerance purely so chop converges in one step,
+        // so the safety margin it produces is correspondingly outsized: 1500 x 0.5. With the 0.05
+        // default the margin is 5%.
+        assertThat(finder.getCurrentRate()).isEqualTo(750.0);
     }
 
     @Test
@@ -601,6 +613,81 @@ class RampRateFinderTest {
         driveToCompletion(backlogFinder, new FakeStableBacklogSystem(50_000, 50_000));
         assertThat(backlogFinder.getLo()).as("no candidate ever held cleanly").isNull();
         assertThat(backlogFinder.getCurrentRate()).isLessThan(1.0);
+    }
+
+    @Test
+    void throughputVerdictDoesNotConfirmAboveMeasuredCapacity() {
+        // The ratio gate accepts while capacity >= ratio x rate, i.e. any rate up to
+        // capacity / 0.95 -- so the accepted target can exceed everything the system ever actually
+        // published. Because UniformRateLimiter hands out a fixed virtual schedule with no
+        // catch-up, published can never exceed expected: the ratio is one-sided, so the 0.95 slack
+        // is absorbed as *permanent shortfall*, not as jitter. A persistent shortfall is unbounded
+        // publish-delay growth, which is exactly what ChopRateFinderKafkaIT calls unsustainable.
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 1000;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeThroughputSystem system = new FakeThroughputSystem(4500, 1_000_000_000L);
+        long periodNanos = SECONDS.toNanos(1);
+
+        boolean done = false;
+        for (int i = 0; i < 200 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.getCurrentRate())
+                .as("a rate the producer never reached is not a sustainable rate")
+                .isLessThanOrEqualTo(4500.0);
+    }
+
+    @Test
+    void throughputVerdictAlsoOverConfirmsWhenTheHoldIsShorterThanTheBurstBudget() {
+        // THROUGHPUT is scale-free but not hold-length-immune. While the broker's burst buffer still
+        // has room, published tracks expected exactly, so achievedRatio reads 1.000 and an
+        // oversubscribed rate looks perfectly clean. Sustained capacity 1000 msg/s with a
+        // 4000-message burst budget fills in 4000 / (2000 - 1000) = 4s, so a 3s hold never sees the
+        // shortfall. The design doc asserts this limitation but nothing exercised it: every other
+        // THROUGHPUT fixture is an instantaneous hard cap, under which the predicate is monotone by
+        // construction and hold length cannot matter.
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 2000;
+        workload.rampBracketHoldSeconds = 3; // shorter than the 4s burst-fill time
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeBurstySystem system = new FakeBurstySystem(1000, 4000);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        for (int i = 0; i < 3; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.getLo()).isEqualTo(2000.0); // oversubscribed rate accepted as clean
+    }
+
+    @Test
+    void throughputVerdictRejectsTheOversubscribedRateOnceTheHoldOutlastsTheBurst() {
+        // Same bursty broker, hold longer than the 4s burst-fill time: the buffer saturates, the
+        // last two seconds only manage 1000 msg/s, and the hold's aggregate lands at
+        // 10000 / 12000 = 0.833 -- below the 0.95 gate, so the candidate is correctly failed. Hold
+        // length is the only difference from the test above.
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 2000;
+        workload.rampBracketHoldSeconds = 6; // longer than the 4s burst-fill time
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeBurstySystem system = new FakeBurstySystem(1000, 4000);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        boolean done = false;
+        for (int i = 0; i < 6 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.getHi()).isEqualTo(2000.0);
+        assertThat(finder.getLo()).isNull();
     }
 
     /** A producer/consumer pair with independent sustained capacities, seeded from zero. */

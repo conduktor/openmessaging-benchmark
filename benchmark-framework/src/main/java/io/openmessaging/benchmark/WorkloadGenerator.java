@@ -339,10 +339,18 @@ public class WorkloadGenerator implements AutoCloseable {
                             + " are not impossibly strict for this setup.");
         }
 
+        // The measurement window runs at whatever rate discovery settled on. The loop above already
+        // applied it on its final iteration; re-applying makes the contract explicit rather than
+        // incidental.
+        worker.adjustPublishRate(finder.getCurrentRate());
+
         if (finder.isConfirmed() && !finder.isNonMonotonic()) {
             Instant verificationConfirmedAt = Instant.now();
             rampVerification = new RampVerification();
-            rampVerification.rate = finder.getCurrentRate();
+            // Report what the confirmation hold actually delivered, not what it was asked for. The
+            // two agree at a sustainable rate; where they disagree, the achieved figure is the one
+            // that is true, and it is the figure the epoch window below actually brackets.
+            rampVerification.rate = finder.lastHoldAchievedRate();
             rampVerification.startEpochMillis = verificationStartedAt.toEpochMilli();
             rampVerification.endEpochMillis = verificationConfirmedAt.toEpochMilli();
             rampVerification.nonMonotonic = false;
