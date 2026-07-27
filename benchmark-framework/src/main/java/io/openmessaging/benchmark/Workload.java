@@ -146,7 +146,21 @@ public class Workload {
      */
     public Integer rampDrainSeconds;
 
-    /** CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 30. */
+    /**
+     * CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 180.
+     *
+     * <p>This is the single most consequential ramp setting, because it is what decides whether a
+     * broker can absorb an oversubscribed rate for the whole hold and so look clean. A broker acks at
+     * the full target rate until its page cache, batching and socket buffers saturate; only then does
+     * throughput droop. A hold shorter than that absorption time accepts a rate that the measurement
+     * window afterwards fails on, and no verdict predicate can detect it from inside the hold.
+     *
+     * <p>180 rather than the earlier 30 because 30 is not survivable on real hardware: absorption
+     * scales with the cache the cluster has. Size it from the cluster, not from this default --
+     * roughly buffer-depth / overshoot -- and note higher candidate rates need longer holds, not
+     * equal ones. Raising this raises discovery time proportionally, so check rampMaxDiscoveryMinutes
+     * with it.
+     */
     public Integer rampHoldSeconds;
 
     /**
@@ -175,7 +189,16 @@ public class Workload {
      */
     public Boolean rampSeedFromAchievedRate;
 
-    /** CHOP only: safety cap on total discovery time, in minutes. Defaults to 10. */
+    /**
+     * CHOP only: safety cap on total discovery time, in minutes. Defaults to 60.
+     *
+     * <p>Coupled to rampHoldSeconds. Under rampVerdict: THROUGHPUT there is no per-poll fast-fail, so
+     * every candidate costs a full hold -- including the bracket phase's doomed 2x overshoots -- and
+     * a search from the default start rate to a 7-figure ceiling runs roughly 15 holds. Budget about
+     * {@code settle + 15 x rampHoldSeconds}, plus the drain if rampDrainSeconds is set. Hitting the
+     * cap is not a failure: discovery reports the best rate that held, having never confirmed it,
+     * with a WARN and no rampVerification attached.
+     */
     public Integer rampMaxDiscoveryMinutes;
 
     /**

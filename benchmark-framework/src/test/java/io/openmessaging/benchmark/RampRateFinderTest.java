@@ -1072,6 +1072,37 @@ class RampRateFinderTest {
     }
 
     @Test
+    void theDefaultDiscoveryBudgetCoversASearchAtTheDefaultHold() {
+        // The two defaults have to stay coherent with each other. A hold long enough to outlast a real
+        // broker's burst absorption makes discovery expensive, and under THROUGHPUT there is no
+        // per-poll fast-fail, so *every* candidate costs its full hold -- including the doomed bracket
+        // overshoots. If the time budget does not cover a realistic search at the default hold,
+        // discovery truncates and reports its best known rate having never confirmed one, which from
+        // the outside differs from success only by a WARN and an absent rampVerification.
+        //
+        // Nothing else pins this pair, so raising one without the other is a silent regression. This is
+        // the test for it: everything below is left unset so the search runs on the shipped defaults.
+        Workload workload = new Workload();
+        workload.subscriptionsPerTopic = 1;
+        workload.rampVerdict = RampVerdict.THROUGHPUT; // the expensive mode: no fast-fail
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeThroughputSystem system = new FakeThroughputSystem(1_000_000, 1_000_000_000L);
+        long periodNanos = SECONDS.toNanos(3);
+
+        boolean done = false;
+        for (int i = 0; i < 5_000 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.isSafetyCapped())
+                .as("the default budget must not truncate a search at the default hold")
+                .isFalse();
+        assertThat(finder.isConfirmed()).isTrue();
+    }
+
+    @Test
     void safetyCapIsDistinguishableFromAGenuineConfirm() {
         // Running out of time budget reports the best rate found so far, which from the outside is
         // indistinguishable from a verified one: isConfirmed() is false either way when a hold was

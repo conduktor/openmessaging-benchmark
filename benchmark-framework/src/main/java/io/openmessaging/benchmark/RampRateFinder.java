@@ -155,7 +155,7 @@ class RampRateFinder {
         int settleSeconds =
                 workload.rampSettleSeconds != null ? workload.rampSettleSeconds.intValue() : 30;
         this.settleNanos = SECONDS.toNanos(settleSeconds);
-        int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 30;
+        int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 180;
         this.holdNanos = SECONDS.toNanos(holdSeconds);
         int bracketHoldSeconds =
                 workload.rampBracketHoldSeconds != null
@@ -171,8 +171,13 @@ class RampRateFinder {
                 workload.rampConvergenceTolerance != null
                         ? workload.rampConvergenceTolerance.doubleValue()
                         : 0.05;
+        // Coupled to holdSeconds: under THROUGHPUT every candidate costs a full hold, and a search
+        // from the default start rate to a 7-figure ceiling runs ~15 holds (8 bracket, ~5 chop,
+        // 1 confirm) plus settle. At the 180s default hold that is ~45 minutes, so a 10-minute budget
+        // -- the old default, sized for 30s holds -- would truncate every real discovery and report an
+        // unconfirmed rate. RampRateFinderTest pins the pair so they cannot drift apart again.
         int maxDiscoveryMinutes =
-                workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes.intValue() : 10;
+                workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes.intValue() : 60;
         this.maxDiscoveryNanos = MINUTES.toNanos(maxDiscoveryMinutes);
         this.requiredConfirmationHolds =
                 workload.rampConfirmationHolds != null ? workload.rampConfirmationHolds.intValue() : 1;
