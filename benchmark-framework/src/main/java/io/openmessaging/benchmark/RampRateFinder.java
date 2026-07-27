@@ -64,6 +64,7 @@ class RampRateFinder {
     private final int requiredConfirmationHolds;
     private final RampVerdict verdict;
     private final double minThroughputRatio;
+    private final boolean seedFromAchievedRate;
 
     // Every publish is delivered once per subscription, so the consumers must move
     // subscriptions x published to keep up. Comparing raw counters would make the drain look
@@ -167,6 +168,8 @@ class RampRateFinder {
                 workload.rampMinThroughputRatio != null
                         ? workload.rampMinThroughputRatio.doubleValue()
                         : 0.95;
+        this.seedFromAchievedRate =
+                workload.rampSeedFromAchievedRate != null && workload.rampSeedFromAchievedRate;
         this.subscriptions = workload.subscriptionsPerTopic;
     }
 
@@ -293,8 +296,10 @@ class RampRateFinder {
 
         if (lo != null && hi != null) {
             phase = Phase.CHOP;
-            double next = (lo + hi) / 2.0;
-            return failed ? beginDrain(next) : setRate(next);
+            if (failed) {
+                return beginDrain(nextAfterFailure());
+            }
+            return setRate((lo + hi) / 2.0);
         }
 
         bracketIterations++;
@@ -331,10 +336,10 @@ class RampRateFinder {
                 lo = bestKnownPassBelow(hi);
                 confirming = false;
                 confirmationHoldsPassed = 0;
-                return beginDrain((lo + hi) / 2.0);
+                return beginDrain(nextAfterFailure());
             }
             hi = currentRate;
-            return beginDrain((lo + hi) / 2.0);
+            return beginDrain(nextAfterFailure());
         }
 
         recordVerdict(currentRate, true);
@@ -391,6 +396,44 @@ class RampRateFinder {
     private boolean setRate(double next) {
         currentRate = next;
         return false;
+    }
+
+    // The next candidate to try after a hold failed. Called only on failure paths, and only once hi
+    // has been set to the rate that just failed -- so hi *is* that rate here, and lo is the highest
+    // rate already known to hold.
+    //
+    // A failed hold has already measured the system: it was asked for hi and managed
+    // lastHoldAchievedRate(), which is a direct estimate of capacity. Bisecting the bracket discards
+    // that measurement and spends another full hold rediscovering it -- and under the THROUGHPUT
+    // verdict there is no per-poll fast-fail, so every rediscovered hold costs its full length.
+    private double nextAfterFailure() {
+        double midpoint = (lo + hi) / 2.0;
+        if (!seedFromAchievedRate) {
+            return midpoint;
+        }
+        double achieved = lastHoldAchievedRate();
+        // The estimate has to be meaningfully below the rate that failed to be an estimate at all. A
+        // candidate that failed on consumer lag -- or on a broker absorbing the overshoot into its
+        // buffers, which a real THROUGHPUT run did at achievedRatio 1.000 -- published everything it
+        // was asked for, so its achieved rate is the target restated, not a measurement of capacity.
+        // This guard is also what keeps the search geometric: consecutive seeded failures each pull hi
+        // down by at least the tolerance, where an unguarded seed sitting just under hi would creep
+        // down by an epsilon per hold -- slower than the bisection it replaced.
+        boolean informative = achieved <= hi * (1.0 - convergenceTolerance);
+        // ... and it has to beat the highest rate already observed to hold, or the bracket the search
+        // has already paid for is the better evidence and re-testing covered ground wastes a hold.
+        boolean aboveKnownGood = achieved > lo;
+        if (!informative || !aboveKnownGood) {
+            return midpoint;
+        }
+        log.info(
+                "FINDER-SEED next candidate {} msg/s from the failed hold's achieved rate"
+                        + " (bisecting [{}, {}] would have tried {})",
+                achieved,
+                lo,
+                hi,
+                midpoint);
+        return achieved;
     }
 
     // Enter recovery after a failed candidate: run at the highest rate already observed to hold
@@ -460,8 +503,8 @@ class RampRateFinder {
     String describeConfig() {
         return String.format(
                 "verdict=%s subscriptions=%d startRate=%s settle=%ds bracketHold=%ds hold=%ds"
-                        + " drainCap=%ds tolerance=%s confirmHolds=%d budget=%dmin"
-                        + " minThroughputRatio=%s"
+                        + " drainCap=%ds tolerance=%s seedFromAchievedRate=%s confirmHolds=%d"
+                        + " budget=%dmin minThroughputRatio=%s"
                         + " backlogLimits=[publish=%d receive=%d maxBacklogSeconds=%s floor=%d"
                         + " ceiling=%d]",
                 verdict,
@@ -472,6 +515,7 @@ class RampRateFinder {
                 SECONDS.convert(holdNanos, NANOSECONDS),
                 SECONDS.convert(drainNanos, NANOSECONDS),
                 convergenceTolerance,
+                seedFromAchievedRate,
                 requiredConfirmationHolds,
                 MINUTES.convert(maxDiscoveryNanos, NANOSECONDS),
                 minThroughputRatio,

@@ -159,6 +159,22 @@ public class Workload {
     /** CHOP only: relative (hi - lo) / lo band at which to stop chopping. Defaults to 0.05. */
     public Double rampConvergenceTolerance;
 
+    /**
+     * CHOP only: when a candidate rate fails, seed the next candidate from the throughput that
+     * candidate actually achieved rather than bisecting the bracket blindly. A failed hold has
+     * already measured what the system can do -- published / elapsed is a direct capacity estimate --
+     * so bisection throws away a measurement the run just paid for.
+     *
+     * <p>The estimate is only used when it is informative and safe: it must sit at least
+     * rampConvergenceTolerance below the rate that just failed (a candidate that failed on consumer
+     * lag while publishing at its full target says nothing about producer capacity, and a seed within
+     * the tolerance band is inside the noise the search already ignores), and strictly above the
+     * highest rate already known to hold. Otherwise the bracket is bisected as before.
+     *
+     * <p>Defaults to false, because it changes the search trajectory after every failed candidate.
+     */
+    public Boolean rampSeedFromAchievedRate;
+
     /** CHOP only: safety cap on total discovery time, in minutes. Defaults to 10. */
     public Integer rampMaxDiscoveryMinutes;
 

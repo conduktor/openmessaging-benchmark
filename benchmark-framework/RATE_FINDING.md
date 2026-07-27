@@ -82,6 +82,17 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 3. **Chop** — binary search the `[lo, hi]` bracket. Each candidate is held for `rampHoldSeconds`
    (default 30s), not just glanced at — a single reactive snapshot (AIMD's approach) isn't enough
    to know a rate actually holds.
+
+   Optionally (`rampSeedFromAchievedRate: true`, default off) the candidate after a *failed* hold is
+   taken from the throughput that hold actually achieved rather than from the midpoint. A hold that
+   asked for 800k msg/s and managed 600k has already measured the system; bisecting to 700k spends
+   another full hold rediscovering that. The estimate is only used when it is informative and safe —
+   at least `rampConvergenceTolerance` below the rate that just failed, and strictly above the
+   highest rate already known to hold — otherwise the bracket is bisected as before. Both guards
+   matter: a candidate that failed on *consumer* lag published everything it was asked for, so its
+   achieved rate is the target restated rather than a measurement of capacity, and seeding from it
+   would propose the rate that just failed.
+
 4. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
    isn't accepted immediately. It must pass `rampConfirmationHolds` (default 1) additional,
    consecutive clean holds before being accepted. This is what makes "verified" mean something more
@@ -156,6 +167,7 @@ predicate decides that is controlled by `rampVerdict`, with two modes:
 | `rampHoldSeconds`          | 30                                     | CHOP only — how long a chop candidate must hold clean                                                                                                                                                                                                                                                                                                                      |
 | `rampConfirmationHolds`    | 1                                      | CHOP only                                                                                                                                                                                                                                                                                                                                                                  |
 | `rampConvergenceTolerance` | 0.05                                   | CHOP only                                                                                                                                                                                                                                                                                                                                                                  |
+| `rampSeedFromAchievedRate` | false (off)                            | CHOP only — after a failed hold, take the next candidate from the throughput that hold achieved instead of bisecting. Measured at ~12% less discovery time on a 5000 → 841k geometry; no effect when the start rate is already above capacity, since the bracket's downward halving path is not seeded                                                                     |
 | `rampMaxDiscoveryMinutes`  | 10                                     | CHOP only                                                                                                                                                                                                                                                                                                                                                                  |
 
 See `workloads/max-rate-chop-1-topic-100-partitions-100b.yaml` for a runnable example.

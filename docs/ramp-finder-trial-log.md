@@ -270,3 +270,44 @@ hold on whether achieved throughput is *flat across its own second half* rather 
 ratio, which detects a filling buffer regardless of hold length. Until then, treat a discovered rate
 as unverified unless `rampHoldSeconds` is comfortably longer than the measurement window's own
 settling behaviour, and check publish delay in the run that follows.
+
+## Finding 6: achieved-rate seeding (D5) is worth ~12%, not the ~50% I claimed
+
+Working note. `rampSeedFromAchievedRate` uses a failed hold's achieved throughput as the next
+candidate instead of bisecting the bracket. I justified it in the review as the strongest available
+lever on the ~48-minute integration test, guessing it "would roughly halve" discovery. That guess was
+wrong. Measured against `FakeThroughputSystem` at 3-second polls and 45-second holds — the integration
+test's own geometry — discovery cost, in wall-clock seconds:
+
+| Capacity | Start rate | Bisecting | Seeded |  Change  |
+|----------|------------|-----------|--------|----------|
+| 841,000  | 5,000      | 768 s     | 678 s  | **−12%** |
+| 4,500    | 5,000      | 408 s     | 408 s  | 0%       |
+
+**Why it is only 12%.** The seed places `lo` accurately in one step but leaves `hi` where bracket's
+last doubling put it — roughly 2x the true ceiling. Chop then has to bisect that whole span anyway, so
+the seed saves the steps *below* the knee and none of the steps above it. Both trajectories still land
+on the ceiling, so the change is sound; it is just not the lever I said it was.
+
+**Why the second row is unchanged.** With the start rate already above capacity the bracket phase
+halves *downward*, and that path is deliberately not seeded: halving is already geometric, and one
+spurious low reading would drop the search orders of magnitude in a single step with nothing to
+reopen `hi`. Anyone reading D5 as a fix for the near-zero-rate collapse should not.
+
+**Measured but not landed.** The bracket's stale `hi` is the actual bottleneck, and the same
+measurement bounds it. Under `THROUGHPUT` the gate passes only while `published >= ratio x expected`,
+so a hold that achieved `a` implies no rate above `a / ratio` can pass — a *derived* upper bound, not
+a guess. Spiking `hi = min(hi, achieved / ratio)` on top of the seed:
+
+| Capacity | Bisecting | Seeded | Seeded + derived `hi` |
+|----------|-----------|--------|-----------------------|
+| 841,000  | 768 s     | 678 s  | **543 s (−29%)**      |
+
+The cost is accuracy: the reported rate moves from 840,750 (0.03% under the true 841,000) to 819,975
+(2.5% under), because a tighter `hi` converges on a lower point inside the band the 0.95 ratio
+tolerates. It also leans harder on the assumption that capacity does not vary with the requested rate
+— exactly the assumption run 3 above violated when the broker absorbed the overshoot into its buffers.
+When that happens `achieved ~= requested`, so `min` makes the derivation a no-op rather than a
+hazard, which is the reason it is safe to consider at all. Left as a decision, not landed: it trades
+2.5% of reported accuracy for 17% of discovery time and belongs with the band-vs-point question rather
+than inside a commit labelled D5.

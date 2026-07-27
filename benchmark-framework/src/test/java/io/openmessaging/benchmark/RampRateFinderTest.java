@@ -17,6 +17,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class RampRateFinderTest {
@@ -809,6 +810,173 @@ class RampRateFinderTest {
         assertThat(finder.getCurrentRate())
                 .as("resumes the candidate the search had queued up, not the drain rate")
                 .isEqualTo(1500.0);
+    }
+
+    // Pairs with one-second polls so a single poll completes a hold and every candidate's verdict is
+    // decided by exactly the counters that poll is handed. Backlog limits are the 100 messages
+    // workload() sets, and convergenceTolerance is left at its 0.05 default.
+    private static Workload seedWorkload(boolean seedFromAchievedRate) {
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 1;
+        workload.rampSeedFromAchievedRate = seedFromAchievedRate;
+        return workload;
+    }
+
+    @Test
+    void aFailedCandidateSeedsTheNextOneFromWhatItActuallyAchieved() {
+        // A candidate that fails has already measured the system: it asked for 2000 msg/s and got
+        // 1200, so 1200 is a direct capacity estimate. Bisecting to the midpoint of [1000, 2000]
+        // discards that measurement and spends another full hold rediscovering it. Both finders here
+        // are handed identical counters and differ only in the flag, so the midpoint and the seed are
+        // directly comparable.
+        RampRateFinder seeded = new RampRateFinder(seedWorkload(true));
+        RampRateFinder bisecting = new RampRateFinder(seedWorkload(false));
+        long periodNanos = SECONDS.toNanos(1);
+
+        for (RampRateFinder finder : List.of(seeded, bisecting)) {
+            finder.poll(periodNanos, 0, 0); // settle + baseline
+            // 1000 msg/s holds clean -> lo = 1000, bracket doubles to 2000.
+            finder.poll(periodNanos, 1000, 1000);
+            assertThat(finder.getLo()).isEqualTo(1000.0);
+            // 2000 msg/s publishes only 1200 of its expected 2000: an 800-message publish backlog
+            // against the 100 limit, so the candidate fails and hi = 2000.
+            finder.poll(periodNanos, 2200, 2200);
+            assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.CHOP);
+            assertThat(finder.getHi()).isEqualTo(2000.0);
+        }
+
+        assertThat(bisecting.getCurrentRate()).as("blind midpoint of [1000, 2000]").isEqualTo(1500.0);
+        assertThat(seeded.getCurrentRate())
+                .as("the throughput the failed hold actually achieved")
+                .isEqualTo(1200.0);
+    }
+
+    @Test
+    void aCandidateThatFailedWhilePublishingAtFullRateIsNotUsedAsACapacityEstimate() {
+        // The guard that matters most. Here 2000 msg/s publishes all 2000 and fails purely on consumer
+        // lag, so the achieved rate equals the target and says nothing about capacity. Seeding from it
+        // would propose the rate that just failed; clamping that back inside the bracket would creep
+        // downward by a tolerance-width per hold instead of halving, which is *slower* than bisection
+        // and is exactly the shape of a real THROUGHPUT run where a broker absorbed the overshoot into
+        // its buffers and reported achievedRatio 1.000 at every rate. So when the estimate is not
+        // meaningfully below the rate that failed, bisect.
+        RampRateFinder finder = new RampRateFinder(seedWorkload(true));
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 1000, 1000); // 1000 clean -> lo = 1000, next 2000
+        // All 2000 published, but only 1500 of the 3000 cumulative deliveries drained: a 500-message
+        // receive backlog fails the candidate with the producer perfectly healthy.
+        finder.poll(periodNanos, 3000, 2500);
+
+        assertThat(finder.getHi()).isEqualTo(2000.0);
+        assertThat(finder.getCurrentRate())
+                .as("achieved == target carries no capacity information, so fall back to the midpoint")
+                .isEqualTo(1500.0);
+    }
+
+    @Test
+    void aSeedAtOrBelowAKnownGoodRateIsRejectedInFavourOfTheMidpoint() {
+        // 1000 msg/s is already known to hold. If a later candidate's achieved rate comes back *below*
+        // that -- a throttled producer, a stalled partition -- seeding from it would re-test ground the
+        // search has already covered and abandon the bracket it paid for. The bracket is still valid
+        // evidence, so bisect it.
+        RampRateFinder finder = new RampRateFinder(seedWorkload(true));
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 1000, 1000); // 1000 clean -> lo = 1000, next 2000
+        finder.poll(periodNanos, 3000, 2500); // consumer-lag failure -> hi = 2000, midpoint 1500
+        assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+
+        // 1500 publishes only 800 -- an achieved rate below the known-good lo of 1000.
+        finder.poll(periodNanos, 3800, 3800);
+
+        assertThat(finder.getHi()).isEqualTo(1500.0);
+        assertThat(finder.getCurrentRate())
+                .as("800 is below the known-good lo, so bisect [1000, 1500] instead")
+                .isEqualTo(1250.0);
+    }
+
+    // Drives a fixed-capacity fixture to completion and returns the polls discovery cost, checking on
+    // the way out that it still lands on the real ceiling. Mirrors the integration test's geometry:
+    // 3s
+    // polls, 45s holds, and a deliberately low 5000 msg/s start rate, so the bracket phase does real
+    // work climbing to the ceiling rather than starting next to it.
+    private static int pollsToDiscover(double capacity, boolean seedFromAchievedRate) {
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 5000;
+        workload.rampBracketHoldSeconds = 45;
+        workload.rampHoldSeconds = 45;
+        workload.rampMaxDiscoveryMinutes =
+                600; // measuring search cost, so the safety cap must not bite
+        workload.rampSeedFromAchievedRate = seedFromAchievedRate;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeThroughputSystem system = new FakeThroughputSystem(capacity, 1_000_000_000L);
+        long periodNanos = SECONDS.toNanos(3);
+
+        int polls = 0;
+        boolean done = false;
+        while (!done && polls < 10_000) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+            polls++;
+        }
+        assertThat(done).isTrue();
+        assertThat(Math.abs(capacity - finder.getCurrentRate()) / capacity)
+                .as("seeded or not, discovery must still land on the real ceiling")
+                .isLessThan(0.05);
+        return polls;
+    }
+
+    @Test
+    void seedingReachesTheSameCeilingInFewerHoldsThanBlindBisection() {
+        // The reason the seed exists: discovery time. Every hold costs its full length under
+        // THROUGHPUT, which has no per-poll fast-fail, so holds are the unit of cost. Note this is a
+        // real but modest saving -- the seed places lo accurately and leaves hi where bracket's last
+        // doubling put it, so chop still has the whole [lo, hi] span to bisect afterwards.
+        int bisecting = pollsToDiscover(841_000, false);
+        int seeded = pollsToDiscover(841_000, true);
+
+        assertThat(seeded).isLessThan(bisecting);
+    }
+
+    @Test
+    void seedingDoesNotHelpWhenTheStartRateIsAlreadyAboveCapacity() {
+        // A deliberate scope boundary. When the start rate is above capacity the bracket phase halves
+        // *downward*, and that path is not seeded: halving is already geometric, and a single spurious
+        // low reading would otherwise drop the search orders of magnitude in one step with no way back
+        // up (nothing ever reopens hi). So this geometry costs exactly what it did before, and the
+        // near-zero-rate collapse the halving path can produce is a separate problem, guarded by
+        // WorkloadGenerator refusing to report a rate when no candidate ever held.
+        int bisecting = pollsToDiscover(4500, false);
+        int seeded = pollsToDiscover(4500, true);
+
+        assertThat(seeded).isEqualTo(bisecting);
+    }
+
+    @Test
+    void seedingStillConvergesOnTheSameCapacityAsBlindBisection() {
+        // The seed changes the trajectory, so the guarantee that matters is that it does not change the
+        // destination: both must still land on the producer's real ceiling.
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 1000;
+        workload.rampSeedFromAchievedRate = true;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeThroughputSystem system = new FakeThroughputSystem(4500, 1_000_000_000L);
+        long periodNanos = SECONDS.toNanos(1);
+
+        boolean done = false;
+        for (int i = 0; i < 200 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.isConfirmed()).isTrue();
+        assertThat(Math.abs(4500.0 - finder.getCurrentRate()) / 4500.0).isLessThan(0.1);
     }
 
     @Test
