@@ -329,7 +329,15 @@ public class WorkloadGenerator implements AutoCloseable {
                 finder.describeConfig());
         worker.adjustPublishRate(startRate);
 
+        // Drain the period counters and latency histograms once before the loop. They have been
+        // accumulating since the worker started -- through topic readiness probing and producer
+        // warm-up -- so without this the first poll attributes all of it to its own 2-second period and
+        // the diagnostic series opens with a spike that is pure artifact. The finder's own inputs are
+        // cumulative and unaffected either way.
+        worker.getPeriodStats();
+
         long lastControlTimestamp = System.nanoTime();
+        long discoveryStartedAt = lastControlTimestamp;
         boolean done = false;
         boolean wasConfirming = finder.isConfirming();
         Instant verificationStartedAt = null;
@@ -341,12 +349,25 @@ public class WorkloadGenerator implements AutoCloseable {
                 return;
             }
 
-            CountersStats stats = worker.getCountersStats();
+            // getPeriodStats rather than getCountersStats: PeriodStats.totalMessagesSent/Received are
+            // the same cumulative sums CountersStats reports, so the finder's inputs are unchanged,
+            // but the same snapshot also carries the publish-delay and publish-latency histograms.
+            // One round trip instead of two, and -- the reason it matters -- the counters and the
+            // latency describe the same instant, so the diagnostic series below has no skew between
+            // them. Draining the period histograms here is safe: nothing else reads them during
+            // discovery, and worker.resetStats() clears every latency recorder before the measurement
+            // window begins.
+            PeriodStats stats = worker.getPeriodStats();
             long currentTime = System.nanoTime();
             long periodNanos = currentTime - lastControlTimestamp;
             lastControlTimestamp = currentTime;
 
-            done = finder.poll(periodNanos, stats.messagesSent, stats.messagesReceived);
+            // The rate this period actually ran at, captured before poll() can choose the next one.
+            double rateDuringPeriod = appliedRate;
+
+            done = finder.poll(periodNanos, stats.totalMessagesSent, stats.totalMessagesReceived);
+
+            logDiscoveryPoll(currentTime - discoveryStartedAt, rateDuringPeriod, periodNanos, stats);
 
             // Only re-apply on an actual change. adjustPublishRate builds a fresh
             // UniformRateLimiter, which resets its virtual schedule -- calling it every poll threw
@@ -430,6 +451,43 @@ public class WorkloadGenerator implements AutoCloseable {
     public void close() throws Exception {
         worker.stopAll();
         executor.shutdownNow();
+    }
+
+    // A per-poll diagnostic series covering the whole of discovery: one line per
+    // rampBracketPeriodSeconds carrying the four signals needed to locate a knee -- the rate asked
+    // for, the rate achieved, the backlog, and publish delay.
+    //
+    // FINDER-HOLD already records every verdict, but at hold granularity (45s is a typical setting)
+    // and with no latency at all, because the finder is handed counters and never sees any. Neither
+    // is
+    // enough to see *where* the knee is: backlog and publish delay start moving well before a hold's
+    // aggregate verdict flips, which is the whole reason a hold's aggregate can accept a rate that
+    // the
+    // measurement window then fails on. INFO to match RateController's FINDER-TRACE, which likewise
+    // emits per control period regardless of the active log4j2 config.
+    private void logDiscoveryPoll(
+            long elapsedNanos, double rateDuringPeriod, long periodNanos, PeriodStats stats) {
+        double periodSeconds = periodNanos / (double) TimeUnit.SECONDS.toNanos(1);
+        long backlog =
+                Math.max(
+                        0L,
+                        workload.subscriptionsPerTopic * stats.totalMessagesSent - stats.totalMessagesReceived);
+        log.info(
+                "FINDER-POLL t={} rate={} achieved={} backlog={} delayP50Ms={} delayP99Ms={}"
+                        + " delayMaxMs={} latencyP99Ms={}",
+                TimeUnit.NANOSECONDS.toSeconds(elapsedNanos),
+                String.format("%.0f", rateDuringPeriod),
+                String.format("%.0f", stats.messagesSent / periodSeconds),
+                backlog,
+                millisFromMicros(stats.publishDelayLatency.getValueAtPercentile(50)),
+                millisFromMicros(stats.publishDelayLatency.getValueAtPercentile(99)),
+                millisFromMicros(stats.publishDelayLatency.getMaxValue()),
+                millisFromMicros(stats.publishLatency.getValueAtPercentile(99)));
+    }
+
+    // Composes with the existing microsToMillis(long) rather than restating the conversion.
+    private static String millisFromMicros(long micros) {
+        return String.format("%.1f", microsToMillis(micros));
     }
 
     private void createConsumers(List<String> topics) throws IOException {

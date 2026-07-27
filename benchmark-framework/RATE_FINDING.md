@@ -241,17 +241,39 @@ now fails loudly instead:
   `settle + (bracket steps + chop steps + confirmation holds) x hold`.
 
 For diagnosis, discovery logs its **resolved** configuration once at start (every ramp field defaults
-silently, so a misspelled one otherwise looks like it applied), and one `FINDER-HOLD` line per
-completed hold at `INFO`:
+silently, so a misspelled one otherwise looks like it applied), then two `INFO` series.
+
+One `FINDER-HOLD` line per completed hold — the *verdict* record:
 
 ```
 FINDER-HOLD phase=CHOP rate=4750.0 verdict=exceeded confirming=false expected=4750 published=4500
-            received=4500 achievedRatio=0.947 drainRatio=1.000 bracket=[4500.0, 5000.0]
+            received=4500 backlog=310 backlogPeak=1180 achievedRatio=0.947 drainRatio=1.000
+            trendRatio=0.923 bracket=[4500.0, 5000.0]
 ```
 
-`achievedRatio` is `published / expected` and `drainRatio` is
-`received / (subscriptionsPerTopic x published)` — the two quantities the `THROUGHPUT` verdict
-compares against `rampMinThroughputRatio`, shown in both modes.
+`achievedRatio` is `published / expected`, `drainRatio` is
+`received / (subscriptionsPerTopic x published)`, and `trendRatio` is the hold's second half over its
+first — the three quantities the `THROUGHPUT` verdict compares against `rampMinThroughputRatio`, shown
+in both modes. `trendRatio` reads `n/a` when the hold was too short to split, which under `BACKLOG` is
+every failing hold, since those fast-fail on their first breaching poll. `backlog` is the level at the
+deciding poll and `backlogPeak` the deepest the hold reached; they differ when a hold recovers after
+falling behind, which is what a knee looks like from the outside.
+
+One `FINDER-POLL` line per poll — the *diagnostic* series, for plotting:
+
+```
+FINDER-POLL t=124 rate=640000 achieved=639871 backlog=241 delayP50Ms=0.1 delayP99Ms=1.2
+            delayMaxMs=3.4 latencyP99Ms=8.1
+```
+
+This exists because the verdict record is not enough to locate a knee. It is at hold granularity (45s
+is a typical setting), and it carries no latency at all, because the finder is handed counters and
+never sees any. Backlog and publish delay both start moving well before a hold's *aggregate* verdict
+flips — which is precisely how a hold can accept a rate the measurement window then fails on. Plot
+`rate`, `achieved`, `backlog` and `delayP99Ms` on one time axis and the knee is visible directly.
+
+Both series come from a single `getPeriodStats()` call per poll, so the counters and the latency
+describe the same instant with no skew between them.
 
 ### Known limitation
 

@@ -178,12 +178,23 @@ class WorkloadGeneratorRampTest {
             return List.of("topic-0");
         }
 
+        // Discovery itself now reads period stats -- it takes the cumulative counters and the latency
+        // histograms from one snapshot -- so this can no longer double as the "measurement window was
+        // reached" tripwire. It reports the same unbounded-backlog shape getCountersStats does.
         @Override
         public PeriodStats getPeriodStats() {
-            throw new UnsupportedOperationException(
-                    "measurement window must not be reached when discovery found no rate");
+            totalSent += 1_000;
+            PeriodStats stats = new PeriodStats();
+            stats.messagesSent = 1_000; // this period's delta
+            stats.totalMessagesSent = totalSent;
+            stats.totalMessagesReceived = 1; // never advances, so the backlog grows without bound
+            return stats;
         }
 
+        // Still a tripwire: only printAndCollectStats calls this, and only after its sampling loop, so
+        // reaching it at all means discovery handed on a rate it should have refused. A regression now
+        // takes testDurationMinutes to surface rather than failing instantly, but the test's real
+        // check is the asserted IllegalStateException -- this only sharpens the message if that breaks.
         @Override
         public CumulativeLatencies getCumulativeLatencies() {
             throw new UnsupportedOperationException(

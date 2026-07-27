@@ -126,6 +126,12 @@ class RampRateFinder {
     private long secondHalfPublished = 0;
     private long secondHalfNanos = 0;
 
+    // Kept for the verdict log line. The level at the deciding poll and the deepest the hold ever got
+    // answer different questions: a hold can end with a clear backlog having been badly behind in the
+    // middle, which is what a knee looks like from the outside.
+    private long lastReceiveBacklog = 0;
+    private long holdPeakReceiveBacklog = 0;
+
     private final List<RateVerdict> history = new ArrayList<>();
 
     RampRateFinder(Workload workload) {
@@ -251,7 +257,10 @@ class RampRateFinder {
             firstHalfNanos = 0;
             secondHalfPublished = 0;
             secondHalfNanos = 0;
+            holdPeakReceiveBacklog = 0;
         }
+        lastReceiveBacklog = receiveBacklog;
+        holdPeakReceiveBacklog = Math.max(holdPeakReceiveBacklog, receiveBacklog);
         holdExpected += expected;
         holdPublished += published;
         holdReceived += received;
@@ -597,7 +606,8 @@ class RampRateFinder {
         // emits regardless of the active log4j2 config.
         log.info(
                 "FINDER-HOLD phase={} rate={} verdict={} confirming={} expected={} published={}"
-                        + " received={} achievedRatio={} drainRatio={} trendRatio={} bracket=[{}, {}]",
+                        + " received={} backlog={} backlogPeak={} achievedRatio={} drainRatio={}"
+                        + " trendRatio={} bracket=[{}, {}]",
                 phase,
                 rate,
                 passed ? "clean" : "exceeded",
@@ -605,6 +615,8 @@ class RampRateFinder {
                 holdExpected,
                 holdPublished,
                 holdReceived,
+                lastReceiveBacklog,
+                holdPeakReceiveBacklog,
                 String.format("%.3f", ratio(holdPublished, holdExpected)),
                 String.format("%.3f", ratio(holdReceived, subscriptions * holdPublished)),
                 // Second half of the hold against its first. "n/a" when the hold was too short to
