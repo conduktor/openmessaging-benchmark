@@ -19,6 +19,8 @@ import static org.assertj.core.api.Assertions.within;
 
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class RampRateFinderTest {
 
@@ -651,6 +653,12 @@ class RampRateFinderTest {
         // shortfall. The design doc asserts this limitation but nothing exercised it: every other
         // THROUGHPUT fixture is an instantaneous hard cap, under which the predicate is monotone by
         // construction and hold length cannot matter.
+        //
+        // This is also the limit of the second-half-vs-first-half trend check, and the reason that
+        // check narrows hold-length sensitivity rather than removing it. The buffer here absorbs for
+        // the whole hold, so both halves publish a flat 2000 msg/s and the trend ratio is 1.000. No
+        // statistic computed inside this hold can distinguish it from a healthy one -- only a longer
+        // hold can, which is what the next test does.
         Workload workload = throughputWorkload();
         workload.rampStartRate = 2000;
         workload.rampBracketHoldSeconds = 3; // shorter than the 4s burst-fill time
@@ -689,6 +697,90 @@ class RampRateFinderTest {
 
         assertThat(finder.getHi()).isEqualTo(2000.0);
         assertThat(finder.getLo()).isNull();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {25, 45, 90})
+    void aHoldWhoseThroughputDeclinesIsRejectedEvenWhenItsAggregateRatioPasses(int holdSeconds) {
+        // The gap the aggregate ratio cannot close. Sustained capacity is 1000 msg/s and the burst
+        // budget is sized so the buffer saturates 92% of the way through the hold. Up to that point
+        // published tracks expected exactly, so over the hold as a whole the producer still delivers
+        // 48000 of an expected 50000 -- ratio 0.96, comfortably past the 0.95 gate. The candidate is
+        // accepted, and it is not sustainable: the last two seconds manage 1000 msg/s, which is what
+        // the *next* 60-second measurement window would run into for its whole duration.
+        //
+        // Averaging over the whole hold is what hides this: a decline confined to the tail is diluted
+        // by every healthy second before it. Comparing the hold's second half against its first keeps
+        // the decline undiluted -- 1846 vs 2000 msg/s, a 0.923 ratio, below the same 0.95 gate.
+        //
+        // Parameterised over hold length because the *point* is that the verdict no longer depends on
+        // it: the burst budget scales with the hold, so all three see saturation at the same 92% mark
+        // and all three must reject. Under the aggregate alone, all three accept.
+        double sustainedCapacity = 1000;
+        double rate = 2000;
+        // (rate - capacity) x 0.92 x holdSeconds: the overshoot absorbed before saturation.
+        double burstBudget = (rate - sustainedCapacity) * 0.92 * holdSeconds;
+
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = (int) rate;
+        workload.rampBracketHoldSeconds = holdSeconds;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeBurstySystem system = new FakeBurstySystem(sustainedCapacity, burstBudget);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        for (int i = 0; i < holdSeconds; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.getHi())
+                .as("declining throughput within the hold must fail the candidate")
+                .isEqualTo(rate);
+        assertThat(finder.getLo()).isNull();
+    }
+
+    @Test
+    void aHoldWithSteadyThroughputIsNotRejectedByTheTrendCheck() {
+        // The other side of the gate: a hold that is genuinely flat must not be failed by it. Same
+        // 25-second hold, but the candidate sits below capacity, so both halves deliver the full rate.
+        // Without this, the trend check could reject every candidate and the search would collapse.
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 25;
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeThroughputSystem system = new FakeThroughputSystem(50_000, 1_000_000_000L);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        for (int i = 0; i < 25; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(finder.getLo()).isEqualTo(1000.0);
+        assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
+    void aHoldTooShortToSplitInHalfIsJudgedOnItsAggregateAlone() {
+        // A hold of a single poll has no second half to compare against, so the trend check has to
+        // abstain rather than guess. This is why the one-poll holds the other tests use are unaffected
+        // by the gate -- and it is a real limit, not just a test convenience: the shorter the hold, the
+        // less the trend check has to work with.
+        Workload workload = throughputWorkload();
+        workload.rampStartRate = 2000;
+        workload.rampBracketHoldSeconds = 1; // one 1s poll completes the hold
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeBurstySystem system = new FakeBurstySystem(1000, 4000);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle
+        system.advance(finder.getCurrentRate(), periodNanos);
+        finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+
+        // Absorbed entirely by the burst budget, so the aggregate sees a clean 2000 of 2000.
+        assertThat(finder.getLo()).isEqualTo(2000.0);
     }
 
     /** A producer/consumer pair with independent sustained capacities, seeded from zero. */

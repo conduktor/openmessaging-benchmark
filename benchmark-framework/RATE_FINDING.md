@@ -137,15 +137,29 @@ predicate decides that is controlled by `rampVerdict`, with two modes:
   Structural weakness: a healthy pipeline's in-flight backlog scales with throughput, so any
   fixed-ish count is too strict at high rates and too loose at low ones — see the two "Trial
   finding" sections below, both of which are this predicate misfiring in opposite directions.
-- **`THROUGHPUT`** (opt-in) — a scale-free alternative. Per hold: `clean ⇔ published ≥
-  ratio·expected AND received ≥ ratio·published`, where `ratio = rampMinThroughputRatio` (default
-  0.95). It checks that the pipeline both kept up with the target rate *and* drained what it
-  published, as ratios rather than message counts, so the same threshold applies unchanged whether
-  the candidate rate is 100 msg/s or 1,000,000 msg/s. There's no per-poll fast-fail — the verdict
-  is decided once, at hold completion, from the hold's aggregate published/received counts, not
-  from intermediate backlog snapshots. It does **not** solve hold-length sensitivity: a hold still
-  has to run longer than the broker's burst-absorption time in either mode, or a genuinely
-  unsustainable rate can still look clean for the duration of a too-short hold.
+- **`THROUGHPUT`** (opt-in) — a scale-free alternative. Per hold, all three of:
+  1. `published ≥ ratio · expected` — the producer kept up with the target rate.
+  2. `received ≥ ratio · subscriptionsPerTopic · published` — the consumers drained what was
+     published. Note this is a check on *divergence*, not on depth: if the receive backlog grew by
+     `ΔB` while the hold published `P`, the consumers moved `subscriptions·P − ΔB`, so this is
+     exactly `ΔB ≤ (1 − ratio)·subscriptions·P`. Consumer-side divergence is caught at any hold
+     length, which is why there is no separate "backlog is not growing" gate.
+  3. `secondHalfRate ≥ ratio · firstHalfRate` — throughput did not *decline* across the hold.
+
+  `ratio` is `rampMinThroughputRatio` (default 0.95) throughout. Everything is a ratio rather than a
+  message count, so the same thresholds apply unchanged whether the candidate is 100 msg/s or
+  1,000,000 msg/s. There is no per-poll fast-fail: the verdict is decided once, at hold completion.
+
+  Check 3 exists because checks 1 and 2 average over the whole hold, which dilutes a decline confined
+  to the tail. A broker that absorbs the overshoot into page cache, batching and socket buffers acks
+  at the full target rate until those buffers saturate, so a hold that saturates near its end still
+  totals above the ratio and gets accepted. Comparing the halves leaves the decline undiluted.
+
+  It **narrows** hold-length sensitivity without removing it. A hold whose buffers absorb for its
+  entire length is flat in both halves, and no statistic computed within that hold can tell it from a
+  healthy one — only a longer hold can. Measured against a 20,000-message absorption buffer over a
+  true 1,000 msg/s ceiling, check 3 is worth 2–5%; tripling the hold is worth far more. Budget hold
+  length first, and see "Known limitation" below.
 
 ### Configuration (workload YAML fields, all optional, only apply when `producerRate: 0`)
 
@@ -259,6 +273,15 @@ against, so when there is nothing to drain it costs a single poll.
 Note what this does and does not fix. It removes *cross-candidate* contamination. It does not make a
 history-dependent verdict into a function of rate — see the trial log, where the same 800k candidate
 returned opposite verdicts on the same broker minutes apart.
+
+**Expect enabling it to raise the reported rate, not lower it.** Counterintuitive, and worth
+understanding before reading a before/after pair as a regression. On an absorbing broker, leftover
+contamination makes every candidate fail more readily, which pushes the accepted rate down — and on a
+model whose buffer never refills, that accidentally lands very close to the true ceiling. Draining
+gives each candidate a fair hold, which is correct, and the accepted rate rises accordingly. The
+contamination was not producing a good answer for a good reason; it was masking the fact that a
+5%-over-a-finite-hold predicate is too permissive when a broker can absorb the overshoot. Fixing the
+isolation exposes that. Hold length is the lever that addresses it.
 
 ### Caveat when reading a ramp run's reported rates
 

@@ -119,6 +119,13 @@ class RampRateFinder {
     private long elapsedDrainNanos = 0;
     private double pendingRate = 0;
 
+    // The hold's publish volume split at the midpoint of its target length, so holdClean() can judge
+    // the trend across a hold and not only its total.
+    private long firstHalfPublished = 0;
+    private long firstHalfNanos = 0;
+    private long secondHalfPublished = 0;
+    private long secondHalfNanos = 0;
+
     private final List<RateVerdict> history = new ArrayList<>();
 
     RampRateFinder(Workload workload) {
@@ -240,6 +247,10 @@ class RampRateFinder {
             holdPublished = 0;
             holdReceived = 0;
             holdElapsedNanos = 0;
+            firstHalfPublished = 0;
+            firstHalfNanos = 0;
+            secondHalfPublished = 0;
+            secondHalfNanos = 0;
         }
         holdExpected += expected;
         holdPublished += published;
@@ -247,6 +258,19 @@ class RampRateFinder {
         // Tracked separately from elapsedHoldNanos, which the bracket path zeroes before recording
         // its verdict -- this one stays valid for as long as the hold's totals do.
         holdElapsedNanos += periodNanos;
+
+        // Assign this period to a half of the hold. The midpoint comes from the *target* hold length,
+        // which is known up front, so each period can be filed as it arrives rather than buffering
+        // every poll of the hold and splitting at the end. A period belongs to the first half when it
+        // started before the midpoint.
+        long targetHoldNanos = phase == Phase.BRACKET ? bracketHoldNanos : holdNanos;
+        if (holdElapsedNanos - periodNanos < targetHoldNanos / 2) {
+            firstHalfPublished += published;
+            firstHalfNanos += periodNanos;
+        } else {
+            secondHalfPublished += published;
+            secondHalfNanos += periodNanos;
+        }
 
         boolean breachedNow;
         if (verdict == RampVerdict.THROUGHPUT) {
@@ -493,8 +517,43 @@ class RampRateFinder {
             return true;
         }
         boolean producerKeepsUp = holdPublished >= minThroughputRatio * holdExpected;
+        // Note this is already a *divergence* check rather than a level check, which is why there is no
+        // separate "backlog is not growing" gate: if the receive backlog grew by dB while the hold
+        // published P, the consumer moved subscriptions x P - dB, so requiring
+        // holdReceived >= ratio x subscriptions x holdPublished is exactly requiring
+        // dB <= (1 - ratio) x subscriptions x P. Consumer-side divergence is caught at any hold length.
         boolean consumerKeepsUp = holdReceived >= minThroughputRatio * subscriptions * holdPublished;
-        return producerKeepsUp && consumerKeepsUp;
+        return producerKeepsUp && consumerKeepsUp && throughputIsNotDeclining();
+    }
+
+    // Whether the hold's second half published as fast as its first. The aggregate ratio above
+    // averages
+    // over the whole hold, which dilutes a decline confined to the tail: a broker that absorbs the
+    // overshoot into page cache, batching and socket buffers acks at the full target rate until those
+    // buffers saturate, so a hold that saturates near its end still totals above the ratio and is
+    // accepted. Comparing the halves leaves that decline undiluted.
+    //
+    // This narrows the window rather than closing it. A hold whose buffers absorb the overshoot for
+    // its
+    // entire length is flat in both halves and no in-hold statistic can tell it from a healthy one --
+    // only a longer hold can. What this buys is roughly the sensitivity of a hold twice as long, for
+    // no
+    // extra wall-clock, because the signal is concentrated in half the window instead of spread over
+    // all of it.
+    private boolean throughputIsNotDeclining() {
+        // A hold of a single period has no second half to compare against; abstain rather than guess.
+        if (firstHalfNanos == 0 || secondHalfNanos == 0) {
+            return true;
+        }
+        return secondHalfRate() >= minThroughputRatio * firstHalfRate();
+    }
+
+    private double firstHalfRate() {
+        return firstHalfPublished / (firstHalfNanos / (double) ONE_SECOND_IN_NANOS);
+    }
+
+    private double secondHalfRate() {
+        return secondHalfPublished / (secondHalfNanos / (double) ONE_SECOND_IN_NANOS);
     }
 
     // A one-line resolved-config summary. Rendered by the caller at discovery start so a run's log
@@ -538,7 +597,7 @@ class RampRateFinder {
         // emits regardless of the active log4j2 config.
         log.info(
                 "FINDER-HOLD phase={} rate={} verdict={} confirming={} expected={} published={}"
-                        + " received={} achievedRatio={} drainRatio={} bracket=[{}, {}]",
+                        + " received={} achievedRatio={} drainRatio={} trendRatio={} bracket=[{}, {}]",
                 phase,
                 rate,
                 passed ? "clean" : "exceeded",
@@ -548,6 +607,11 @@ class RampRateFinder {
                 holdReceived,
                 String.format("%.3f", ratio(holdPublished, holdExpected)),
                 String.format("%.3f", ratio(holdReceived, subscriptions * holdPublished)),
+                // Second half of the hold against its first. "n/a" when the hold was too short to
+                // split, so a hold the trend gate abstained on is distinguishable from a flat one.
+                firstHalfNanos == 0 || secondHalfNanos == 0 || firstHalfRate() == 0
+                        ? "n/a"
+                        : String.format("%.3f", secondHalfRate() / firstHalfRate()),
                 lo,
                 hi);
 

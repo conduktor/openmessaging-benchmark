@@ -311,3 +311,46 @@ When that happens `achieved ~= requested`, so `min` makes the derivation a no-op
 hazard, which is the reason it is safe to consider at all. Left as a decision, not landed: it trades
 2.5% of reported accuracy for 17% of discovery time and belongs with the band-vs-point question rather
 than inside a commit labelled D5.
+
+## Finding 7: the trend gate works, is worth 2–5%, and corrects finding 5's conclusion
+
+Working note. `THROUGHPUT` now also requires that a hold's second half published as fast as its
+first (`secondHalfRate >= ratio x firstHalfRate`). Checks 1 and 2 average over the whole hold, which
+dilutes a decline confined to the tail; comparing halves leaves it undiluted. Always on under
+`THROUGHPUT` rather than behind a flag: `THROUGHPUT` is already opt-in and already documented as having
+exactly this defect, so this is a fix to it, not a variant of it. No existing test changed behaviour.
+
+**In isolation it is decisive.** A 25/45/90-second hold at 2000 msg/s against a 1000 msg/s ceiling,
+with the absorption buffer sized to saturate 92% of the way through: aggregate ratio 0.96 (accepted),
+trend ratio 0.92 (rejected). Parameterised over all three hold lengths to show the verdict no longer
+depends on hold length *for that shape* of failure.
+
+**Across a whole search it is worth much less.** Discovery driven to completion against a
+20,000-message absorption buffer over a true 1,000 msg/s ceiling, each candidate given a clean buffer
+(i.e. `rampDrainSeconds` working):
+
+| Hold | Without trend gate | With trend gate | Error with gate |
+|------|--------------------|-----------------|-----------------|
+| 15 s | 2,316              | 2,264           | +126%           |
+| 45 s | 1,440              | 1,366           | +37%            |
+| 90 s | 1,217              | 1,189           | +19%            |
+
+The gate is worth 2–5%. Hold length is worth 6x. The reason: accepted candidates are the ones that
+saturate *late* in their hold or not at all, and for those the decline is small in the second half
+too. Both gates are 5% tests; concentrating one into half the window roughly doubles its sensitivity
+to a decline, which shifts the accepted rate only slightly because rate and saturation-fraction are
+steeply related. Keep it — it is free, always conservative, and `trendRatio` in `FINDER-HOLD` is
+diagnostic — but do not budget it as the fix.
+
+**This corrects finding 5.** That entry concluded "longer holds do not fix it", from the integration
+test's measurement-window publish delay barely moving (3,037 ms at a 15s hold to 2,612 ms at 45s).
+That inference was wrong, because publish delay in a 120-second measurement window is mostly a
+property of that window, not of the hold that chose the rate. Measured against a known ceiling
+instead, hold length moves the answer a great deal: +126% to +19% for a 6x hold. It converges slowly —
+roughly, the error halves per doubling of the hold, and even a 90-second hold is still 19% over — so
+"longer holds are not sufficient" stands. "Longer holds do not help" does not.
+
+**Still open.** Neither gate can see a hold that absorbs for its entire length, and no statistic
+computed inside that hold can. The remaining candidates are all outside the hold: scale the hold with
+the candidate rate (absorption time is roughly buffer-depth / overshoot, so higher rates need longer
+holds, not equal ones), or give up on a point value and report the band the sweep actually supports.
