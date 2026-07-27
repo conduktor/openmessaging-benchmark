@@ -16,10 +16,10 @@ An AKS re-validation on 2026-07-24 (matrix `finder-chop-revalidate.yaml`, digest
 `sha256:4c43c65…`, `representative` preset, 1 topic / 100 partitions / 100-byte messages) exposed
 that this predicate is structurally wrong. Three loads on the **same cluster**:
 
-| Load | Config | Discovered rate | Sustained over 15 min? |
-|------|--------|-----------------|------------------------|
-| AIMD | fixed 1000-msg backlog limit | ~13,500 msg/s | yes (but conservative) |
-| chop-floor | `rampMaxBacklogSeconds: 0.1` | **2,734 msg/s** (clean confirm) | yes, trivially — far under capacity |
+|     Load     |            Config            |                Discovered rate                |                                                Sustained over 15 min?                                                |
+|--------------|------------------------------|-----------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| AIMD         | fixed 1000-msg backlog limit | ~13,500 msg/s                                 | yes (but conservative)                                                                                               |
+| chop-floor   | `rampMaxBacklogSeconds: 0.1` | **2,734 msg/s** (clean confirm)               | yes, trivially — far under capacity                                                                                  |
 | chop-ceiling | `rampMaxBacklogSeconds: 1.0` | **880,000 msg/s** (`nonMonotonic` → withheld) | **yes** — publish≈consume≈880k, backlog bounded (max 16,432, not growing), avg publish-delay 0.12 ms, e2e p99 326 ms |
 
 The true sustainable rate was **~880k msg/s**. AIMD under-reported it by ~65×, and `chop-floor` by
@@ -157,3 +157,4 @@ correct, scale-free verdict.
   `poll()` (current backlog-count check ~L166–187); bracket/chop machinery ~L194–293.
 - `benchmark-framework/RATE_FINDING.md` — algorithm docs and the two "Trial finding" incidents.
 - AKS run 30103329337 (`conduktor/benchmarks`) — the re-validation that produced the data above.
+

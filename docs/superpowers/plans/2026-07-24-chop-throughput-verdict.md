@@ -130,24 +130,24 @@ Pure refactor: route the pass/fail decision through a `holdClean()` method that 
 Add field near the other `final` config fields (top of class):
 
 ```java
-    private final RampVerdict verdict;
+private final RampVerdict verdict;
 ```
 
 In the constructor (after `requiredConfirmationHolds` is set):
 
 ```java
-        this.verdict = workload.rampVerdict != null ? workload.rampVerdict : RampVerdict.BACKLOG;
+this.verdict = workload.rampVerdict != null ? workload.rampVerdict : RampVerdict.BACKLOG;
 ```
 
 Add the seam (place it just above `recordVerdict`):
 
 ```java
-    // Whether the just-completed hold counts as clean. For BACKLOG this is always true: a real
-    // breach fast-fails per-poll before the hold ever completes, so reaching completion means clean.
-    // THROUGHPUT overrides this in a later task.
-    private boolean holdClean() {
-        return true;
-    }
+// Whether the just-completed hold counts as clean. For BACKLOG this is always true: a real
+// breach fast-fails per-poll before the hold ever completes, so reaching completion means clean.
+// THROUGHPUT overrides this in a later task.
+private boolean holdClean() {
+    return true;
+}
 ```
 
 - [ ] **Step 2: Rewrite `pollBracket` to branch on `holdClean()` at completion**
@@ -417,26 +417,26 @@ Expected: FAIL — the three new tests do not converge as asserted, because `hol
 Add fields (near `previousTotalPublished`):
 
 ```java
-    private final double minThroughputRatio;
-    private long previousTotalReceived = 0;
-    private long holdExpected = 0;
-    private long holdPublished = 0;
-    private long holdReceived = 0;
+private final double minThroughputRatio;
+private long previousTotalReceived = 0;
+private long holdExpected = 0;
+private long holdPublished = 0;
+private long holdReceived = 0;
 ```
 
 In the constructor:
 
 ```java
-        this.minThroughputRatio =
-                workload.rampMinThroughputRatio != null
-                        ? workload.rampMinThroughputRatio.doubleValue()
-                        : 0.95;
+this.minThroughputRatio =
+        workload.rampMinThroughputRatio != null
+                ? workload.rampMinThroughputRatio.doubleValue()
+                : 0.95;
 ```
 
 In `poll()`, inside the settle block, keep the received baseline current too (next to `previousTotalPublished = totalPublished;`):
 
 ```java
-            previousTotalReceived = totalReceived;
+previousTotalReceived = totalReceived;
 ```
 
 After the per-period `published`/`receiveBacklog`/`publishBacklog` are computed and `previousTotalPublished` is updated, add received-delta tracking and hold accumulation:
@@ -462,32 +462,32 @@ After the per-period `published`/`receiveBacklog`/`publishBacklog` are computed 
 In `poll()`, guard the fast-fail computation so `THROUGHPUT` never fast-fails:
 
 ```java
-        boolean breachedNow;
-        if (verdict == RampVerdict.THROUGHPUT) {
-            breachedNow = false; // throughput verdict is decided at hold completion (see holdClean)
-        } else if (maxBacklogSeconds != null) {
-            double limit =
-                    Math.max(
-                            maxBacklogFloor,
-                            Math.min(currentRate * maxBacklogSeconds, (double) maxBacklogCeiling));
-            breachedNow = receiveBacklog > limit || publishBacklog > limit;
-        } else {
-            breachedNow =
-                    receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
-        }
+boolean breachedNow;
+if (verdict == RampVerdict.THROUGHPUT) {
+    breachedNow = false; // throughput verdict is decided at hold completion (see holdClean)
+} else if (maxBacklogSeconds != null) {
+    double limit =
+            Math.max(
+                    maxBacklogFloor,
+                    Math.min(currentRate * maxBacklogSeconds, (double) maxBacklogCeiling));
+    breachedNow = receiveBacklog > limit || publishBacklog > limit;
+} else {
+    breachedNow =
+            receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
+}
 ```
 
 Replace the `holdClean()` body from Task 2 with:
 
 ```java
-    private boolean holdClean() {
-        if (verdict != RampVerdict.THROUGHPUT) {
-            return true;
-        }
-        boolean producerKeepsUp = holdPublished >= minThroughputRatio * holdExpected;
-        boolean consumerKeepsUp = holdReceived >= minThroughputRatio * holdPublished;
-        return producerKeepsUp && consumerKeepsUp;
+private boolean holdClean() {
+    if (verdict != RampVerdict.THROUGHPUT) {
+        return true;
     }
+    boolean producerKeepsUp = holdPublished >= minThroughputRatio * holdExpected;
+    boolean consumerKeepsUp = holdReceived >= minThroughputRatio * holdPublished;
+    return producerKeepsUp && consumerKeepsUp;
+}
 ```
 
 - [ ] **Step 5: Run the full finder suite (new + existing)**
@@ -517,7 +517,6 @@ After the CHOP "Algorithm" section, add a subsection documenting `rampVerdict`:
 
 - `BACKLOG` (default): the existing backlog-count predicate (`rampMaxBacklogSeconds`/`Floor`/`Ceiling`, or the fixed `rampPublishBacklogLimit`/`rampReceiveBacklogLimit`). Note its structural weakness — a healthy pipeline's in-flight backlog scales with throughput, so any fixed-ish count is too strict at high rates and too loose at low ones.
 - `THROUGHPUT` (opt-in): per hold, `clean ⇔ published ≥ ratio·expected AND received ≥ ratio·published`, with `ratio = rampMinThroughputRatio` (default 0.95). Scale-free (one threshold at every rate); no fast-fail (verdict at hold completion). Note it does not solve hold-length sensitivity (a hold must exceed the broker's burst-absorption time in either mode).
-
 - [ ] **Step 2: Add the two new fields to the config table**
 
 Add rows for `rampVerdict` (default `BACKLOG`) and `rampMinThroughputRatio` (default `0.95`, "CHOP only — THROUGHPUT verdict").
@@ -555,23 +554,23 @@ Add an integration test proving `THROUGHPUT` converges to a sustainable rate at 
 Add to `ChopRateFinderKafkaIT`:
 
 ```java
-    private double runDiscoveryAndAssertSustainable(Workload workload) throws Exception {
-        File driverConfig = writeKafkaDriverConfig(KAFKA.getBootstrapServers());
-        LocalWorker worker = new LocalWorker();
-        worker.initializeDriver(driverConfig);
-        TestResult result;
-        try (WorkloadGenerator generator = new WorkloadGenerator("Kafka", workload, worker)) {
-            result = generator.run();
-        }
-        double pubDelayAvgMs = result.aggregatedPublishDelayLatencyAvg / 1000.0;
-        log.info(
-                "verdict={} confirmedRate={} avgPublishDelay={} ms",
-                workload.rampVerdict,
-                result.rampVerification == null ? null : result.rampVerification.rate,
-                String.format("%.1f", pubDelayAvgMs));
-        assertThat(pubDelayAvgMs).isLessThan(500.0); // the confirmed rate must actually hold
-        return result.rampVerification == null ? 0.0 : result.rampVerification.rate;
+private double runDiscoveryAndAssertSustainable(Workload workload) throws Exception {
+    File driverConfig = writeKafkaDriverConfig(KAFKA.getBootstrapServers());
+    LocalWorker worker = new LocalWorker();
+    worker.initializeDriver(driverConfig);
+    TestResult result;
+    try (WorkloadGenerator generator = new WorkloadGenerator("Kafka", workload, worker)) {
+        result = generator.run();
     }
+    double pubDelayAvgMs = result.aggregatedPublishDelayLatencyAvg / 1000.0;
+    log.info(
+            "verdict={} confirmedRate={} avgPublishDelay={} ms",
+            workload.rampVerdict,
+            result.rampVerification == null ? null : result.rampVerification.rate,
+            String.format("%.1f", pubDelayAvgMs));
+    assertThat(pubDelayAvgMs).isLessThan(500.0); // the confirmed rate must actually hold
+    return result.rampVerification == null ? 0.0 : result.rampVerification.rate;
+}
 ```
 
 - [ ] **Step 2: Write the failing THROUGHPUT test**
@@ -631,3 +630,4 @@ Expected: `BUILD SUCCESS` — confirms the new enum/fields don't break dependent
 - **Spec coverage:** `rampVerdict` enum + default BACKLOG (Task 1); `rampMinThroughputRatio` 0.95 (Tasks 1,3); predicate `published≥ratio·expected AND received≥ratio·published` at hold completion (Task 3 Step 4); no per-poll fast-fail for THROUGHPUT (`breachedNow=false`, Task 3 Step 4); machinery reused (Task 2 preserves it); no new Worker API (uses counters already passed to `poll`); back-compat default (Task 1 + Task 2 regression gate); tests unit+IT (Tasks 3,5); docs incl. AKS motivation + hold-length caveat (Task 4). All spec sections map to a task.
 - **Placeholder scan:** the only prose-only step is Task 4 (a Markdown doc, content described precisely by section); every code step shows complete code.
 - **Type consistency:** `RampVerdict.{BACKLOG,THROUGHPUT}`, `Workload.rampVerdict`/`rampMinThroughputRatio`, `holdClean()`, `breachedNow`, `holdExpected/holdPublished/holdReceived`, `previousTotalReceived`, `minThroughputRatio` used consistently across Tasks 1–3; `FakeThroughputSystem(double,double,long)` constructor matches all three call sites in Task 3 Step 1.
+
