@@ -365,7 +365,16 @@ public class WorkloadGenerator implements AutoCloseable {
             // The rate this period actually ran at, captured before poll() can choose the next one.
             double rateDuringPeriod = appliedRate;
 
-            done = finder.poll(periodNanos, stats.totalMessagesSent, stats.totalMessagesReceived);
+            // Publish delay goes in too: it is not a verdict input, but recovery after a failed
+            // candidate cannot be judged without it. Work queued in the producer client has not been
+            // published, so it contributes nothing to receive backlog -- the drain would otherwise call
+            // itself recovered while the producer is still seconds behind its own schedule.
+            done =
+                    finder.poll(
+                            periodNanos,
+                            stats.totalMessagesSent,
+                            stats.totalMessagesReceived,
+                            stats.publishDelayLatency.getValueAtPercentile(99));
 
             logDiscoveryPoll(currentTime - discoveryStartedAt, rateDuringPeriod, periodNanos, stats);
 

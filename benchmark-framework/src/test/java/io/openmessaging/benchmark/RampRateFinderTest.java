@@ -977,6 +977,45 @@ class RampRateFinderTest {
     }
 
     @Test
+    void recoveryWaitsForTheProducerToCatchUpAndNotJustTheConsumer() {
+        // The drain's blind spot, the mirror of the acknowledgement-stall one. Its recovery test looked
+        // only at cumulative receive backlog, and messages still queued in the producer client have not
+        // been published yet -- so they contribute no receive backlog at all. With a 64MB buffer.memory
+        // that is hundreds of thousands of messages the test cannot see, and every drain in the local
+        // Kafka run duly reported "recovery complete after 2s" while publish delay was still seconds
+        // deep. The next candidate then measured that fallout as its own.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 1;
+        workload.rampDrainSeconds = 600; // far longer than this test needs
+        workload.rampMaxBacklogSeconds = 0.5; // also the producer's catch-up tolerance: 0.5s
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 1000, 1000, 0); // 1000 holds clean -> lo = 1000
+        assertThat(finder.getLo()).isEqualTo(1000.0);
+        // 2000 publishes fully but leaves 1,500 messages of receive backlog against the 1,000 limit
+        // (the floor, since 0.5s at 1000 msg/s is only 500), and the hold ends while still breaching.
+        finder.poll(periodNanos, 3000, 1500, 0);
+        assertThat(finder.isDraining()).isTrue();
+
+        // Backlog is clear, but the producer is still 3 seconds behind its own schedule: the overshoot
+        // is sitting in its send buffer, invisible to a receive-backlog check.
+        finder.poll(periodNanos, 4000, 4000, SECONDS.toMicros(3));
+        assertThat(finder.isDraining())
+                .as("consumer caught up, producer has not -- not recovered")
+                .isTrue();
+
+        // Delay subsides below the 0.5s tolerance. Now it is genuinely recovered.
+        finder.poll(periodNanos, 5000, 5000, 100_000);
+
+        assertThat(finder.isDraining()).isFalse();
+        assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+    }
+
+    @Test
     void drainEndsEarlyOnceTheBacklogHasCleared() {
         // The drain is capped, not fixed: waiting out the full cap when the system already recovered
         // just burns the discovery budget. Once the backlog is back within the limit it is judged

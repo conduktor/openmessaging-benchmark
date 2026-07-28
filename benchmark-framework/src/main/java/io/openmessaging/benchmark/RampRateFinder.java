@@ -216,6 +216,17 @@ class RampRateFinder {
 
     // Advances the state machine given the latest period's counters. Returns true when done.
     boolean poll(long periodNanos, long totalPublished, long totalReceived) {
+        return poll(periodNanos, totalPublished, totalReceived, 0L);
+    }
+
+    // As above, plus this period's p99 publish delay in microseconds -- how far behind its own
+    // schedule
+    // the producer is. Diagnostic only as far as the verdict goes; it is used solely to decide when
+    // recovery is complete, because a producer's own send buffer holds work that has not been
+    // published
+    // and so contributes nothing to receive backlog. 0 means "not supplied" and reads as caught up.
+    boolean poll(
+            long periodNanos, long totalPublished, long totalReceived, long publishDelayP99Micros) {
         if (phase == Phase.DONE) {
             return true;
         }
@@ -242,27 +253,7 @@ class RampRateFinder {
         }
 
         if (draining) {
-            elapsedDrainNanos += periodNanos;
-            // Re-baseline so the recovery period's traffic is never attributed to the next
-            // candidate's hold, exactly as the settle phase does for start-up transients.
-            previousTotalPublished = totalPublished;
-            previousTotalReceived = totalReceived;
-            long drainBacklog = subscriptions * totalPublished - totalReceived;
-            boolean recovered = drainBacklog <= receiveBacklogLimitFor(currentRate);
-            boolean outOfPatience = elapsedDrainNanos >= drainNanos;
-            if (recovered || outOfPatience) {
-                log.info(
-                        "FINDER-DRAIN recovery {} after {}s at {} msg/s (backlog {}); resuming at {} msg/s",
-                        recovered ? "complete" : "capped",
-                        SECONDS.convert(elapsedDrainNanos, NANOSECONDS),
-                        currentRate,
-                        drainBacklog,
-                        pendingRate);
-                draining = false;
-                elapsedDrainNanos = 0;
-                currentRate = pendingRate;
-            }
-            return false;
+            return pollDrain(periodNanos, totalPublished, totalReceived, publishDelayP99Micros);
         }
 
         long expected = (long) ((currentRate / ONE_SECOND_IN_NANOS) * periodNanos);
@@ -521,6 +512,57 @@ class RampRateFinder {
         }
         return Math.max(
                 maxBacklogFloor, Math.min(rate * maxBacklogSeconds, (double) maxBacklogCeiling));
+    }
+
+    // How far behind its own schedule the producer may still be and count as recovered.
+    // rampMaxBacklogSeconds is already a tolerance expressed in seconds, so it is the natural value
+    // when
+    // set -- the same slack allowed on the consumer side, applied to the producer. One second
+    // otherwise,
+    // which is generous next to the sub-millisecond delays a healthy hold shows.
+    private long producerCatchUpMicros() {
+        return maxBacklogSeconds != null
+                ? (long) (maxBacklogSeconds * 1_000_000L)
+                : SECONDS.toMicros(1);
+    }
+
+    // Recovery after a failed candidate: run at the highest rate already known to hold and evaluate
+    // nothing until both sides have caught up. Always returns false -- recovery never ends discovery.
+    private boolean pollDrain(
+            long periodNanos, long totalPublished, long totalReceived, long publishDelayP99Micros) {
+        elapsedDrainNanos += periodNanos;
+        // Re-baseline so the recovery period's traffic is never attributed to the next
+        // candidate's hold, exactly as the settle phase does for start-up transients.
+        previousTotalPublished = totalPublished;
+        previousTotalReceived = totalReceived;
+        long drainBacklog = subscriptions * totalPublished - totalReceived;
+        // Both sides have to be caught up, not just the consumer. Work still sitting in the
+        // producer's client buffer has not been published, so it contributes nothing to receive
+        // backlog -- with a 64MB buffer.memory that is hundreds of thousands of messages the backlog
+        // check cannot see. Every drain in the local Kafka run reported "recovery complete after 2s"
+        // on that basis while publish delay was still seconds deep, and the next candidate then
+        // measured the previous one's fallout as its own.
+        boolean consumerCaughtUp = drainBacklog <= receiveBacklogLimitFor(currentRate);
+        boolean producerCaughtUp = publishDelayP99Micros <= producerCatchUpMicros();
+        boolean recovered = consumerCaughtUp && producerCaughtUp;
+        boolean outOfPatience = elapsedDrainNanos >= drainNanos;
+        if (recovered || outOfPatience) {
+            log.info(
+                    "FINDER-DRAIN recovery {} after {}s at {} msg/s (backlog {}, delayP99 {}ms,"
+                            + " consumerCaughtUp={} producerCaughtUp={}); resuming at {} msg/s",
+                    recovered ? "complete" : "capped",
+                    SECONDS.convert(elapsedDrainNanos, NANOSECONDS),
+                    currentRate,
+                    drainBacklog,
+                    publishDelayP99Micros / 1000,
+                    consumerCaughtUp,
+                    producerCaughtUp,
+                    pendingRate);
+            draining = false;
+            elapsedDrainNanos = 0;
+            currentRate = pendingRate;
+        }
+        return false;
     }
 
     private boolean setRate(double next) {
