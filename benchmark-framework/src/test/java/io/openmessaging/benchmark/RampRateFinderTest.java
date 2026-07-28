@@ -1341,6 +1341,63 @@ class RampRateFinderTest {
     }
 
     @Test
+    void anAcknowledgementStallIsNotEvidenceAboutTheRate() {
+        // AKS, transparent arm: two polls in which nothing acknowledged failed a re-verification of a
+        // rate that had just held cleanly, and the search converged on 9,203 msg/s against a real
+        // ceiling near 1,100,000 -- about 120x low. Every counter and histogram the finder sees is
+        // populated on ack, so an acknowledgement stall zeroes all of them at once while the messages
+        // are still in flight. The deferred acks arrived on the very next poll: 41,278 msg/s against a
+        // 5,000 target, with a p99 publish latency of 10.7 seconds.
+        //
+        // Nothing acknowledged is an absence of data, not a measurement of capacity. It says nothing
+        // about whether the rate is too high, so it must not fail the candidate -- and it must not
+        // count
+        // toward the hold either, because a hold interrupted mid-window is not the window it claims.
+        Workload workload = workload();
+        workload.rampStartRate = 10000;
+        workload.rampBracketHoldSeconds = 3;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 10_000, 10_000); // a real, clean poll: 1s of the 3s hold
+
+        // Acks stop dead. Cumulative totals do not move, so published is exactly 0 for two polls --
+        // which under a plain consecutive-breach check is two breaches and a failed candidate.
+        finder.poll(periodNanos, 10_000, 10_000);
+        finder.poll(periodNanos, 10_000, 10_000);
+        assertThat(finder.getHi()).as("nothing acknowledged is not a breach").isNull();
+        assertThat(finder.getLo()).as("nor is it a clean hold").isNull();
+
+        // Acks resume. The hold restarts rather than resuming a window it did not observe, so three
+        // fresh clean seconds are needed before the candidate is accepted.
+        finder.poll(periodNanos, 20_000, 20_000);
+        finder.poll(periodNanos, 30_000, 30_000);
+        assertThat(finder.getLo()).as("hold restarted, so not yet complete").isNull();
+        finder.poll(periodNanos, 40_000, 40_000);
+
+        assertThat(finder.getLo()).as("three clean seconds after the stall").isEqualTo(10000.0);
+        assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
+    void aGenuineShortfallStillBreachesEvenThoughAZeroDoesNot() {
+        // The guard on the above: "published nothing" is excused, "published far too little" is not.
+        // Otherwise the fix would blind the producer-side check entirely.
+        Workload workload = workload();
+        workload.rampStartRate = 10000;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        // 100 of an expected 10,000: a 9,900-message publish shortfall against the 100 limit.
+        finder.poll(periodNanos, 100, 100);
+        finder.poll(periodNanos, 200, 200);
+
+        assertThat(finder.getHi()).as("a measured shortfall is still a breach").isEqualTo(10000.0);
+    }
+
+    @Test
     void theDefaultDiscoveryBudgetCoversASearchAtTheDefaultHold() {
         // The two defaults have to stay coherent with each other. A hold long enough to outlast a real
         // broker's burst absorption makes discovery expensive, and under THROUGHPUT there is no

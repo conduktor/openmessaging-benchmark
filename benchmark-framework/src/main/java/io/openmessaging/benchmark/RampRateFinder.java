@@ -274,6 +274,39 @@ class RampRateFinder {
         long received = totalReceived - previousTotalReceived;
         previousTotalReceived = totalReceived;
 
+        // Nothing acknowledged is an absence of data, not a measurement of capacity. Every counter and
+        // histogram this finder sees is populated on ack -- WorkerStats.recordProducerSuccess
+        // increments
+        // messagesSent and records both latency histograms at the same moment -- so an acknowledgement
+        // stall zeroes all of them at once while the messages are still in flight, unacknowledged. That
+        // says nothing about whether the rate is too high.
+        //
+        // An AKS run mistook exactly this for a breach: two zero-ack polls failed a re-verification of
+        // a
+        // rate that had just held cleanly, and the search converged on 9,203 msg/s against a real
+        // ceiling
+        // near 1,100,000. The deferred acks arrived on the very next poll -- 41,278 msg/s against a
+        // 5,000
+        // target, p99 publish latency 10.7 seconds -- so nothing had been lost, only deferred. A
+        // consecutive-breach requirement is no defence here, because consecutiveness is trivially true
+        // when every poll in the window reads zero.
+        //
+        // So do not judge the candidate on it, and restart the hold rather than resuming a window that
+        // was interrupted partway through: a hold has to be a continuous observation to mean what it
+        // claims. If the stall never clears, the discovery budget caps and no rampVerification is
+        // attached, which is the honest outcome for an outage.
+        if (published == 0 && expected > 0) {
+            log.info(
+                    "FINDER-STALL no acknowledgements in a {}ms poll at {} msg/s (expected {}); not"
+                            + " judged, hold restarted",
+                    NANOSECONDS.toMillis(periodNanos),
+                    currentRate,
+                    expected);
+            elapsedHoldNanos = 0;
+            consecutiveBreaches = 0;
+            return false;
+        }
+
         // A fresh hold starts whenever elapsedHoldNanos was reset to 0 by the previous poll's
         // transition (or after settle). Reset the per-hold accumulators at that first poll.
         if (elapsedHoldNanos == 0) {
@@ -310,27 +343,7 @@ class RampRateFinder {
             secondHalfNanos += periodNanos;
         }
 
-        boolean breachedNow;
-        if (verdict == RampVerdict.THROUGHPUT) {
-            breachedNow = false; // throughput verdict is decided at hold completion (see holdClean)
-        } else if (maxBacklogSeconds != null) {
-            // A limit that scales with the candidate rate, so the predicate is equally strict
-            // at every rate tested during bracket's exponential range -- a fixed message count
-            // is comparatively loose at high rates and comparatively tight at low ones. Clamped
-            // at both ends: maxBacklogCeiling stops the tolerance growing unbounded as bracket's
-            // exponential doubling runs away past the real ceiling (a real incident: at a
-            // 1,000,000+ msg/s candidate, an uncapped 1.0s tolerance meant a million messages of
-            // backlog still counted as "clean," and the search reported a two-orders-of-magnitude
-            // wrong rate as confirmed). maxBacklogFloor stops the opposite: without it, a single
-            // early false failure halves the rate and, in the same stroke, halves the tolerance --
-            // the wrong direction for a recovery mechanism -- letting one bad reading cascade all
-            // the way down to a near-zero "confirmed" rate (also a real incident, reproduced
-            // deterministically twice on the same starting conditions).
-            double limit = receiveBacklogLimitFor(currentRate);
-            breachedNow = receiveBacklog > limit || publishBacklog > limit;
-        } else {
-            breachedNow = receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
-        }
+        boolean breachedNow = backlogBreached(receiveBacklog, publishBacklog);
 
         // Debounce the fast-fail. A single poll is one sample, and condemning a candidate on one sample
         // is a coin toss at the boundary -- worse, hi never reopens, so the mistake is permanent. On
@@ -348,6 +361,32 @@ class RampRateFinder {
         return phase == Phase.BRACKET
                 ? pollBracket(breached, periodNanos)
                 : pollChop(breached, periodNanos);
+    }
+
+    // Whether this poll's backlog is past the limit the active mode judges it against. Under
+    // THROUGHPUT
+    // there is no per-poll verdict at all -- it is decided once from the hold's aggregates, see
+    // holdClean.
+    private boolean backlogBreached(long receiveBacklog, long publishBacklog) {
+        if (verdict == RampVerdict.THROUGHPUT) {
+            return false;
+        }
+        if (maxBacklogSeconds != null) {
+            // A limit that scales with the candidate rate, so the predicate is equally strict at every
+            // rate tested during bracket's exponential range -- a fixed message count is comparatively
+            // loose at high rates and comparatively tight at low ones. Clamped at both ends:
+            // maxBacklogCeiling stops the tolerance growing unbounded as bracket's exponential doubling
+            // runs away past the real ceiling (a real incident: at a 1,000,000+ msg/s candidate, an
+            // uncapped 1.0s tolerance meant a million messages of backlog still counted as "clean," and
+            // the search reported a two-orders-of-magnitude wrong rate as confirmed). maxBacklogFloor
+            // stops the opposite: without it, a single early false failure halves the rate and, in the
+            // same stroke, halves the tolerance -- the wrong direction for a recovery mechanism --
+            // letting one bad reading cascade all the way down to a near-zero "confirmed" rate (also a
+            // real incident, reproduced deterministically twice on the same starting conditions).
+            double limit = receiveBacklogLimitFor(currentRate);
+            return receiveBacklog > limit || publishBacklog > limit;
+        }
+        return receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
     }
 
     private boolean pollBracket(boolean breachedNow, long periodNanos) {

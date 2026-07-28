@@ -607,3 +607,149 @@ publish shortfall across the hold and compare that against the limit — at whic
 `holdExpected - holdPublished`, i.e. the `THROUGHPUT` verdict's producer gate expressed as a count. So
 the two verdicts are closer than they look, and the honest version of `BACKLOG` may be "cumulative
 receive lag, plus THROUGHPUT's producer ratio".
+
+## Finding 13: `BACKLOG` verdict trapped the transparent arm at 9,203 msg/s — 125x below its real ceiling
+
+AKS, representative infra-preset, harness commit `aceb354` (`omb/matrices/finder-chop-verdict-3arms.yaml`),
+run 30343759563, same PR-19 HEAD as Finding 11/12 (`26653c3`: `rampBreachPolls` consecutive-breach
+requirement, `rampMaxBacklogCeiling` default 500,000, drain-by-default, re-verify-lo). 3 arms x 2 loads,
+both loads on the same topology (`rampStartRate: 5000`, `rampBracketHoldSeconds: 20`,
+`rampMaxDiscoveryMinutes: 50`, `testDurationMinutes: 10`): `chop-backlog` uses the default `BACKLOG`
+verdict (`rampMaxBacklogSeconds: 0.5`), `chop-throughput` uses `rampVerdict: THROUGHPUT` with no
+backlog fields set.
+
+Confirmed rates (`rampVerification.rate`), same job, same cluster:
+
+|     arm     |  BACKLOG  |  THROUGHPUT   |  ratio   |
+|-------------|-----------|---------------|----------|
+| direct      | 1,112,274 | 1,164,974     | 1.05x    |
+| encrypt     | 128,258   | 148,432       | 1.16x    |
+| transparent | **9,203** | **1,151,838** | **125x** |
+
+direct and encrypt are consistent within the kind of spread a different bracket/chop path explains.
+transparent is not. THROUGHPUT's transparent number sits within 1% of direct's own confirmed rate, and
+its chart (`ramp-report-chop-throughput-transparent.png`) shows the saturation signature you'd expect
+at a real ceiling: broker CPU climbing to 0.6–0.8 cores, publish-delay p99 spiking into the thousands of
+ms during backlog bursts. BACKLOG's transparent chart (`ramp-report-chop-backlog-transparent.png`)
+shows the opposite: broker CPU pinned at ~0.2–0.3 cores and gateway CPU ~0.1 cores for the entire
+15-minute remainder of discovery after the first bracket doubling past 10,000 msg/s — nowhere near a
+resource ceiling.
+
+Root cause, from the raw polls (`chop-backlog/transparent.coordinator.log`):
+
+```
+09:36:36.053 FINDER-POLL t=92  rate=20000 achieved=20001 backlog=2183
+09:36:39.138 FINDER-HOLD phase=BRACKET rate=20000.0 verdict=exceeded achievedRatio=0.957 bracket=[10000.0, null]
+09:36:39.139 FINDER-POLL t=95  rate=20000 achieved=14179 backlog=1464
+09:36:42.242 FINDER-POLL t=98  rate=10000 achieved=0    backlog=1464 delayMaxMs=0.0 latencyP99Ms=0.0
+09:36:45.345 FINDER-POLL t=101 rate=10000 achieved=0    backlog=1464 delayMaxMs=0.0 latencyP99Ms=0.0
+09:36:48.461 FINDER-HOLD phase=CHOP rate=10000.0 verdict=exceeded expected=62268 published=0 received=0 achievedRatio=0.000 bracket=[10000.0, 20000.0]
+```
+
+20,000 exceeds on a normal near-miss (`achievedRatio=0.957`), setting `hi=20000`. Per the re-verify-lo
+mechanism, the next hold re-tests `lo=10000` before chopping — and that hold reads `achieved=0` on
+every one of its 3 polls (9+ seconds; it aborted well short of a full `rampBracketHoldSeconds` window),
+with `delayMaxMs`/`latencyP99Ms` both exactly `0.0`. That's not "fell short of the target," it's "the
+stats recorder saw nothing at all." The immediately preceding poll (still labelled `rate=20000`) had
+already dropped `20001 -> 14179` — the tail of the old rate draining as the transition happened. Nothing
+else in the run — CPU, GC, broker or gateway saturation — supports a real ceiling anywhere near
+10,000–20,000 msg/s on this arm; this reads as a producer-side stall or stats-recorder gap tied to the
+downward rate transition itself, not a capacity limit.
+
+`rampBreachPolls=2` only requires *consecutive* breaching polls within a hold — trivially satisfied when
+every poll in a short hold reads zero. The bracket never recovered: chop proceeded to bisect entirely
+within `[5000, 10000]`, converging on 9,203 — about 125x below the arm's real ceiling, independently
+confirmed by the same job's `THROUGHPUT` cell for the same arm.
+
+Notably, `chop-throughput/transparent` made the identical class of downward transition later in its own
+discovery (1,280,000 → 640,000, also a bracket-exceeded → re-verify-lo step) with no stall: achieved
+dropped smoothly `1,255,211 -> 1,110,551 -> 867,044` across the transition
+(`chop-throughput/transparent.coordinator.log`, 11:11:30–11:11:37). So this isn't an inherent property
+of downward rate transitions — it looks like a rare, arm/timing-specific hiccup, made catastrophic only
+because BACKLOG's fast-fail treats "zero for a whole short hold" as a confirmed breach with no check for
+"was anything published at all this hold."
+
+Not fixed. Two independent angles worth considering upstream: (a) treat `achievedRatio == 0.000` as a
+suspect measurement — distinguish "shortfall" from "recorded nothing" — rather than a confirmed breach,
+or (b) require a stall to persist across a hold *at the new rate* rather than failing on a re-verify
+hold that reads zero for its entire (short) duration. This is the same failure class as the pre-`ce3d4ee`
+transparent-arm false-fail (2,152 msg/s, see above): those fixes closed the false-confirm shapes tested
+at the time, but "every poll in the hold reads zero" still slips through a consecutive-breach check,
+since consecutive-ness is trivially true when there's nothing but zero-polls in the hold.
+
+Charts: `ramp-report-chop-backlog-transparent.png` / `ramp-report-chop-throughput-transparent.png`
+(also `ramp-report-chop-{backlog,throughput}-{direct,encrypt}.png` for the two healthy arms, both
+consistent within 5–16% across verdicts).
+
+### Correction and root cause for Finding 13
+
+Reviewed against `aks-omb-report8`'s raw artifacts. The headline holds — 9,203 msg/s is wrong by
+roughly two orders of magnitude — but three things need correcting, one of them mine.
+
+**It is an acknowledgement stall, not a recorder gap.** The excerpt above stops one poll short of the
+evidence:
+
+```
+t=104  rate=10000  achieved=0       delayMaxMs=0.0   latencyP99Ms=0.0
+t=108  rate=5000   achieved=41278   delayMaxMs=28.3  latencyP99Ms=10681.9
+```
+
+41,278 msg/s against a 5,000 target, p99 publish latency 10.7 seconds. Nothing was lost; about nine
+seconds of acknowledgements were *deferred* and then arrived at once. That also explains why all three
+signals read exactly `0.0` together rather than one of them looking odd:
+`WorkerStats.recordProducerSuccess` increments `messagesSent` **and** records both latency histograms at
+the same moment, on ack. An ack stall therefore zeroes every counter the finder can see, while the
+messages are still in flight.
+
+This is the same blind spot as the drain's, from the other side: in-flight-but-unacked work is invisible
+to every counter `poll()` receives. There it causes a false "recovered"; here a false "breach".
+
+**The re-verify-lo mechanism turned a bounded error into an octave.** Without it, 20,000 failing would
+have left chop bisecting `[10000, 20000]`, the stall would have hit the 15,000 hold, and `lo` would have
+stayed at 10,000 — the search continues in a bracket that still contains the truth. With it, the stall
+lands on the re-verification of `lo` itself, so `hi` becomes 10,000, `lo >= hi` triggers the fallback to
+`bestKnownPassBelow` = 5,000, and the bracket drops a whole octave to `[5000, 10000]`. The log confirms
+the chain: `t=108 rate=5000` is the drain at the demoted `lo`, `t=111 rate=7500` the resumed midpoint.
+Failing a re-verification destroys the only known-good footing, which makes a transient there maximally
+expensive. That amplification is a property of the re-verification, not of the stall.
+
+**`THROUGHPUT` is not a valid yardstick for the comparison.** Its own measurement windows disagree with
+it:
+
+|           cell           | confirmed | window median | avg publish delay | max backlog |
+|--------------------------|-----------|---------------|-------------------|-------------|
+| `BACKLOG` direct         | 1,112,274 | 1,110,419     | **6.5 ms**        | 24,144      |
+| `BACKLOG` transparent    | 9,203     | 9,203         | 0.1 ms            | 1,955       |
+| `BACKLOG` encrypt        | 128,258   | 128,261       | 0.0 ms            | 36,263      |
+| `THROUGHPUT` direct      | 1,164,974 | 1,182,433     | **790.8 ms**      | 104,967     |
+| `THROUGHPUT` transparent | 1,151,838 | 1,158,995     | **805.5 ms**      | 167,931     |
+| `THROUGHPUT` encrypt     | 148,432   | 145,423       | 0.0 ms            | 59,219      |
+
+~800 ms of average publish delay is unsustainable by the same threshold used everywhere else in this
+log (the integration test's bar is 500 ms), so citing 1,151,838 as transparent's "real ceiling" repeats
+the over-report of Findings 5 and 7. Transparent's sustainable ceiling is probably ~1.05-1.10M, by
+analogy with `BACKLOG` direct's 1,112,274 at 6.5 ms — so 9,203 is about **120x** low, and the reference
+should be `BACKLOG` direct rather than `THROUGHPUT` transparent.
+
+Note also *where* `THROUGHPUT` breaks: it is exact at encrypt's 148,432 (0.0 ms) and 800 ms out at
+1.1M+. Absorption capacity is roughly fixed in messages, so it conceals proportionally more the faster
+the candidate — which is what Finding 7 predicted and this run confirms at two scales in one job.
+
+**Two estimates of mine in Finding 10 were wrong**, in opposite directions:
+
+- I put direct's real capacity at "≥634k". It is **1,112,274**. Correct as a floor, badly wrong as an
+  estimate: the false failure truncated the bracket *climb*, not merely the final answer.
+- I said the direct:encrypt penalty was "nearer 5x" than the reported 7.7x. It is **8.7x**
+  (1,112,274 / 128,258). The encrypt half of that estimate was good — I predicted 110,000-130,000 against
+  an actual 128,258 — but direct rose far more than I allowed for, so the correction went the wrong way.
+
+**What the run does validate:** `direct` went from 588,930 (Finding 8, with the 100,000 ceiling and
+single-poll fast-fail) to 1,112,274 here, at 6.5 ms publish delay and a bounded 24,144 backlog. The
+ceiling raise and the consecutive-breach requirement are worth 1.89x on that arm, and the result holds
+for its full measurement window.
+
+**Fixed since:** a poll that acknowledges nothing while expecting something is now treated as an absence
+of data rather than a breach — not judged, and the hold restarts rather than resuming a window it did not
+observe. A `FINDER-STALL` line records each one. Because `lo` is only demoted on a *measured* breach, the
+octave-loss above cannot recur from this cause. Still open: the drain's version of the same blindness,
+which needs publish delay passed into the finder.
