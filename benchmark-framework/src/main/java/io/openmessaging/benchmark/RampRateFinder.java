@@ -152,10 +152,16 @@ class RampRateFinder {
         this.maxBacklogSeconds = workload.rampMaxBacklogSeconds;
         this.maxBacklogFloor =
                 workload.rampMaxBacklogFloor != null ? workload.rampMaxBacklogFloor.longValue() : 1_000L;
+        // 500,000 rather than the original 100,000. At 100,000 the ceiling silently overrode any
+        // rampMaxBacklogSeconds above ~200,000 msg/s, turning the rate-scaled limit back into the fixed
+        // count it exists to replace: an AKS run asking for 0.5s at 589,000 msg/s got 0.17s worth, and
+        // that is what tripped its one false failure. 500,000 still catches the runaway the ceiling was
+        // added for -- a candidate 2x past capacity accrues far more than 500,000 messages of shortfall
+        // per poll at these rates -- while letting 0.5s mean 0.5s up to 1,000,000 msg/s.
         this.maxBacklogCeiling =
                 workload.rampMaxBacklogCeiling != null
                         ? workload.rampMaxBacklogCeiling.longValue()
-                        : 100_000L;
+                        : 500_000L;
         int settleSeconds =
                 workload.rampSettleSeconds != null ? workload.rampSettleSeconds.intValue() : 30;
         this.settleNanos = SECONDS.toNanos(settleSeconds);

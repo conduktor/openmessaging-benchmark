@@ -317,22 +317,54 @@ class RampRateFinderTest {
     }
 
     @Test
-    void backlogCeilingDefaultsTo100000MessagesWhenUnset() {
+    void theDefaultCeilingDoesNotOverrideAModestBacklogSecondsAtRealClusterRates() {
+        // The AKS trial set rampMaxBacklogSeconds: 0.5 and never got it. At its 589,000 msg/s answer
+        // 0.5s is 294,465 messages, but the old 100,000 default ceiling clamped that to 0.17s worth --
+        // so above ~200,000 msg/s the rate-scaled limit silently reverted to a fixed count, the very
+        // thing rate-scaling exists to replace. It also caused that run's one false failure: a single
+        // poll's 110,055-message publish shortfall tripped a limit that should have been 320,000.
+        //
+        // Here: 640,000 msg/s carrying a steady 150,000 messages of receive backlog. That is 0.23s
+        // worth, well inside the configured 0.5s, and must be clean.
         Workload workload = workload();
-        workload.rampStartRate = 1000000;
-        workload.rampMaxBacklogSeconds = 1.0; // would allow 1,000,000 messages without a ceiling
-        RampRateFinder finder = new RampRateFinder(workload); // rampMaxBacklogCeiling left unset
+        workload.rampStartRate = 640000;
+        workload.rampMaxBacklogSeconds = 0.5; // 320,000 messages at this rate
+        workload.rampBracketHoldSeconds = 2; // two 1s polls complete the hold
+        RampRateFinder finder = new RampRateFinder(workload); // ceiling left unset -> default
         long periodNanos = SECONDS.toNanos(1);
 
-        finder.poll(periodNanos, 0, 0); // settle
-        // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
-        // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
-        finder.poll(periodNanos, 5000, 5000);
-        finder.poll(periodNanos, 10000, 10000);
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 640_000, 490_000); // at target, 150,000 behind on receive
+        finder.poll(periodNanos, 1_280_000, 1_130_000); // still 150,000 behind, steady
 
-        // The default ceiling (100,000) applies since none was set, catching the runaway
-        // tolerance just like an explicit low ceiling would.
-        assertThat(finder.getHi()).isEqualTo(1000000.0);
+        assertThat(finder.getLo())
+                .as("150,000 is 0.23s at this rate, inside the configured 0.5s")
+                .isEqualTo(640000.0);
+        assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
+    void theDefaultCeilingStillCatchesARunawayToleranceAtVeryHighRates() {
+        // The ceiling's original purpose, which raising it must not give up. The incident it was added
+        // for: a 1,000,000+ msg/s candidate with rampMaxBacklogSeconds 1.0, where an uncapped limit let
+        // a million messages of backlog count as clean and the search reported a
+        // two-orders-of-magnitude-wrong rate as confirmed. 700,000 messages is inside that uncapped
+        // 1.0s limit but past the ceiling, so the ceiling is what has to reject it. (This one passes
+        // before and after the raise -- it is the guard on the raise, not a demonstration of it.)
+        Workload workload = workload();
+        workload.rampStartRate = 1000000;
+        workload.rampMaxBacklogSeconds = 1.0; // 1,000,000 messages uncapped
+        RampRateFinder finder = new RampRateFinder(workload); // ceiling left unset -> default
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 1_000_000, 300_000); // 700,000 behind
+        finder.poll(periodNanos, 2_000_000, 1_300_000); // still 700,000 behind -- two consecutive
+
+        assertThat(finder.getHi())
+                .as("700,000 must still be rejected, or the runaway incident returns")
+                .isEqualTo(1000000.0);
+        assertThat(finder.getLo()).isNull();
     }
 
     @Test

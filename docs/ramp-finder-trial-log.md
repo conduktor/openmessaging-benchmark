@@ -416,12 +416,12 @@ of every bracket step, chop step, and failure, rather than reasoning from the pl
 overload (80,000 -> 160,000, the step that found its knee) went from a healthy baseline straight
 to failure in a single poll:
 
-| t (s) | target | achieved | backlog |
-|-------|--------|----------|---------|
-| 491   | 80,000 | 80,102   | 1,299 (healthy) |
-| 494   | 160,000 | 131,332 | **74,835** |
-| 510   | 87,151  | 97,993  | **232,102 (peak)** |
-| 522   | 80,447  | 97,197  | 1,598 (recovered) |
+| t (s) | target  | achieved |      backlog       |
+|-------|---------|----------|--------------------|
+| 491   | 80,000  | 80,102   | 1,299 (healthy)    |
+| 494   | 160,000 | 131,332  | **74,835**         |
+| 510   | 87,151  | 97,993   | **232,102 (peak)** |
+| 522   | 80,447  | 97,197   | 1,598 (recovered)  |
 
 One 3-second poll is enough to go from a stable ~1,300 messages to ~74,800 (~57x) the moment a
 candidate genuinely exceeds capacity — not a gradual creep, a step function. It keeps growing for
@@ -434,13 +434,13 @@ finding below, and "Known limitation" in `RATE_FINDING.md`).
 
 **Where the time went, `direct` (1,606s / 26.8min total discovery):**
 
-| Phase | Candidates | Cost |
-|-------|-----------|------|
-| Settle + 1st bracket hold (5,000) | 1 | 120s |
-| Bracket doublings (10k -> 320k, all clean) | 6 | 6 x 89s = 534s |
-| Bracket failure (640,000) | 1 | 22s (fail-fast, no full hold needed) |
-| Chop bisection (480k, 560k, 600k, 620k, all clean) | 4 | 4 x 178s = 712s |
-| Confirm (589,000 = 620,000 x 0.95) | 1 | 178s |
+|                       Phase                        | Candidates |                 Cost                 |
+|----------------------------------------------------|------------|--------------------------------------|
+| Settle + 1st bracket hold (5,000)                  | 1          | 120s                                 |
+| Bracket doublings (10k -> 320k, all clean)         | 6          | 6 x 89s = 534s                       |
+| Bracket failure (640,000)                          | 1          | 22s (fail-fast, no full hold needed) |
+| Chop bisection (480k, 560k, 600k, 620k, all clean) | 4          | 4 x 178s = 712s                      |
+| Confirm (589,000 = 620,000 x 0.95)                 | 1          | 178s                                 |
 
 Every bracket/chop hold that passed ran for its *entire* configured length (89s / 178s) — clean
 holds are not shortened early. The 640,000 failure is the only step that returned in less than a

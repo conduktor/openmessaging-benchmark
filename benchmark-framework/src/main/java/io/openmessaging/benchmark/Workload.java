@@ -109,7 +109,14 @@ public class Workload {
      * can't grow unbounded as bracket's exponential doubling searches far past the real ceiling --
      * without it, a high enough candidate rate can make the relative check tolerate an enormous
      * backlog and report a wildly implausible "confirmed" rate. Only meaningful when
-     * rampMaxBacklogSeconds is set. Defaults to 100000.
+     * rampMaxBacklogSeconds is set. Defaults to 500000.
+     *
+     * <p>Watch the interaction with rampMaxBacklogSeconds: the limit is {@code max(floor, min(rate x
+     * seconds, ceiling))}, so once {@code rate x seconds} exceeds the ceiling the ceiling wins and
+     * the limit stops scaling with rate. At the 100000 this used to default to, that happened above
+     * roughly 200000 msg/s -- an AKS run asking for 0.5s at 589000 msg/s silently got 0.17s worth,
+     * which is what tripped its one false failure. If you run above 1000000 msg/s, raise this too or
+     * the rate-scaled limit quietly becomes a fixed count again.
      */
     public Long rampMaxBacklogCeiling;
 
