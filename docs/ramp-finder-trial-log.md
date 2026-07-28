@@ -493,3 +493,117 @@ section already names for the bracket phase specifically; this run shows it happ
 Items 1 and 2 together are argued directly from data that stayed flat for its full duration or
 carried zero new information — no confidence given up to get them. Items 3-5 trade a specific,
 named risk for time; 3 is closing a gap this run's data exposes rather than opening one.
+
+## Finding 10: both AKS arms under-report, for two different reasons
+
+Working note, from the same `finder-chop-3arms` run as Findings 8 and 9, re-examined poll-by-poll
+rather than from the confirmed rates. Both arms confirmed with `nonMonotonic: false` and both held
+flat for their full 40-minute windows, so both are *safe*. Neither is the ceiling.
+
+**`direct`: a single poll capped it.** `hi` was set at 640,000 twenty-four seconds into a 90-second
+bracket hold:
+
+| t (s) | achieved | receive backlog |  publish shortfall / poll   |
+|-------|----------|-----------------|-----------------------------|
+| 678   | 632,703  | 5,113           | 21,891                      |
+| 681   | 640,034  | 3,430           | -102                        |
+| 685   | 639,586  | 6,049           | 1,242                       |
+| 688   | 629,694  | 5,123           | 30,918                      |
+| 691   | 650,592  | 6,249           | -31,776                     |
+| 694   | 637,371  | 5,100           | 7,887                       |
+| 697   | 642,043  | 6,573           | -6,129                      |
+| 700   | 603,315  | 0               | **110,055** (limit 100,000) |
+
+Seven healthy polls, then one 3-second sample dipped 5.7% and exceeded the limit by 10%. The hold's
+own aggregate was `published/expected = 15,618,179 / 15,755,821 = 99.13%`. Nothing ever reopens `hi`,
+so **588,930 is a floor, not the answer** — the arm demonstrably sustained ~634,000 for 24 seconds.
+Broker CPU never passed 0.45 of 8 cores, which corroborates it.
+
+**`encrypt`: eight candidates were rejected without being measured.** Finding 9 records the cascade
+and correctly diagnoses it as the previous candidate's undrained overshoot. Adding the magnitude: at
+160,000 the gateway *achieved* 131,332 msg/s, and gateway CPU peaked at 1.8 of its 2 allocated cores.
+That looks like the 2-core encryption ceiling, which puts real capacity near 110,000-130,000 against a
+confirmed 76,425 — the confirmed figure uses only 1.2 of 2 cores. **So the direct:encrypt penalty
+reported as 7.7x is probably nearer 5x**, and that ratio is the number to be most careful quoting.
+
+**A configuration trap sat underneath both.** The matrix set `rampMaxBacklogSeconds: 0.5` and, on the
+`direct` arm, never got it:
+
+```
+direct  @589k:  0.5s = 294,465 msgs  ->  clamped to ceiling 100,000  (0.17s effective)
+encrypt @76k:   0.5s =  38,212 msgs  ->  rate-scaled applies
+```
+
+Because the limit is `max(floor, min(rate x seconds, ceiling))`, the old 100,000 ceiling default won
+above roughly 200,000 msg/s and the rate-scaled limit silently became a fixed count again — the exact
+thing rate-scaling replaces. It is also the direct cause of the false failure above: 110,055 tripped a
+limit that should have been 320,000. Neither this run's own findings nor the first pass of this review
+spotted it.
+
+**Fixed since:** `rampBreachPolls` (default 2) so one sample cannot condemn a candidate;
+`rampMaxBacklogCeiling` default raised 100,000 -> 500,000 so 0.5s means 0.5s up to 1,000,000 msg/s.
+Still open: `rampDrainSeconds` remains off in every matrix run so far, which is what the `encrypt`
+cascade needs.
+
+## Finding 11: making discovery quicker without giving up rigor
+
+Finding 9's recommendation 4 was to shorten `rampBracketHoldSeconds`, on the evidence that clean
+bracket holds were representative within 1-2 polls and showed no trend over the remaining ~85s. That
+reasoning is sound about the *data* and unsafe as stated: a short hold is exactly what cannot see
+slow-building absorption, `lo` only ever moves upward, and the same run's `direct` plot shows broker
+memory climbing to a hard 8 GiB and pinning there — the absorption reservoir filling, visible as a
+flat line. Hold length is also the dominant error term measured anywhere in this log (Finding 7:
++126% at 15s, +37% at 45s, +19% at 90s against a known ceiling).
+
+**What makes it safe: re-verify `lo` at full length before chopping.** The probe locates the bracket;
+the full hold certifies it. One extra hold, and the objection goes away — an over-confirmed probe now
+fails its re-verification, `hi` becomes that `lo`, and the search drops back to the highest recorded
+pass below it. Measured on this run's geometry against a hard 589,000 msg/s ceiling:
+
+| `rampBracketHoldSeconds` | discovery | vs 90s | confirmed rate |
+|--------------------------|-----------|--------|----------------|
+| 90 (this run's value)    | 1,494s    | —      | identical      |
+| 45                       | 1,134s    | −24%   | identical      |
+| 20                       | 942s      | −37%   | identical      |
+| 9                        | 846s      | −43%   | identical      |
+
+All four converge on the same rate, so the saving comes out of probing rather than out of rigor.
+
+**Ranked for a quicker next run**, with what each costs:
+
+1. **`rampBracketHoldSeconds: 20`** — −37% discovery, no measured accuracy cost now that `lo` is
+   re-verified. The safest large cut available.
+2. **Per-arm `rampStartRate`** (Finding 9's recommendation 2) — free. Every doubling below ~1/8 of the
+   answer carried no information. Needs per-arm loads, which is harness-side.
+3. **Cut `testDurationMinutes` from 40** — the biggest single block of wall-clock, but keep it at
+   *several times* `rampHoldSeconds` rather than at minimum. That window is the independent check that
+   a confirmed rate is sustainable; it is what catches "passed a hold, then 2.6s of publish delay"
+   (Finding 5). Its flatness is the result being relied on, not a reason to stop measuring. ~10 minutes
+   against a 180s hold keeps the check meaningful.
+4. **`rampConvergenceTolerance: 0.10`** — drops roughly one chop hold, widens the reported band. A real
+   trade, not a free one.
+
+Not recommended: shortening `rampHoldSeconds` itself. That is the one lever measured to move the
+answer rather than the clock.
+
+## Finding 12: `rampMaxBacklogSeconds` means two different things, and one of them is loose
+
+Working note, surfaced while measuring Finding 11 rather than from a trial. The same limit is compared
+against two quantities of different dimension:
+
+- `receiveBacklog` is **cumulative** — `subscriptions x totalPublished - totalReceived`. Against a
+  limit of `rate x seconds`, that reads as "consumers are at most this many seconds behind". Tight and
+  meaningful.
+- `publishBacklog` is **per-period** — `expected - published` for this poll alone. Against the *same*
+  limit, at a 3-second poll period, `rate x 0.5` tolerates a 17% publish shortfall **every period,
+  indefinitely**, because nothing accumulates across polls.
+
+So `rampMaxBacklogSeconds: 0.5` asks for half a second of consumer lag and simultaneously permits a
+permanent one-sixth producer shortfall. Raising the ceiling default (Finding 10) makes the publish side
+looser still, and the old 100,000 clamp had been accidentally masking it at high rates.
+
+Not fixed, and worth a decision rather than a quick patch. The obvious repair is to accumulate the
+publish shortfall across the hold and compare that against the limit — at which point it becomes
+`holdExpected - holdPublished`, i.e. the `THROUGHPUT` verdict's producer gate expressed as a count. So
+the two verdicts are closer than they look, and the honest version of `BACKLOG` may be "cumulative
+receive lag, plus THROUGHPUT's producer ratio".
