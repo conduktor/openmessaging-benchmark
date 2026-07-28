@@ -942,8 +942,8 @@ class RampRateFinderTest {
         assertThat(finder.getHi()).isEqualTo(2000.0);
         assertThat(finder.isDraining()).as("a failure must trigger recovery").isTrue();
         assertThat(finder.getCurrentRate())
-                .as("drain runs at the known-good lo, not at the next candidate")
-                .isEqualTo(1000.0);
+                .as("drain runs below the known-good lo, so there is headroom to clear the queue")
+                .isEqualTo(500.0);
 
         // While draining, nothing is judged: the backlog still present is the overshoot's, not the
         // next candidate's, so no verdict may be recorded from it.
@@ -1021,6 +1021,34 @@ class RampRateFinderTest {
 
         assertThat(finder.isDraining()).isFalse();
         assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
+    }
+
+    @Test
+    void recoveryRunsWithHeadroomBecauseDrainingAtLoNeverCatchesUp() {
+        // Recovery used to run at lo itself, on the reasoning that lo is a rate known to be
+        // sustainable. That is true and insufficient: lo means "keeps up", not "has spare capacity".
+        // Clearing a queue needs arrival below service, and at lo there is almost none, so the queue
+        // drains at (capacity - lo) -- nearly zero. On AKS two of four recoveries ran their full 180s
+        // cap and gave up with the producer still 10 and 24 seconds behind its schedule, at a drain
+        // rate of ~1.16M against a ceiling of ~1.17M. Half of lo leaves real headroom, and since
+        // recovery is capped and nothing is evaluated during it, running slower costs nothing.
+        Workload workload = workload();
+        workload.rampStartRate = 100000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 1;
+        workload.rampDrainSeconds = 600;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 100_000, 100_000); // 100k holds clean -> lo = 100,000
+        assertThat(finder.getLo()).isEqualTo(100000.0);
+        finder.poll(periodNanos, 300_000, 299_000); // 200k leaves 1,000 backlog vs the 100 limit
+
+        assertThat(finder.isDraining()).isTrue();
+        assertThat(finder.getCurrentRate())
+                .as("half of lo: enough headroom that a queue actually shrinks")
+                .isEqualTo(50000.0);
     }
 
     @Test

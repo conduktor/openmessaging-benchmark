@@ -753,3 +753,67 @@ of data rather than a breach — not judged, and the hold restarts rather than r
 observe. A `FINDER-STALL` line records each one. Because `lo` is only demoted on a *measured* breach, the
 octave-loss above cannot recur from this cause. Still open: the drain's version of the same blindness,
 which needs publish delay passed into the finder.
+
+## Finding 14: Finding 13 confirmed fixed — re-run against `e1481de`
+
+Same matrix, same settings, same arms as Finding 13 (`finder-chop-verdict-3arms.yaml`, AKS
+representative, run 30366818869), against PR-19 HEAD `e1481de` — i.e. `fde5838`/`e0b1d5f`/`965b3ca`
+all in. transparent's `BACKLOG` result:
+
+| | Finding 13 run | this run |
+|---|---|---|
+| transparent BACKLOG | 9,203 | **1,177,872** |
+| transparent THROUGHPUT | 1,151,838 | 1,421,882 |
+| direct BACKLOG | 1,112,274 | 1,111,681 |
+| direct THROUGHPUT | 1,164,974 | 1,099,507 |
+| encrypt BACKLOG | 128,258 | 119,670 |
+| encrypt THROUGHPUT | 148,432 | 128,969 |
+
+transparent BACKLOG went from 125x under the arm's real ceiling to matching it. Its chart
+(`ramp-report-chop-backlog-transparent.png` from this run) now shows what direct's and encrypt's
+always have: a full bracket doubling, real saturation at confirm (gateway CPU 0.8–0.95 cores — this
+arm's actual bottleneck), no collapse. direct and encrypt hold within normal run-to-run spread
+(1–13%), as they did across the two BACKLOG-verdict runs already logged.
+
+One new thing surfaced by the comparison rather than by either run alone: this run's transparent
+THROUGHPUT result (1,421,882) exceeds this run's own direct THROUGHPUT result (1,099,507) by ~29% —
+the gateway passthrough out-throughput-ing bypassing it. Checked the raw hold trace before writing
+this down: it's not a repeat of Finding 13's shape. Bracket climbed to 2,560,000 before exceeding
+(higher than direct's own bracket ceiling of 1,280,000 in the same run), 8 holds of chopping,
+`nonMonotonic=false`, and the chart shows real saturation (broker CPU 0.6–0.8 cores, same shape as
+direct's). Legitimate result, not a glitch — just unexplained. Not investigated further; flagging in
+case it recurs or someone has a mechanism (connection multiplexing through the gateway vs. many
+direct client connections is the only candidate that's occurred to me, unconfirmed).
+
+## Finding 15: encrypt's ceiling is the gateway's CPU limit, not the broker — and broker MEM is a dead signal
+
+Resource attribution from the Finding 14 re-run (30366818869), peak CPU/MEM per pod over each cell's
+discovery window:
+
+| verdict | arm | confirmed | broker CPU (max) | broker MEM (max) | gateway CPU (max) | gateway MEM (max) |
+|---|---|---:|---:|---:|---:|---:|
+| BACKLOG | direct | 1,111,681 | 0.71 | 7.91 GiB | — | — |
+| BACKLOG | transparent | 1,177,872 | 0.75 | 7.91 GiB | 0.95 | 0.55 GiB |
+| BACKLOG | encrypt | 119,670 | 0.43 | 7.91 GiB | **2.00** | 1.01 GiB |
+| THROUGHPUT | direct | 1,099,507 | 0.76 | 7.91 GiB | — | — |
+| THROUGHPUT | transparent | 1,421,882 | 0.83 | 7.91 GiB | 0.61 | 1.04 GiB |
+| THROUGHPUT | encrypt | 128,969 | 0.48 | 7.91 GiB | **2.00** | 1.12 GiB |
+
+Two things fall out of this that weren't visible from the confirmed rate alone:
+
+- **Encrypt's ceiling is the gateway's CPU request/limit, not the broker.** Gateway CPU sits at
+  exactly 2.00 in both verdicts — the harness's `gateway-cpu` default, unchanged in this dispatch —
+  while broker CPU is 0.43–0.48, nowhere near saturated. Encrypt's throughput (~120–130k, an order of
+  magnitude below direct/transparent) isn't a Kafka-side or gateway-architecture limit; it's the
+  encrypt interceptor's per-message CPU cost hitting a container CPU cap that was never raised for
+  this test. The number this run reports for encrypt is a statement about `gateway-cpu: 2`, not about
+  the algorithm or the interceptor's ceiling in the abstract — raising the limit is very likely to
+  raise the confirmed rate, untested here.
+- **transparent's gateway CPU has real headroom** (0.61–0.95 of the same 2-core cap) — it isn't
+  CPU-bound at the gateway in either verdict, which is at least consistent with (though doesn't fully
+  explain) transparent tracking or exceeding direct's throughput, per Finding 14.
+
+Separately, **broker MEM is the same 7.91 GiB in all six cells** — that's the JVM heap sitting at its
+allocated ceiling, not a per-workload footprint measurement. It doesn't move with rate, arm, or
+verdict, so it isn't a comparison signal worth reading into for these runs; noting it so it isn't
+mistaken for one later.

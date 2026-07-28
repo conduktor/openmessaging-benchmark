@@ -44,6 +44,17 @@ class RampRateFinder {
     // reopened search bounded even in that edge case).
     private static final double CONFIRMATION_BACKOFF_FACTOR = 0.9;
 
+    // Recovery runs at this fraction of lo. lo means "keeps up", not "has spare capacity", so
+    // draining
+    // at lo itself leaves the queue shrinking at (capacity - lo) -- nearly nothing. Two AKS
+    // recoveries
+    // ran their full 180s cap and gave up with the producer still 10 and 24 seconds behind, draining
+    // at
+    // ~1.16M against a ~1.17M ceiling. Half leaves real headroom, and since nothing is evaluated
+    // during
+    // recovery and it ends as soon as both sides are caught up, running slower costs nothing.
+    private static final double DRAIN_HEADROOM_FACTOR = 0.5;
+
     enum Phase {
         BRACKET,
         CHOP,
@@ -627,7 +638,7 @@ class RampRateFinder {
             return setRate(next);
         }
         pendingRate = next;
-        currentRate = lo;
+        currentRate = lo * DRAIN_HEADROOM_FACTOR;
         draining = true;
         elapsedDrainNanos = 0;
         return false;
