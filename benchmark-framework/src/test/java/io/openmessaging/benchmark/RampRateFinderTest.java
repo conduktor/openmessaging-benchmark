@@ -267,16 +267,18 @@ class RampRateFinderTest {
     void relativeBacklogLimitScalesWithCandidateRateUnlikeTheFixedAbsoluteLimit() {
         long periodNanos = SECONDS.toNanos(1);
 
-        // A 500-message backlog at 100,000 msg/s: negligible in relative terms (5ms worth) but
-        // far above the small fixed absolute default (100 messages) that workload() sets.
+        // A 500-message *receive* backlog at 100,000 msg/s: negligible in relative terms (5ms worth)
+        // but far above the small fixed absolute default (100 messages) that workload() sets. The
+        // fixture drives receive backlog rather than publish shortfall because the producer side is now
+        // judged as a fraction of target, which no rate-scaled or fixed message count applies to.
         Workload absolute = workload();
         absolute.rampStartRate = 100000;
         RampRateFinder absoluteFinder = new RampRateFinder(absolute);
         absoluteFinder.poll(periodNanos, 0, 0); // settle
         // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
         // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
-        absoluteFinder.poll(periodNanos, 99500, 99500);
-        absoluteFinder.poll(periodNanos, 199000, 199000);
+        absoluteFinder.poll(periodNanos, 100_000, 99_500);
+        absoluteFinder.poll(periodNanos, 200_000, 199_500);
         assertThat(absoluteFinder.getHi()).isEqualTo(100000.0); // absolute limit (100) blown
         assertThat(absoluteFinder.getLo()).isNull();
 
@@ -286,31 +288,37 @@ class RampRateFinderTest {
         relative.rampBracketHoldSeconds = 1; // one poll completes the hold for a clean verdict
         RampRateFinder relativeFinder = new RampRateFinder(relative);
         relativeFinder.poll(periodNanos, 0, 0); // settle
-        relativeFinder.poll(periodNanos, 99500, 99500);
+        relativeFinder.poll(periodNanos, 100_000, 99_500);
         // Same backlog, but well under the rate-scaled limit -> treated as clean instead.
         assertThat(relativeFinder.getLo()).isEqualTo(100000.0);
         assertThat(relativeFinder.getHi()).isNull();
     }
 
     @Test
-    void uncappedRelativeLimitCanRunAwayAtHighCandidateRates() {
-        // The incident this guards against: at 1,000,000 msg/s with rampMaxBacklogSeconds=1.0,
-        // the relative limit alone would tolerate a full 1,000,000-message backlog -- so a
-        // candidate that only actually published 5,000 of an expected 1,000,000 messages (a
-        // massive shortfall) still gets called "clean" without a ceiling low enough to catch it.
+    void aRunawayToleranceCannotHideAGrossShortfallNowThePublishSideIsARatio() {
+        // This used to document a pathology: at 1,000,000 msg/s with rampMaxBacklogSeconds 1.0, the
+        // relative limit alone tolerated a full 1,000,000-message shortfall, so a candidate that
+        // published 5,000 of an expected 1,000,000 was called "clean" and the search reported a
+        // two-orders-of-magnitude-wrong rate as confirmed. The ceiling was added to bound that.
+        //
+        // Judging the producer side as a fraction rather than a count removes the pathology at its
+        // source: 5,000 of 1,000,000 is 0.005 against a 0.95 gate, and no tolerance expressed in
+        // messages enters into it. The ceiling still matters for the *consumer* side, which is a level.
         Workload workload = workload();
         workload.rampStartRate = 1000000;
         workload.rampMaxBacklogSeconds = 1.0;
-        workload.rampMaxBacklogCeiling = 2_000_000L; // high enough not to clamp anything here
-        workload.rampBracketHoldSeconds = 1; // one poll completes the hold for a clean verdict
+        workload.rampMaxBacklogCeiling = 2_000_000L; // deliberately too high to catch anything
+        workload.rampBracketHoldSeconds = 1;
         RampRateFinder finder = new RampRateFinder(workload);
         long periodNanos = SECONDS.toNanos(1);
 
         finder.poll(periodNanos, 0, 0); // settle
         finder.poll(periodNanos, 5000, 5000);
 
-        assertThat(finder.getLo()).isEqualTo(1000000.0); // wrongly "clean"
-        assertThat(finder.getHi()).isNull();
+        assertThat(finder.getHi())
+                .as("0.005 of target is caught by the ratio, with no help from the ceiling")
+                .isEqualTo(1000000.0);
+        assertThat(finder.getLo()).isNull();
     }
 
     @Test
@@ -399,10 +407,10 @@ class RampRateFinderTest {
         long periodNanos = SECONDS.toNanos(1);
 
         finder.poll(periodNanos, 0, 0); // settle
-        // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
-        // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
-        finder.poll(periodNanos, 50, 50); // only 50 of the expected 100 published
-        finder.poll(periodNanos, 100, 100);
+        // Publishing on target, but 50 messages behind on the receive side. Two consecutive breaching
+        // polls, since rampBreachPolls defaults to 2.
+        finder.poll(periodNanos, 100, 50);
+        finder.poll(periodNanos, 200, 150);
 
         assertThat(finder.getHi()).isEqualTo(100.0); // wrongly treated as a capacity failure
         assertThat(finder.getLo()).isNull();
@@ -419,9 +427,9 @@ class RampRateFinderTest {
         long periodNanos = SECONDS.toNanos(1);
 
         finder.poll(periodNanos, 0, 0); // settle
-        finder.poll(periodNanos, 50, 50); // same shortfall as above
+        finder.poll(periodNanos, 100, 50); // same 50-message receive backlog as above
 
-        // The floor applies, so the same modest shortfall is correctly tolerated as clean.
+        // The floor applies, so the same modest lag is correctly tolerated as clean.
         assertThat(finder.getLo()).isEqualTo(100.0);
         assertThat(finder.getHi()).isNull();
     }
@@ -1417,6 +1425,32 @@ class RampRateFinderTest {
 
         assertThat(finder.getLo()).as("three clean seconds after the stall").isEqualTo(10000.0);
         assertThat(finder.getHi()).isNull();
+    }
+
+    @Test
+    void aSustainedPublishShortfallBreachesEvenWhileEachPollLooksTolerable() {
+        // rampMaxBacklogSeconds used to be compared against two quantities of different dimension:
+        // receiveBacklog is cumulative, so "rate x seconds" reads as "consumers are this many seconds
+        // behind", but publishBacklog was this poll's shortfall alone. Against the same limit at a 1s
+        // poll, 0.5 permitted a 50% shortfall *every poll, indefinitely*, because nothing accumulated.
+        //
+        // Here the producer manages 6,000 of an expected 10,000 forever. Per-poll that is a 4,000
+        // shortfall against a 5,000 limit -- tolerable, every single time. As a fraction of what was
+        // asked for it is 0.6, and no amount of patience makes that sustainable.
+        Workload workload = workload();
+        workload.rampStartRate = 10000;
+        workload.rampMaxBacklogSeconds = 0.5; // 5,000 messages at this rate
+        workload.rampBracketHoldSeconds = 60; // long, so only a breach can end this early
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 6_000, 6_000);
+        finder.poll(periodNanos, 12_000, 12_000);
+
+        assertThat(finder.getHi())
+                .as("60% of target is not sustainable however tolerable each poll looks")
+                .isEqualTo(10000.0);
     }
 
     @Test

@@ -142,13 +142,26 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 Each hold (bracket or chop) needs a clean/not-clean verdict before CHOP can act on it. Which
 predicate decides that is controlled by `rampVerdict`, with two modes:
 
-- **`BACKLOG`** (default) — the predicate described above: a hold is clean if `receiveBacklog`/
-  `publishBacklog` never exceeds the configured limit (`rampMaxBacklogSeconds`/`Floor`/`Ceiling`,
-  or the fixed `rampPublishBacklogLimit`/`rampReceiveBacklogLimit` when the relative one is unset).
+- **`BACKLOG`** (default) — a hold is clean if neither side falls behind, with the two sides judged
+  differently because they are different kinds of quantity:
+
+  1. **Consumers** — `receiveBacklog` (cumulative) must stay within the configured limit
+     (`rampMaxBacklogSeconds` scaled by rate and clamped by `Floor`/`Ceiling`, or the fixed
+     `rampReceiveBacklogLimit` when the relative one is unset). Being a level, `rate x seconds` reads
+     as "the consumers are at most this many seconds behind", which is what the setting means.
+  2. **Producer** — `holdPublished >= rampMinThroughputRatio x holdExpected` over the hold so far. A
+     shortfall is a *flow*, so comparing one poll's shortfall against a message count said something
+     quite different: at a 1-second poll, `rampMaxBacklogSeconds: 0.5` permitted a 50% shortfall every
+     poll indefinitely, because nothing accumulated between polls. As a fraction it needs no per-rate
+     tuning, fast-fails a gross shortfall on the first poll, and ignores a small one.
+
+  `rampPublishBacklogLimit` is therefore unused by CHOP; it remains only for AIMD.
   Structural weakness: a healthy pipeline's in-flight backlog scales with throughput, so any
   fixed-ish count is too strict at high rates and too loose at low ones — see the two "Trial
   finding" sections below, both of which are this predicate misfiring in opposite directions.
+
 - **`THROUGHPUT`** (opt-in) — a scale-free alternative. Per hold, all three of:
+
   1. `published ≥ ratio · expected` — the producer kept up with the target rate.
   2. `received ≥ ratio · subscriptionsPerTopic · published` — the consumers drained what was
      published. Note this is a check on *divergence*, not on depth: if the receive backlog grew by

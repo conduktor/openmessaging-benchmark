@@ -259,7 +259,6 @@ class RampRateFinder {
         long expected = (long) ((currentRate / ONE_SECOND_IN_NANOS) * periodNanos);
         long published = totalPublished - previousTotalPublished;
         long receiveBacklog = subscriptions * totalPublished - totalReceived;
-        long publishBacklog = expected - published;
         previousTotalPublished = totalPublished;
 
         long received = totalReceived - previousTotalReceived;
@@ -334,7 +333,7 @@ class RampRateFinder {
             secondHalfNanos += periodNanos;
         }
 
-        boolean breachedNow = backlogBreached(receiveBacklog, publishBacklog);
+        boolean breachedNow = backlogBreached(receiveBacklog);
 
         // Debounce the fast-fail. A single poll is one sample, and condemning a candidate on one sample
         // is a coin toss at the boundary -- worse, hi never reopens, so the mistake is permanent. On
@@ -354,30 +353,35 @@ class RampRateFinder {
                 : pollChop(breached, periodNanos);
     }
 
-    // Whether this poll's backlog is past the limit the active mode judges it against. Under
-    // THROUGHPUT
-    // there is no per-poll verdict at all -- it is decided once from the hold's aggregates, see
-    // holdClean.
-    private boolean backlogBreached(long receiveBacklog, long publishBacklog) {
+    // Whether this poll's evidence condemns the candidate. Under THROUGHPUT there is no per-poll
+    // verdict at all -- it is decided once from the hold's aggregates, see holdClean.
+    //
+    // The two sides are checked differently, and deliberately so. Receive backlog is a *level*: it is
+    // cumulative, so comparing it against rate x rampMaxBacklogSeconds reads as "the consumers are at
+    // most this many seconds behind", which is what that setting is meant to say. Publish shortfall
+    // is
+    // a *flow*, and comparing this poll's shortfall against the same limit said something quite
+    // different -- at a 1s poll, 0.5 permitted a 50% shortfall every poll indefinitely, because
+    // nothing
+    // accumulated between polls. So the producer side is judged as a fraction of what was asked for,
+    // over the hold so far, against rampMinThroughputRatio. That is dimensionless, needs no per-rate
+    // tuning, and fast-fails a gross shortfall on the first poll while ignoring a small one.
+    private boolean backlogBreached(long receiveBacklog) {
         if (verdict == RampVerdict.THROUGHPUT) {
             return false;
         }
-        if (maxBacklogSeconds != null) {
-            // A limit that scales with the candidate rate, so the predicate is equally strict at every
-            // rate tested during bracket's exponential range -- a fixed message count is comparatively
-            // loose at high rates and comparatively tight at low ones. Clamped at both ends:
-            // maxBacklogCeiling stops the tolerance growing unbounded as bracket's exponential doubling
-            // runs away past the real ceiling (a real incident: at a 1,000,000+ msg/s candidate, an
-            // uncapped 1.0s tolerance meant a million messages of backlog still counted as "clean," and
-            // the search reported a two-orders-of-magnitude wrong rate as confirmed). maxBacklogFloor
-            // stops the opposite: without it, a single early false failure halves the rate and, in the
-            // same stroke, halves the tolerance -- the wrong direction for a recovery mechanism --
-            // letting one bad reading cascade all the way down to a near-zero "confirmed" rate (also a
-            // real incident, reproduced deterministically twice on the same starting conditions).
-            double limit = receiveBacklogLimitFor(currentRate);
-            return receiveBacklog > limit || publishBacklog > limit;
+        if (holdPublished < minThroughputRatio * holdExpected) {
+            return true;
         }
-        return receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
+        if (maxBacklogSeconds != null) {
+            // Clamped at both ends. maxBacklogCeiling stops the tolerance growing unbounded as bracket's
+            // exponential doubling runs past the real ceiling; maxBacklogFloor stops the opposite, where
+            // a single early false failure halves the rate and, in the same stroke, halves the tolerance
+            // -- the wrong direction for a recovery mechanism -- letting one bad reading cascade all the
+            // way down to a near-zero "confirmed" rate. Both were real, reproduced incidents.
+            return receiveBacklog > receiveBacklogLimitFor(currentRate);
+        }
+        return receiveBacklog > receiveBacklogLimit;
     }
 
     private boolean pollBracket(boolean breachedNow, long periodNanos) {
