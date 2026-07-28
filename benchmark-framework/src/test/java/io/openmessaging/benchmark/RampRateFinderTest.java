@@ -30,6 +30,13 @@ class RampRateFinderTest {
         workload.rampPublishBacklogLimit = 100L;
         workload.rampReceiveBacklogLimit = 100L;
         workload.rampSettleSeconds = 0; // most tests don't care about settling; a few override it
+        // Pinned off so a failure's trajectory is the search's own. rampDrainSeconds now defaults ON
+        // (to the resolved rampHoldSeconds), which inserts a recovery period after every failed
+        // candidate -- correct for real runs, but it makes every hand-fed poll sequence below about the
+        // drain as well as its own subject. The drain has dedicated tests, and
+        // theDefaultDiscoveryBudgetCoversASearchAtTheDefaultHold drives a whole search on the shipped
+        // defaults, so the on-path is covered where it matters.
+        workload.rampDrainSeconds = 0;
         return workload;
     }
 
@@ -608,6 +615,7 @@ class RampRateFinderTest {
         workload.rampBracketHoldSeconds = 1; // one 1s poll completes a hold
         workload.rampHoldSeconds = 1;
         workload.rampConvergenceTolerance = 0.05;
+        workload.rampDrainSeconds = 0; // see workload() -- pinned off so trajectories stay readable
         return workload;
     }
 
@@ -934,6 +942,38 @@ class RampRateFinderTest {
         finder.poll(periodNanos, 4000, 3000);
         assertThat(finder.isDraining()).isTrue();
         assertThat(finder.getHi()).isEqualTo(2000.0); // unchanged -- no new verdict
+    }
+
+    @Test
+    void thereIsNoDrainWhileBracketIsStillHalvingDownwardWithNoKnownGoodRate() {
+        // The drain's whole premise is that it runs at a rate already known to be sustainable, so
+        // queues
+        // actually shrink -- draining at the *next* candidate guarantees nothing, because that
+        // candidate
+        // may itself be above capacity. On bracket's downward path there is no such rate yet: lo is
+        // null. Draining there is worse than not draining, because the recovery test never passes, the
+        // full cap is burned, and the halved candidate then starts its hold with a *larger* backlog
+        // than
+        // if the search had simply moved on. So skip it and halve immediately.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 1;
+        workload.rampDrainSeconds = 5;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        // The start rate itself is already overloaded: 900 messages of receive backlog against the
+        // 100 limit, and the hold ends while still breaching, so it fails with no lo ever established.
+        finder.poll(periodNanos, 1000, 100);
+
+        assertThat(finder.getHi()).isEqualTo(1000.0);
+        assertThat(finder.getLo()).isNull();
+        assertThat(finder.isDraining())
+                .as("no known-good rate to drain at, so there is nothing to drain toward")
+                .isFalse();
+        assertThat(finder.getCurrentRate()).as("halves straight away").isEqualTo(500.0);
     }
 
     @Test

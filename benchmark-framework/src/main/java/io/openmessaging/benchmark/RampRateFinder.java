@@ -172,22 +172,33 @@ class RampRateFinder {
                         ? workload.rampBracketHoldSeconds.intValue()
                         : holdSeconds;
         this.bracketHoldNanos = SECONDS.toNanos(bracketHoldSeconds);
-        // Defaults to 0 (off). Enabling it changes the search trajectory after every failure, so it
-        // is opt-in first -- the same way CHOP and the THROUGHPUT verdict were introduced -- until
-        // there are integration runs behind it. A good starting value is the resolved rampHoldSeconds.
-        int drainSeconds = workload.rampDrainSeconds != null ? workload.rampDrainSeconds.intValue() : 0;
+        // Defaults to the resolved rampHoldSeconds, i.e. on. It is a cap and not a fixed wait --
+        // recovery
+        // ends as soon as the backlog is back inside the limit it is judged against, so it costs a
+        // single
+        // poll when there is nothing to drain -- and the AKS trial showed what it costs to leave off:
+        // the
+        // encrypt arm rejected eight consecutive candidates in 24 seconds, none of them measured, each
+        // failing on the previous candidate's undrained overshoot rather than on its own rate. A hold's
+        // worth of patience is the natural bound: a candidate needing longer than that to drain is not
+        // one the search should be judging yet.
+        int drainSeconds =
+                workload.rampDrainSeconds != null ? workload.rampDrainSeconds.intValue() : holdSeconds;
         this.drainNanos = SECONDS.toNanos(drainSeconds);
         this.convergenceTolerance =
                 workload.rampConvergenceTolerance != null
                         ? workload.rampConvergenceTolerance.doubleValue()
                         : 0.05;
-        // Coupled to holdSeconds: under THROUGHPUT every candidate costs a full hold, and a search
-        // from the default start rate to a 7-figure ceiling runs ~15 holds (8 bracket, ~5 chop,
-        // 1 confirm) plus settle. At the 180s default hold that is ~45 minutes, so a 10-minute budget
-        // -- the old default, sized for 30s holds -- would truncate every real discovery and report an
-        // unconfirmed rate. RampRateFinderTest pins the pair so they cannot drift apart again.
+        // Coupled to holdSeconds *and* drainSeconds. Under THROUGHPUT every candidate costs a full
+        // hold,
+        // and a search from the default start rate to a 7-figure ceiling runs ~15 holds (8 bracket, ~5
+        // chop, 1 confirm) plus settle -- ~45 minutes at the 180s default hold. Add the drain: it is a
+        // cap rather than a wait (observed 2-30s in practice), but a search with ~6 failures could in
+        // the
+        // worst case spend another 6 x 180s waiting. 75 minutes covers both without truncating.
+        // RampRateFinderTest pins the budget against the hold so they cannot drift apart again.
         int maxDiscoveryMinutes =
-                workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes.intValue() : 60;
+                workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes.intValue() : 75;
         this.maxDiscoveryNanos = MINUTES.toNanos(maxDiscoveryMinutes);
         this.requiredConfirmationHolds =
                 workload.rampConfirmationHolds != null ? workload.rampConfirmationHolds.intValue() : 1;
@@ -520,11 +531,18 @@ class RampRateFinder {
     // (falling back to the queued candidate when nothing has passed yet, e.g. bracket halving down
     // from a start rate that was already too high) and evaluate nothing until the backlog clears.
     private boolean beginDrain(double next) {
-        if (drainNanos == 0) {
+        // No drain without a known-good rate to drain at. The premise is that running at lo makes
+        // queues
+        // actually shrink; the next candidate guarantees nothing, since it may itself be above
+        // capacity.
+        // On bracket's downward path lo is still null, and draining there is worse than skipping it --
+        // the recovery test never passes, the whole cap is burned, and the halved candidate then begins
+        // its hold carrying a larger backlog than if the search had simply moved on.
+        if (drainNanos == 0 || lo == null) {
             return setRate(next);
         }
         pendingRate = next;
-        currentRate = lo != null ? lo : next;
+        currentRate = lo;
         draining = true;
         elapsedDrainNanos = 0;
         return false;

@@ -148,8 +148,21 @@ public class Workload {
      * the backlog is back within the limit it is judged against, so when there is nothing to drain it
      * costs a single poll.
      *
-     * <p>Defaults to 0 (off), because enabling it changes the search trajectory after every failed
-     * candidate; a good starting value is the resolved rampHoldSeconds.
+     * <p>Defaults to the resolved rampHoldSeconds, i.e. on. Set 0 to disable. The AKS trial showed
+     * what leaving it off costs: its encrypt arm rejected eight consecutive candidates in 24 seconds,
+     * none of them measured, each failing on the previous candidate's undrained overshoot rather than
+     * on its own rate -- and the achievedRatio of those holds read 1.03-1.13, i.e. published
+     * exceeding target, which only happens when a queue from a higher previous rate is still
+     * emptying.
+     *
+     * <p>Recovery is skipped entirely while the bracket phase is still halving downward, because
+     * there is no known-good rate to drain at yet: draining at the next candidate guarantees nothing,
+     * since it may itself be above capacity, and the recovery test would then never pass.
+     *
+     * <p>Known gap: the recovery test looks only at cumulative *receive* backlog. Messages still
+     * queued in the producer client (buffer.memory, commonly 64MB) have not been published, so they
+     * contribute no receive backlog and recovery can be declared while the producer is still seconds
+     * behind its own schedule. See the trial log.
      */
     public Integer rampDrainSeconds;
 
@@ -212,7 +225,7 @@ public class Workload {
     public Boolean rampSeedFromAchievedRate;
 
     /**
-     * CHOP only: safety cap on total discovery time, in minutes. Defaults to 60.
+     * CHOP only: safety cap on total discovery time, in minutes. Defaults to 75.
      *
      * <p>Coupled to rampHoldSeconds. Under rampVerdict: THROUGHPUT there is no per-poll fast-fail, so
      * every candidate costs a full hold -- including the bracket phase's doomed 2x overshoots -- and
