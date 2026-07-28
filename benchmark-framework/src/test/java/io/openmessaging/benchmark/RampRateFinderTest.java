@@ -128,20 +128,29 @@ class RampRateFinderTest {
 
         finder.poll(periodNanos, 0, 0); // settle
 
-        // Bracket: 1000 clean, 2000 exceeds -> CHOP with lo=1000, hi=2000, mid=1500
+        // Bracket: 1000 clean, 2000 exceeds -> CHOP with lo=1000, hi=2000
         finder.poll(periodNanos, 3000, 3000);
         finder.poll(periodNanos, 3000 + 3000, 3000 + 3000);
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.CHOP);
+
+        // Bracket held for 3s where chop holds for 30, so chop re-verifies lo at full length first.
+        // Ten clean 3s polls at 1000 msg/s, then the bracket is bisected as usual.
+        assertThat(finder.getCurrentRate()).isEqualTo(1000.0);
+        long total = 6000;
+        for (int i = 0; i < 10; i++) {
+            total += 3000;
+            finder.poll(periodNanos, total, total);
+        }
         assertThat(finder.getCurrentRate()).isEqualTo(1500.0);
 
         // First hold poll at 1500 is clean (published keeps up with expected)
-        finder.poll(periodNanos, 6000 + 4500, 6000 + 4500);
+        finder.poll(periodNanos, total + 4500, total + 4500);
         assertThat(finder.getHi()).isEqualTo(2000.0); // unchanged so far
 
         // Two consecutive breaching polls at 1500 -- must fail on the second, not after the full 30s.
         // rampBreachPolls defaults to 2, so a single sample no longer condemns a candidate.
-        finder.poll(periodNanos, 10500 + 1000, 10500 + 1000);
-        boolean done = finder.poll(periodNanos, 11500 + 1000, 11500 + 1000);
+        finder.poll(periodNanos, total + 4500 + 1000, total + 4500 + 1000);
+        boolean done = finder.poll(periodNanos, total + 4500 + 2000, total + 4500 + 2000);
 
         assertThat(done).isFalse();
         assertThat(finder.getHi()).isEqualTo(1500.0);
@@ -461,7 +470,13 @@ class RampRateFinderTest {
         Workload workload = workload();
         workload.rampStartRate = 1000;
         workload.rampBracketHoldSeconds = 3; // fast bracket setup
-        workload.rampHoldSeconds = 30; // slow chop hold (applies to first pass and confirmation)
+        // 21s (7 polls), not 30: because bracket holds for 3s where chop holds longer, chop now
+        // re-verifies lo at full length before bisecting, adding one full hold to the sequence. The cap
+        // has to land *inside* the confirmation hold for this test to be about anything, and
+        // rampMaxDiscoveryMinutes is whole minutes, so the hold has to fit the 60s budget rather than
+        // the budget fitting the hold. Sequence: 3s settle + 3s + 3s bracket + 21s re-verify + 21s chop
+        // = 51s, leaving 9s of the 60s budget against a 21s confirmation hold.
+        workload.rampHoldSeconds = 21;
         workload.rampConvergenceTolerance = 0.5;
         workload.rampMaxDiscoveryMinutes = 1; // 60s cap
         RampRateFinder finder = new RampRateFinder(workload);
@@ -470,11 +485,11 @@ class RampRateFinderTest {
 
         finder.poll(periodNanos, 0, 0); // settle
 
-        // Bracket (2 polls) -> CHOP mid=1500. First hold (10 polls, 30s) passes and is within
-        // tolerance -> confirming flips true. The confirmation hold then needs another 30s, but
-        // the 60s safety cap fires first, partway through it.
+        // Bracket (2 polls) -> re-verify lo (7 polls) -> CHOP mid=1500. That hold (7 polls) passes and
+        // is within tolerance -> confirming flips true. The confirmation hold then needs another 21s,
+        // but the 60s safety cap fires 9s into it.
         boolean done = false;
-        for (int i = 0; i < 25 && !done; i++) {
+        for (int i = 0; i < 45 && !done; i++) {
             system.advance(finder.getCurrentRate(), periodNanos);
             done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
         }
@@ -1173,6 +1188,116 @@ class RampRateFinderTest {
         assertThat(finder.getHi())
                 .as("sustained overload fails on the second breach, not after the full 60s hold")
                 .isEqualTo(1000.0);
+    }
+
+    @Test
+    void aCheapBracketProbeHasItsLoReVerifiedAtFullLengthBeforeChopping() {
+        // The speed lever. Bracket's early doublings are pure overhead on a fast cluster: the AKS run
+        // spent 6 x 89s climbing 10k -> 320k with backlog flat at a few thousand the whole way,
+        // learning
+        // nothing but "still fine". Shortening rampBracketHoldSeconds reclaims that, but on its own it
+        // is unsafe -- a short hold can miss slow-building absorption, and lo only ever moves *up*, so
+        // an over-confirmed lo can never be undone.
+        //
+        // So when bracket ran cheaper than chop, the first thing chop does is re-run lo at full length.
+        // The probe locates the bracket; the full hold is what certifies it.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1; // cheap probe
+        workload.rampHoldSeconds = 3; // full rigor
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 1000, 1000); // 1000 probes clean -> lo = 1000, doubles to 2000
+        assertThat(finder.getLo()).isEqualTo(1000.0);
+        finder.poll(periodNanos, 3000, 2500); // 2000 breaches on the probe's only poll -> hi = 2000
+
+        assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.CHOP);
+        assertThat(finder.getCurrentRate())
+                .as("re-verify the cheaply-probed lo at full length, rather than bisecting from it")
+                .isEqualTo(1000.0);
+    }
+
+    @Test
+    void aFailedReVerificationRepositionsTheBracketInsteadOfStalling() {
+        // What the re-verification is *for*: catching a lo the cheap probe over-confirmed. When it
+        // fails, hi becomes that lo -- so lo and hi collide, and bisecting would retest the same rate
+        // forever. The search has to fall back to a lower recorded pass.
+        //
+        // And this must not latch isNonMonotonic(). A 1s probe passing where a 3s hold fails is not the
+        // system contradicting itself; it is two measurements of different rigor, which is the whole
+        // premise of probing cheaply. Latching here would withhold every result from every run that
+        // used a cheap bracket, making the option useless.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 1;
+        workload.rampHoldSeconds = 3;
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(1);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 1000, 1000); // probe passes 1000
+        finder.poll(periodNanos, 3000, 2500); // 2000 fails -> CHOP, re-verifying 1000
+        assertThat(finder.getCurrentRate()).isEqualTo(1000.0);
+
+        // 1000 now fails its full-length hold: two consecutive breaching polls.
+        finder.poll(periodNanos, 4000, 3000); // 1000 behind
+        finder.poll(periodNanos, 5000, 3500); // 1500 behind -- consecutive, so the candidate fails
+
+        assertThat(finder.getHi())
+                .as("the over-confirmed lo becomes the new ceiling")
+                .isEqualTo(1000.0);
+        assertThat(finder.getLo())
+                .as("falls back below it rather than colliding with hi and stalling")
+                .isLessThan(1000.0);
+        assertThat(finder.getCurrentRate()).isLessThan(1000.0);
+        assertThat(finder.isNonMonotonic())
+                .as("a cheap probe disagreeing with a full hold is not system instability")
+                .isFalse();
+    }
+
+    // Drives the AKS run's geometry -- 5,000 msg/s start, 180s chop holds, 3s polls, seeding on --
+    // against a hard 589,000 msg/s ceiling, and returns {discovery seconds, confirmed rate}.
+    private static double[] discoverAtBracketHold(int bracketHoldSeconds) {
+        Workload workload = new Workload();
+        workload.subscriptionsPerTopic = 1;
+        workload.rampStartRate = 5000;
+        workload.rampMaxBacklogSeconds = 0.5;
+        workload.rampBracketHoldSeconds = bracketHoldSeconds;
+        workload.rampHoldSeconds = 180;
+        workload.rampConvergenceTolerance = 0.05;
+        workload.rampSeedFromAchievedRate = true;
+        workload.rampSettleSeconds = 30;
+        workload.rampMaxDiscoveryMinutes = 600; // measuring search cost, so the cap must not bite
+
+        RampRateFinder finder = new RampRateFinder(workload);
+        FakeSystem system = new FakeSystem(589_000);
+        long periodNanos = SECONDS.toNanos(3);
+        int polls = 0;
+        boolean done = false;
+        while (!done && polls < 100_000) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+            polls++;
+        }
+        assertThat(done).isTrue();
+        return new double[] {polls * 3.0, finder.getCurrentRate()};
+    }
+
+    @Test
+    void aCheaperBracketProbeCutsDiscoveryTimeWithoutMovingTheAnswer() {
+        // The payoff, and the reason the re-verification above is worth its one extra hold. The AKS run
+        // used rampBracketHoldSeconds: 90 against 180s chop holds and spent 534s of its 1,606s climbing
+        // through doublings whose backlog never moved. Shortening the probe reclaims most of that, and
+        // because lo is re-verified at full length before chop, it does not cost accuracy.
+        double[] slow = discoverAtBracketHold(90);
+        double[] fast = discoverAtBracketHold(20);
+
+        assertThat(fast[0]).as("a cheaper probe must actually be cheaper").isLessThan(slow[0]);
+        assertThat(fast[1])
+                .as("and must land on the same rate -- the saving is in probing, not in rigor")
+                .isEqualTo(slow[1]);
     }
 
     @Test

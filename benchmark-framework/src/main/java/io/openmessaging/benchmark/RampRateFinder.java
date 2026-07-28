@@ -360,6 +360,15 @@ class RampRateFinder {
 
         if (lo != null && hi != null) {
             phase = Phase.CHOP;
+            // When bracket ran cheaper than chop, lo was certified with less rigor than every candidate
+            // chop is about to judge -- and lo only ever moves upward, so an over-confirmed lo can never
+            // be undone later. Re-run it at full length before narrowing anything. That is what makes a
+            // short rampBracketHoldSeconds safe: the probe locates the bracket, the full hold certifies
+            // it. Bracket's early doublings are otherwise pure overhead on a fast cluster (an AKS run
+            // spent 6 x 89s climbing to 320k with backlog flat the whole way, learning nothing).
+            if (bracketHoldNanos < holdNanos) {
+                return failed ? beginDrain(lo) : setRate(lo);
+            }
             if (failed) {
                 return beginDrain(nextAfterFailure());
             }
@@ -403,6 +412,13 @@ class RampRateFinder {
                 return beginDrain(nextAfterFailure());
             }
             hi = currentRate;
+            // A candidate at or below lo has failed -- which is exactly what re-verifying a cheaply
+            // probed lo is meant to catch. lo and hi would now collide, and bisecting a zero-width
+            // bracket retests the same rate forever, so drop back to the highest rate history records
+            // as passing strictly below it.
+            if (lo >= hi) {
+                lo = bestKnownPassBelow(hi);
+            }
             return beginDrain(nextAfterFailure());
         }
 
@@ -664,7 +680,17 @@ class RampRateFinder {
                 lo,
                 hi);
 
+        // Only full-length holds can contradict each other. A bracket probe run at a shorter
+        // rampBracketHoldSeconds is a cheaper measurement, not a weaker verdict on the same thing: a 1s
+        // probe passing where a 3s hold fails is the probe being cheap, which is the whole premise of
+        // probing cheaply. Latching nonMonotonic there would withhold the result of every run that used
+        // a cheap bracket, making the option useless. When bracket and chop hold for the same length
+        // (the default) every verdict is full rigor and this is exactly the old behaviour.
+        boolean fullRigor = phase != Phase.BRACKET || bracketHoldNanos >= holdNanos;
         for (RateVerdict v : history) {
+            if (!fullRigor || !v.fullRigor) {
+                continue;
+            }
             if (passed && !v.passed && rate >= v.rate) {
                 nonMonotonic = true;
             }
@@ -672,16 +698,19 @@ class RampRateFinder {
                 nonMonotonic = true;
             }
         }
-        history.add(new RateVerdict(rate, passed));
+        history.add(new RateVerdict(rate, passed, fullRigor));
     }
 
     private static final class RateVerdict {
         final double rate;
         final boolean passed;
+        // False for a bracket probe shorter than a chop hold -- see recordVerdict.
+        final boolean fullRigor;
 
-        RateVerdict(double rate, boolean passed) {
+        RateVerdict(double rate, boolean passed, boolean fullRigor) {
             this.rate = rate;
             this.passed = passed;
+            this.fullRigor = fullRigor;
         }
     }
 }

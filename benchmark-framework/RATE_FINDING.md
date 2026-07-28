@@ -75,10 +75,21 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 2. **Bracket** — starting at `rampStartRate`, double the rate every poll while backlog stays
    clean. A breach is immediately actionable (fail-fast, no need to hold out a rate that's already
    failing) and sets a known-bad `hi`; a clean reading must hold for `rampBracketHoldSeconds`
-   (defaults to the resolved `rampHoldSeconds` — i.e. bracket is exactly as rigorous as chop unless
-   you deliberately shorten it) before being accepted as the known-good `lo`. (Handles the reverse
+   (defaults to the resolved `rampHoldSeconds`) before being accepted as the known-good `lo`.
+
+   **Shortening `rampBracketHoldSeconds` is the main speed lever, and it is safe.** When bracket holds
+   for less time than chop, the first thing chop does is re-run `lo` at *full* length before narrowing
+   anything — the probe locates the bracket, the full hold certifies it. That matters because `lo` only
+   ever moves upward, so an over-confirmed `lo` could otherwise never be undone. If the re-verification
+   fails, `hi` becomes that `lo` and the search drops back to the highest rate history records as
+   passing below it. A short probe disagreeing with a full hold does *not* set `isNonMonotonic()`:
+   verdicts of different rigor are different measurements, not a contradiction. Measured on the AKS
+   run's geometry (5,000 msg/s start, 180s chop holds, hard 589k ceiling): 90s probes cost 1,494s of
+   discovery, 45s cost 1,134s (−24%), 20s cost 942s (−37%), 9s cost 846s (−43%) — all four converging
+   on the identical rate. (Handles the reverse
    case too — if even the start rate is already overloaded, it halves downward until it finds a
    clean `lo`.)
+
 3. **Chop** — binary search the `[lo, hi]` bracket. Each candidate is held for `rampHoldSeconds`
    (default 180s), not just glanced at — a single reactive snapshot (AIMD's approach) isn't enough
    to know a rate actually holds.
