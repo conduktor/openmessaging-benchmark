@@ -137,53 +137,87 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    settle period and every bracket/chop hold all draw from this same budget — with generous hold
    settings, raise this alongside them.
 
-### Verdict modes
+### Verdict modes: we use `BACKLOG`
 
-Each hold (bracket or chop) needs a clean/not-clean verdict before CHOP can act on it. Which
-predicate decides that is controlled by `rampVerdict`, with two modes:
+Each hold needs a clean/not-clean verdict before CHOP can act on it. Two predicates exist, selected by
+`rampVerdict`. **We use `BACKLOG`, the default. `THROUGHPUT` is retained but not recommended** — the
+reasoning is at the end of this section, and the evidence is in `docs/ramp-finder-trial-log.md`.
 
-- **`BACKLOG`** (default) — a hold is clean if neither side falls behind, with the two sides judged
-  differently because they are different kinds of quantity:
+#### `BACKLOG` (default, and what we use)
 
-  1. **Consumers** — `receiveBacklog` (cumulative) must stay within the configured limit
-     (`rampMaxBacklogSeconds` scaled by rate and clamped by `Floor`/`Ceiling`, or the fixed
-     `rampReceiveBacklogLimit` when the relative one is unset). Being a level, `rate x seconds` reads
-     as "the consumers are at most this many seconds behind", which is what the setting means.
-  2. **Producer** — `holdPublished >= rampMinThroughputRatio x holdExpected` over the hold so far. A
-     shortfall is a *flow*, so comparing one poll's shortfall against a message count said something
-     quite different: at a 1-second poll, `rampMaxBacklogSeconds: 0.5` permitted a 50% shortfall every
-     poll indefinitely, because nothing accumulated between polls. As a fraction it needs no per-rate
-     tuning, fast-fails a gross shortfall on the first poll, and ignores a small one.
+A hold is clean while neither side falls behind. The two sides are judged differently, because they are
+different kinds of quantity:
 
-  `rampPublishBacklogLimit` is therefore unused by CHOP; it remains only for AIMD.
-  Structural weakness: a healthy pipeline's in-flight backlog scales with throughput, so any
-  fixed-ish count is too strict at high rates and too loose at low ones — see the two "Trial
-  finding" sections below, both of which are this predicate misfiring in opposite directions.
+1. **Consumers — a level.** Cumulative `receiveBacklog`
+   (`subscriptionsPerTopic × totalPublished − totalReceived`) must stay within the configured limit:
+   `rampMaxBacklogSeconds` scaled by the candidate rate and clamped by `rampMaxBacklogFloor`/`Ceiling`,
+   or the fixed `rampReceiveBacklogLimit` when the relative one is unset. Because backlog is a level,
+   `rate × seconds` reads as "the consumers are at most this many seconds behind" — which is what the
+   setting is meant to say.
+2. **Producer — a flow.** `holdPublished ≥ rampMinThroughputRatio × holdExpected`, accumulated over the
+   hold so far. A shortfall is a rate, not a depth, so comparing one poll's shortfall against a message
+   count said something else entirely: at a 1-second poll, `rampMaxBacklogSeconds: 0.5` permitted a 50%
+   shortfall *every poll, indefinitely*, because nothing accumulated between polls. As a fraction it
+   needs no per-rate tuning, fast-fails a gross shortfall on the first poll, and ignores a small one.
+   (`rampPublishBacklogLimit` is therefore unused by CHOP; it remains only for AIMD.)
 
-- **`THROUGHPUT`** (opt-in) — a scale-free alternative. Per hold, all three of:
+Two polls must breach consecutively before a candidate fails (`rampBreachPolls`, default 2), and a poll
+that acknowledges *nothing* is treated as an absence of data rather than a breach — see "When discovery
+refuses to answer" below for both.
 
-  1. `published ≥ ratio · expected` — the producer kept up with the target rate.
-  2. `received ≥ ratio · subscriptionsPerTopic · published` — the consumers drained what was
-     published. Note this is a check on *divergence*, not on depth: if the receive backlog grew by
-     `ΔB` while the hold published `P`, the consumers moved `subscriptions·P − ΔB`, so this is
-     exactly `ΔB ≤ (1 − ratio)·subscriptions·P`. Consumer-side divergence is caught at any hold
-     length, which is why there is no separate "backlog is not growing" gate.
-  3. `secondHalfRate ≥ ratio · firstHalfRate` — throughput did not *decline* across the hold.
+#### `THROUGHPUT` (retained, not recommended)
 
-  `ratio` is `rampMinThroughputRatio` (default 0.95) throughout. Everything is a ratio rather than a
-  message count, so the same thresholds apply unchanged whether the candidate is 100 msg/s or
-  1,000,000 msg/s. There is no per-poll fast-fail: the verdict is decided once, at hold completion.
+A scale-free alternative. Per hold, all three of:
 
-  Check 3 exists because checks 1 and 2 average over the whole hold, which dilutes a decline confined
-  to the tail. A broker that absorbs the overshoot into page cache, batching and socket buffers acks
-  at the full target rate until those buffers saturate, so a hold that saturates near its end still
-  totals above the ratio and gets accepted. Comparing the halves leaves the decline undiluted.
+1. `published ≥ ratio · expected` — the producer kept up with the target rate.
+2. `received ≥ ratio · subscriptionsPerTopic · published` — the consumers drained what was published.
+   This is a check on *divergence*, not depth: if the receive backlog grew by `ΔB` while the hold
+   published `P`, the consumers moved `subscriptions·P − ΔB`, so it is exactly
+   `ΔB ≤ (1 − ratio)·subscriptions·P`.
+3. `secondHalfRate ≥ ratio · firstHalfRate` — throughput did not *decline* across the hold.
 
-  It **narrows** hold-length sensitivity without removing it. A hold whose buffers absorb for its
-  entire length is flat in both halves, and no statistic computed within that hold can tell it from a
-  healthy one — only a longer hold can. Measured against a 20,000-message absorption buffer over a
-  true 1,000 msg/s ceiling, check 3 is worth 2–5%; tripling the hold is worth far more. Budget hold
-  length first, and see "Known limitation" below.
+`ratio` is `rampMinThroughputRatio` (default 0.95) throughout, and there is no per-poll fast-fail: the
+verdict is decided once, at hold completion.
+
+#### Why we chose `BACKLOG`
+
+`THROUGHPUT` was added for a good reason. A fixed message count cannot be right at two different rates —
+a healthy pipeline's in-flight depth scales with throughput — and a large *stable* backlog is healthy
+even though a count-based check rejects it. That diagnosis was correct, and `BACKLOG` has since absorbed
+the fix: its limit scales with rate, and its producer side is now a ratio, which is `THROUGHPUT`'s own
+producer gate. The two are no longer far apart.
+
+What separates them is **what each can see**. Every counter the finder receives is populated when a
+message is *acknowledged*, so work that is in flight and unacked is invisible. `BACKLOG` watches a
+level, which starts rising the moment arrival exceeds service. `THROUGHPUT` watches flows and ratios,
+which stay healthy for as long as something downstream can absorb the overshoot — and only droop once it
+cannot. **Backlog is a leading indicator of saturation; achieved rate is a lagging one.** Check 3 above
+narrows that gap but cannot close it: a hold whose buffers absorb for its entire length is flat in both
+halves, and no statistic computed inside that hold can distinguish it from a healthy one.
+
+That is not a theoretical preference. Measured on AKS across three transport arms, one job, same
+cluster:
+
+|     arm     |   verdict    | confirmed |    avg publish delay over a 10-minute window     |
+|-------------|--------------|----------:|--------------------------------------------------|
+| direct      | `BACKLOG`    | 1,111,681 | 1,016 ms (a mid-window excursion that recovered) |
+| transparent | `BACKLOG`    | 1,177,872 | **4.4 ms**                                       |
+| encrypt     | `BACKLOG`    |   119,670 | **0.0 ms**                                       |
+| direct      | `THROUGHPUT` | 1,099,507 | 16.6 ms                                          |
+| transparent | `THROUGHPUT` | 1,421,882 | **22,930 ms**, climbing to 55,585 ms             |
+| encrypt     | `THROUGHPUT` |   128,969 | 0.0 ms                                           |
+
+`THROUGHPUT` confirmed 1,421,882 msg/s on the transparent arm — 21% above what `BACKLOG` found on the
+same arm — and the measurement window that followed delivered 10% *less* than that while publish delay
+climbed monotonically to 55 seconds. Every one of `THROUGHPUT`'s three checks passed, and
+`nonMonotonic` was false, because the gateway in that path had enough buffer to keep the ratios looking
+healthy. Its error tracks **how much buffering sits between producer and broker**, which is why it
+appears on the gateway arms and not on direct.
+
+So: `BACKLOG` for anything whose number we intend to rely on. `THROUGHPUT` remains for the one shape it
+genuinely handles better — a topology carrying a large, *stable* standing backlog that the consumers
+keep pace with but never close, where a level-based check has no correct threshold. If you use it,
+check publish delay in the measurement window before believing the rate.
 
 ### Configuration (workload YAML fields, all optional, only apply when `producerRate: 0`)
 
@@ -309,13 +343,23 @@ rather than reflecting steady state at the candidate under test. This matters mo
 the bracket phase only ever moves `lo` *upward*, so a single contaminated reading cannot be recovered
 from later.
 
-**Handled by `rampDrainSeconds`** (on by default, at the resolved `rampHoldSeconds`; set 0 to disable). A failed candidate is followed
-by a recovery period at the highest rate already observed to hold — a rate the consumers are known to
-keep up with, so queues actually shrink, which draining at the *next candidate* would not guarantee
-since that candidate may itself be above capacity. Nothing is evaluated during recovery and the
-counters are re-baselined, exactly as `rampSettleSeconds` does for start-up transients. It is a cap
-rather than a fixed wait: recovery ends as soon as the backlog is back within the limit it is judged
-against, so when there is nothing to drain it costs a single poll.
+**Handled by `rampDrainSeconds`** (on by default, at the resolved `rampHoldSeconds`; set 0 to disable).
+A failed candidate is followed by a recovery period during which nothing is evaluated and the counters
+are re-baselined, exactly as `rampSettleSeconds` does for start-up transients. Three details matter:
+
+- **It runs at half of `lo`, not at `lo`.** Draining needs arrival below service. `lo` means "keeps up",
+  not "has spare capacity", so at `lo` the queue shrinks at `capacity − lo` — nearly nothing. Two AKS
+  recoveries ran their full 180-second cap and gave up with the producer still 10 and 24 seconds behind,
+  draining at ~1.16M against a ~1.17M ceiling. Half gives real headroom; since nothing is measured during
+  recovery, running slower costs nothing.
+- **Both sides have to catch up.** Receive backlog inside its limit *and* publish delay back within
+  tolerance. Work sitting in the producer client's buffer has not been published, so it contributes no
+  receive backlog at all — recovery previously declared itself complete in two polls while the producer
+  was seconds behind its own schedule. `FINDER-DRAIN` reports `consumerCaughtUp` and `producerCaughtUp`
+  separately so a capped recovery says which side was not ready.
+- **It is a cap, not a fixed wait**, so it ends as soon as both sides are clear — a single poll when
+  there is nothing to drain. And it is skipped entirely while bracket is still halving downward, because
+  there is no known-good rate to drain at yet.
 
 Note what this does and does not fix. It removes *cross-candidate* contamination. It does not make a
 history-dependent verdict into a function of rate — see the trial log, where the same 800k candidate
@@ -359,3 +403,12 @@ AIMD if you just want *a* number and don't care whether it's reproducible in a f
 fixed rate. CHOP if you intend to take the discovered rate and actually rely on it — e.g. feeding
 it into a fixed-`producerRate` workload later, or attributing resource cost to "the rate we
 verified" rather than an average blurred across a whole oscillating test.
+
+With CHOP, leave `rampVerdict` at its `BACKLOG` default. See "Verdict modes" above for why, and
+`docs/ramp-finder-trial-log.md` for the runs behind it.
+
+Whichever you use, the number is only as good as the hold it was verified over. `rampHoldSeconds` has to
+exceed the time your broker can absorb an oversubscribed rate, which is a property of its cache and not
+something the finder can discover — so size it from the cluster, and check publish delay in the
+measurement window that follows. That check is the one thing that has caught every over-confirm in the
+trial log.

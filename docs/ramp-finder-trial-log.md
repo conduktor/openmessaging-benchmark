@@ -760,14 +760,14 @@ Same matrix, same settings, same arms as Finding 13 (`finder-chop-verdict-3arms.
 representative, run 30366818869), against PR-19 HEAD `e1481de` — i.e. `fde5838`/`e0b1d5f`/`965b3ca`
 all in. transparent's `BACKLOG` result:
 
-| | Finding 13 run | this run |
-|---|---|---|
-| transparent BACKLOG | 9,203 | **1,177,872** |
-| transparent THROUGHPUT | 1,151,838 | 1,421,882 |
-| direct BACKLOG | 1,112,274 | 1,111,681 |
-| direct THROUGHPUT | 1,164,974 | 1,099,507 |
-| encrypt BACKLOG | 128,258 | 119,670 |
-| encrypt THROUGHPUT | 148,432 | 128,969 |
+|                        | Finding 13 run |   this run    |
+|------------------------|----------------|---------------|
+| transparent BACKLOG    | 9,203          | **1,177,872** |
+| transparent THROUGHPUT | 1,151,838      | 1,421,882     |
+| direct BACKLOG         | 1,112,274      | 1,111,681     |
+| direct THROUGHPUT      | 1,164,974      | 1,099,507     |
+| encrypt BACKLOG        | 128,258        | 119,670       |
+| encrypt THROUGHPUT     | 148,432        | 128,969       |
 
 transparent BACKLOG went from 125x under the arm's real ceiling to matching it. Its chart
 (`ramp-report-chop-backlog-transparent.png` from this run) now shows what direct's and encrypt's
@@ -790,14 +790,14 @@ direct client connections is the only candidate that's occurred to me, unconfirm
 Resource attribution from the Finding 14 re-run (30366818869), peak CPU/MEM per pod over each cell's
 discovery window:
 
-| verdict | arm | confirmed | broker CPU (max) | broker MEM (max) | gateway CPU (max) | gateway MEM (max) |
-|---|---|---:|---:|---:|---:|---:|
-| BACKLOG | direct | 1,111,681 | 0.71 | 7.91 GiB | — | — |
-| BACKLOG | transparent | 1,177,872 | 0.75 | 7.91 GiB | 0.95 | 0.55 GiB |
-| BACKLOG | encrypt | 119,670 | 0.43 | 7.91 GiB | **2.00** | 1.01 GiB |
-| THROUGHPUT | direct | 1,099,507 | 0.76 | 7.91 GiB | — | — |
-| THROUGHPUT | transparent | 1,421,882 | 0.83 | 7.91 GiB | 0.61 | 1.04 GiB |
-| THROUGHPUT | encrypt | 128,969 | 0.48 | 7.91 GiB | **2.00** | 1.12 GiB |
+|  verdict   |     arm     | confirmed | broker CPU (max) | broker MEM (max) | gateway CPU (max) | gateway MEM (max) |
+|------------|-------------|----------:|-----------------:|-----------------:|------------------:|------------------:|
+| BACKLOG    | direct      | 1,111,681 |             0.71 |         7.91 GiB |                 — |                 — |
+| BACKLOG    | transparent | 1,177,872 |             0.75 |         7.91 GiB |              0.95 |          0.55 GiB |
+| BACKLOG    | encrypt     |   119,670 |             0.43 |         7.91 GiB |          **2.00** |          1.01 GiB |
+| THROUGHPUT | direct      | 1,099,507 |             0.76 |         7.91 GiB |                 — |                 — |
+| THROUGHPUT | transparent | 1,421,882 |             0.83 |         7.91 GiB |              0.61 |          1.04 GiB |
+| THROUGHPUT | encrypt     |   128,969 |             0.48 |         7.91 GiB |          **2.00** |          1.12 GiB |
 
 Two things fall out of this that weren't visible from the confirmed rate alone:
 
@@ -817,3 +817,79 @@ Separately, **broker MEM is the same 7.91 GiB in all six cells** — that's the 
 allocated ceiling, not a per-workload footprint measurement. It doesn't move with rate, arm, or
 verdict, so it isn't a comparison signal worth reading into for these runs; noting it so it isn't
 mistaken for one later.
+
+## Finding 16: transparent's THROUGHPUT result is the largest over-confirm in this log
+
+Same run as Findings 14 and 15 (30366818869), re-examined by measurement window rather than by
+confirmed rate. Finding 14 records transparent `THROUGHPUT` at 1,421,882 — 29% above the same run's
+direct `THROUGHPUT` — and calls it "legitimate result, not a glitch — just unexplained". It is not
+legitimate. Its own measurement window disagrees with it by a wide margin:
+
+|           cell           | confirmed | window median | avg publish delay |               delay shape across 59 intervals                |
+|--------------------------|-----------|---------------|-------------------|--------------------------------------------------------------|
+| `BACKLOG` direct         | 1,111,681 | 1,115,760     | 1,016 ms          | ~0, excursion peaking 2,978 ms at interval 29, ~0 by the end |
+| `BACKLOG` transparent    | 1,177,872 | 1,178,258     | **4.4 ms**        | flat, 0.7 ms both ends                                       |
+| `BACKLOG` encrypt        | 119,670   | 119,632       | **0.0 ms**        | flat                                                         |
+| `THROUGHPUT` direct      | 1,099,507 | 1,103,938     | 16.6 ms           | flat                                                         |
+| `THROUGHPUT` transparent | 1,421,882 | 1,278,132     | **22,930 ms**     | 13 ms → 435 → 4,125 → 40,421 → **55,585 ms**                 |
+| `THROUGHPUT` encrypt     | 128,969   | 127,609       | 0.0 ms            | flat                                                         |
+
+transparent `THROUGHPUT`'s delay climbs monotonically to **55.6 seconds** and its window delivers 10%
+less than the rate it confirmed. That is unbounded queue growth, and it is a worse over-confirm than
+the 1.8M incident that motivated this whole exercise. `nonMonotonic` is false and the chart looks like
+saturation because every check `THROUGHPUT` applies is blind to in-flight, unacknowledged work.
+
+**And this supplies the mechanism Finding 14 left open.** The question was why gateway passthrough
+appears to out-throughput bypassing the gateway; the guess was connection multiplexing. The answer is
+in Finding 15's own table: transparent `THROUGHPUT` gateway MEM is **1.04 GiB against 0.55 GiB** for
+transparent `BACKLOG` — nearly double, for a nominally identical passthrough. transparent is not
+faster. A proxy in the path adds a whole extra buffering layer, so `THROUGHPUT` can confirm a *higher*
+rate precisely because there is more room to hide unacked work. direct has no gateway, no extra buffer,
+and 16.6 ms.
+
+So `THROUGHPUT`'s error is not simply "grows with rate" (Finding 7) — it grows with **how much
+buffering sits between producer and broker**. That is why the over-confirm lands on transparent and not
+on direct at almost the same rate, and it is now evidenced twice.
+
+The `BACKLOG` direct excursion in that table is a separate, milder thing: near-zero at both ends with a
+sustained mid-window degradation that recovered. Not inherited from discovery, not unbounded. Either
+cluster variance or a bistable episode at a rate sitting on the knee; the confirmed rate itself
+reproduced to within 0.05% of the previous run.
+
+## Finding 17: recovery could not clear a queue, because it ran at lo
+
+Found in the same run's `FINDER-DRAIN` lines, which only became readable once `e0b1d5f` made recovery
+producer-aware. Two of four recoveries on the direct arm:
+
+```
+FINDER-DRAIN capped after 182s at 1280000 (backlog 29198, delayP99 24437ms,
+             consumerCaughtUp=true producerCaughtUp=false)
+FINDER-DRAIN capped after 180s at 1158209 (backlog 0,     delayP99 10448ms,
+             consumerCaughtUp=true producerCaughtUp=false)
+```
+
+Both ran the full 180-second cap and gave up with the consumer caught up and the producer still 10 and
+24 seconds behind its own schedule.
+
+The cause is structural rather than a tuning problem. Recovery ran at `lo`, on the reasoning that `lo`
+is a rate known to be sustainable — true, and insufficient. `lo` means "keeps up", not "has spare
+capacity". Clearing a queue needs arrival below service, so at `lo` the queue shrinks at
+`capacity - lo`, which by construction is nearly zero: draining at ~1.16M against a ~1.17M ceiling is
+about 1% of headroom, and a 10-second queue then needs on the order of 1,000 seconds.
+
+**Fixed:** recovery now runs at half of `lo`. That gives 2x headroom, clearing a queue in roughly its
+own duration. Nothing is evaluated during recovery and it ends as soon as both sides are caught up, so
+running slower costs nothing — while dropping to near-zero would leave the system cold, which is the
+transient `rampSettleSeconds` exists to avoid.
+
+Worth noting the sequence: `e0b1d5f` fixed recovery's blindness to the producer, and that fix
+immediately exposed a flaw it had been masking. Before it, all four of these recoveries would have
+reported "recovery complete" within a couple of polls while the producer was 24 seconds behind.
+
+**A correction to my own diagnosis.** I first read the `BACKLOG` direct window as a queue inherited
+from discovery and decaying away, and proposed a post-confirm drain to fix it. That was wrong, and
+wrong for an avoidable reason: I judged the shape from a first-half/second-half median, which for a
+mostly-zero series with a mid-window excursion is meaningless — sorting each half discards exactly the
+ordering that distinguishes "inherited and decaying" from "grew and recovered". The interval series
+shows near-zero at both ends, so the window never started behind and a post-confirm drain would have
+fixed nothing. The drain-rate defect above is the real one, and it was in the same data.
