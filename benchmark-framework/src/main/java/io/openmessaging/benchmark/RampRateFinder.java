@@ -65,6 +65,7 @@ class RampRateFinder {
     private final RampVerdict verdict;
     private final double minThroughputRatio;
     private final boolean seedFromAchievedRate;
+    private final int requiredBreachPolls;
 
     // Every publish is delivered once per subscription, so the consumers must move
     // subscriptions x published to keep up. Comparing raw counters would make the drain look
@@ -132,6 +133,9 @@ class RampRateFinder {
     private long lastReceiveBacklog = 0;
     private long holdPeakReceiveBacklog = 0;
 
+    // Consecutive breaching polls within the current hold. Reset by any clean poll.
+    private int consecutiveBreaches = 0;
+
     private final List<RateVerdict> history = new ArrayList<>();
 
     RampRateFinder(Workload workload) {
@@ -188,6 +192,8 @@ class RampRateFinder {
                         : 0.95;
         this.seedFromAchievedRate =
                 workload.rampSeedFromAchievedRate != null && workload.rampSeedFromAchievedRate;
+        this.requiredBreachPolls =
+                workload.rampBreachPolls != null ? Math.max(1, workload.rampBreachPolls.intValue()) : 2;
         this.subscriptions = workload.subscriptionsPerTopic;
     }
 
@@ -263,6 +269,7 @@ class RampRateFinder {
             secondHalfPublished = 0;
             secondHalfNanos = 0;
             holdPeakReceiveBacklog = 0;
+            consecutiveBreaches = 0;
         }
         lastReceiveBacklog = receiveBacklog;
         holdPeakReceiveBacklog = Math.max(holdPeakReceiveBacklog, receiveBacklog);
@@ -308,9 +315,22 @@ class RampRateFinder {
             breachedNow = receiveBacklog > receiveBacklogLimit || publishBacklog > publishBacklogLimit;
         }
 
+        // Debounce the fast-fail. A single poll is one sample, and condemning a candidate on one sample
+        // is a coin toss at the boundary -- worse, hi never reopens, so the mistake is permanent. On
+        // AKS
+        // a 640,000 msg/s candidate ran seven consecutive healthy polls and then dipped for one, 10%
+        // past the limit; that lone sample capped the whole search 7% low, on a hold whose own
+        // aggregate
+        // was 99.13% of target. Genuine overload does not look like that: the same trial measured
+        // backlog jumping from ~1,300 to ~74,800 in a single poll and then staying elevated for 12-15s.
+        // So requiring consecutive breaches costs one poll against a real failure and rejects a
+        // transient outright. Counts reset on any clean poll, so only a run of breaches trips it.
+        consecutiveBreaches = breachedNow ? consecutiveBreaches + 1 : 0;
+        boolean breached = consecutiveBreaches >= requiredBreachPolls;
+
         return phase == Phase.BRACKET
-                ? pollBracket(breachedNow, periodNanos)
-                : pollChop(breachedNow, periodNanos);
+                ? pollBracket(breached, periodNanos)
+                : pollChop(breached, periodNanos);
     }
 
     private boolean pollBracket(boolean breachedNow, long periodNanos) {
@@ -528,7 +548,12 @@ class RampRateFinder {
     // must have kept up with (drained) what the producer actually published.
     private boolean holdClean() {
         if (verdict != RampVerdict.THROUGHPUT) {
-            return true;
+            // Reaching completion means no run of breaches was ever long enough to fast-fail. But a
+            // hold that ends while still breaching has not recovered, and without this a hold shorter
+            // than rampBreachPolls polls could never fail at all -- the debounce would swallow its only
+            // sample. So the tolerance is for breaches the candidate *recovered* from, not for one that
+            // is still in progress when the clock runs out.
+            return consecutiveBreaches == 0;
         }
         boolean producerKeepsUp = holdPublished >= minThroughputRatio * holdExpected;
         // Note this is already a *divergence* check rather than a level check, which is why there is no
@@ -576,8 +601,8 @@ class RampRateFinder {
     String describeConfig() {
         return String.format(
                 "verdict=%s subscriptions=%d startRate=%s settle=%ds bracketHold=%ds hold=%ds"
-                        + " drainCap=%ds tolerance=%s seedFromAchievedRate=%s confirmHolds=%d"
-                        + " budget=%dmin minThroughputRatio=%s"
+                        + " drainCap=%ds tolerance=%s seedFromAchievedRate=%s breachPolls=%d"
+                        + " confirmHolds=%d budget=%dmin minThroughputRatio=%s"
                         + " backlogLimits=[publish=%d receive=%d maxBacklogSeconds=%s floor=%d"
                         + " ceiling=%d]",
                 verdict,
@@ -589,6 +614,7 @@ class RampRateFinder {
                 SECONDS.convert(drainNanos, NANOSECONDS),
                 convergenceTolerance,
                 seedFromAchievedRate,
+                requiredBreachPolls,
                 requiredConfirmationHolds,
                 MINUTES.convert(maxDiscoveryNanos, NANOSECONDS),
                 minThroughputRatio,

@@ -354,3 +354,142 @@ roughly, the error halves per doubling of the hold, and even a 90-second hold is
 computed inside that hold can. The remaining candidates are all outside the hold: scale the hold with
 the candidate rate (absorption time is roughly buffer-depth / overshoot, so higher rates need longer
 holds, not equal ones), or give up on a point value and report the band the sweep actually supports.
+
+## Finding 8: a full AKS run across all three transport arms, with the 180s-hold defaults
+
+Found running the consuming harness's (`conduktor/benchmarks`) AKS integration test, 2026-07-27,
+`representative` infra preset, `BACKLOG` verdict (still the default). First run of this matrix
+across all three transport arms in one dispatch — `direct` (no gateway), `transparent` (gateway,
+no interceptors), `encrypt` (gateway + real Vault transit KMS) — rather than `direct` alone as in
+every entry above. One "chop" load shared across arms (`rampStartRate` is a load-level field, not
+per-arm, so one value has to serve all three):
+
+```yaml
+rampStartRate: 5000
+rampMaxBacklogSeconds: 0.5
+rampBracketHoldSeconds: 90
+rampHoldSeconds: 180
+rampConvergenceTolerance: 0.05
+rampSeedFromAchievedRate: true
+rampMaxDiscoveryMinutes: 35
+testDurationMinutes: 40
+```
+
+**Result**: `direct` confirmed **588,930 msg/s** (`nonMonotonic: false`, discovery ~27min),
+`encrypt` confirmed **76,425 msg/s** (`nonMonotonic: false`, discovery ~15min — fewer bracket
+doublings needed for its lower ceiling). Both then held flat through their full measurement
+windows (`direct`: 588k-591k across 239 samples; `encrypt`: 76.2k-76.7k across 239 samples) — no
+drift, no decline. `transparent`'s result never made it off the cluster: a 0-byte `result.json`,
+no coordinator log, no metrics — the harness's `kubectl cp` step failed to copy the file even
+though `wait_job` had already confirmed the underlying Job completed (`kubectl cp`'s exit code is
+not trustworthy for this — kubernetes/kubectl#199). Harness-side, not a CHOP defect; the harness
+now retries that copy step up to 3 times before giving up, prompted directly by hitting this twice
+in one day (this run's `transparent`, and an earlier run's `aimd`).
+
+**These numbers matter beyond "it confirmed cleanly".** Every prior AKS trial in this log used
+`AIMD` as the comparison point on the same or similar hardware, and AIMD never got past the
+28,000-90,000 msg/s range, oscillating rather than settling. `direct`'s 588,930 here is not a
+noisier version of that number — it is roughly **6.5-20x** higher, on the *same class of
+hardware*, because AIMD's continuous reactive control never had a chance to explore that high
+before its own backlog limits (environment-variable-only, not rate-relative) forced it back down.
+This is the clearest evidence in this log that CHOP is not just "AIMD but reproducible" — on a
+sufficiently capable cluster it finds a materially different, and materially more correct, answer.
+
+**A visual record exists for `direct` and `encrypt`** (not `transparent`, given the collection
+failure above): `FINDER-POLL` lines (one per poll, `t`/`rate`/`achieved`/`backlog`/`delayP99Ms`/
+`latencyP99Ms`) plotted alongside the same window's Prometheus broker/gateway CPU, memory and GC
+pause, six stacked panels sharing one time axis. Both plots make the "Known limitation" section's
+overshoot claim directly visible rather than inferred: `encrypt`'s backlog spikes to ~150,000
+messages and e2e p99 latency to ~3 seconds at the exact moment bracket's doubling overshoots past
+the true knee, before chop backs off and finds it; `direct`'s broker memory climbs to a hard
+~8 GiB ceiling and pins there for the rest of discovery — page-cache saturation, visible as a flat
+line, not a number in a log. Script + PNGs live outside this repo (harness-side artifact, not
+committed here): `conduktor/benchmarks`'s workspace, `.context/ramp-reports/`.
+
+## Finding 9: where discovery's time actually goes, and how much of it is unearned rigor
+
+Working note, drawn from the same `finder-chop-3arms` AKS run as Finding 8 — reconstructed by
+grouping consecutive `FINDER-POLL` lines by their `rate=` value to get the exact wall-clock cost
+of every bracket step, chop step, and failure, rather than reasoning from the plots alone.
+
+**How fast backlog actually arises once a candidate exceeds capacity.** `encrypt`'s only real
+overload (80,000 -> 160,000, the step that found its knee) went from a healthy baseline straight
+to failure in a single poll:
+
+| t (s) | target | achieved | backlog |
+|-------|--------|----------|---------|
+| 491   | 80,000 | 80,102   | 1,299 (healthy) |
+| 494   | 160,000 | 131,332 | **74,835** |
+| 510   | 87,151  | 97,993  | **232,102 (peak)** |
+| 522   | 80,447  | 97,197  | 1,598 (recovered) |
+
+One 3-second poll is enough to go from a stable ~1,300 messages to ~74,800 (~57x) the moment a
+candidate genuinely exceeds capacity — not a gradual creep, a step function. It keeps growing for
+another ~12-15s (the finder is still reacting) before recovering to baseline by ~28s. Every
+*healthy* doubling in both arms, by contrast, never exceeded a few thousand messages and showed no
+trend across its full hold. This is a clean, fast, unambiguous signal — which matters for the
+recommendations below, because it means a real failure does not need a long hold to be seen; it
+needs a long hold only to make sure a *pass* is not a slow-building one (see the bracket-hold
+finding below, and "Known limitation" in `RATE_FINDING.md`).
+
+**Where the time went, `direct` (1,606s / 26.8min total discovery):**
+
+| Phase | Candidates | Cost |
+|-------|-----------|------|
+| Settle + 1st bracket hold (5,000) | 1 | 120s |
+| Bracket doublings (10k -> 320k, all clean) | 6 | 6 x 89s = 534s |
+| Bracket failure (640,000) | 1 | 22s (fail-fast, no full hold needed) |
+| Chop bisection (480k, 560k, 600k, 620k, all clean) | 4 | 4 x 178s = 712s |
+| Confirm (589,000 = 620,000 x 0.95) | 1 | 178s |
+
+Every bracket/chop hold that passed ran for its *entire* configured length (89s / 178s) — clean
+holds are not shortened early. The 640,000 failure is the only step that returned in less than a
+full hold, because a breach is fail-fast by design.
+
+**Where the time went, `encrypt` (882s / 14.7min total discovery):** identical shape through the
+4 clean doublings (10k/20k/40k/80k, 4 x 89s = 356s) and the settle+first-candidate 120s, then
+diverges sharply at its knee. The 160,000 candidate fails instantly (0s), and rather than a
+bisection, `rampSeedFromAchievedRate` re-seeds from the achieved throughput of the failed
+candidate — but the *next eight* candidates (131332, 119245, 108605, 94302, 87151, 83576, 81788,
+80894) each fail in 0-3s too, before 80,447 finally holds clean for a full 178s. That cascade cost
+only ~27s total to cross from 160,000 down to a stable ~80,000 — far cheaper than a bisection would
+have been. **But it is not for the reason it looks like.** Backlog at the moment 80,894 was tried
+was still >180,000 (see the table above) — that candidate did not fail because 80,894 msg/s is
+unsustainable, it failed because the *previous* candidate's overshoot had not drained yet. The
+cascade landed close to the right answer, but on this evidence it is not clear it always would:
+`rampDrainSeconds` is 0 (off) in this matrix, so nothing separates one candidate's fallout from the
+next one's verdict. This is exactly the cross-candidate contamination the "Known limitation"
+section already names for the bracket phase specifically; this run shows it happening across
+*rejected* candidates during a seeded recovery too.
+
+**Recommendations, ranked by evidence strength (harness-side matrix tuning, not algorithm changes):**
+
+1. **Cut the fixed measurement window — the single biggest lever.** Both arms ran the full
+   `testDurationMinutes: 40` after discovery (239 x 10s samples each) and showed *zero* drift the
+   entire time (see Finding 8's plots). Total cell time was discovery + measurement:
+   `direct` 26.3min + 40min, `encrypt` 14.7min + 40min — measurement dominates both, and nothing in
+   this data suggests 40 minutes shows anything a much shorter window would not. This is the
+   highest-confidence cut available: it is supported by watching the *entire* window stay flat,
+   not by extrapolating from a partial one.
+2. **Start closer to the known range, per arm.** `rampStartRate` is one value shared across all
+   three arms (a load-level field, not per-arm), so it was set once (5,000) as a compromise for
+   very different ceilings. Every doubling below ~1/8th of the eventual answer held cleanly with
+   flat, unremarkable backlog — zero information gained beyond "still fine." Splitting into
+   per-arm loads and starting direct/transparent near 300-400k, encrypt near 40-50k (informed by
+   *this run's own* confirmed rates) would skip 4-5 of those doublings per arm for free.
+3. **Turn `rampDrainSeconds` on.** Per the finding above, the fast reseed cascade currently trades
+   confidence for speed without saying so. Draining is cheap when unneeded (one poll) and directly
+   closes the cross-candidate contamination this run's own data shows happening.
+4. **`rampBracketHoldSeconds` (90s) likely exceeds what the non-final bracket steps need.** Every
+   clean bracket hold's backlog was already representative within the first 1-2 polls (3-6s); none
+   showed a trend building across the remaining ~85s. The 90s of scrutiny plausibly only matters
+   for the step nearest the knee, where page-cache absorption can mask trouble longer. A shorter
+   value trades some of that margin for time, backstopped by chop's full-rigor re-examination of
+   the same territory and the reopen-on-failed-confirm path.
+5. **`rampConvergenceTolerance` is a smaller, real trade.** `direct` needed exactly 4 bisections to
+   narrow a 2x-wide bracket to 5%; loosening to ~10% would likely drop one (~178s) at the cost of a
+   wider confirmed-rate band.
+
+Items 1 and 2 together are argued directly from data that stayed flat for its full duration or
+carried zero new information — no confidence given up to get them. Items 3-5 trade a specific,
+named risk for time; 3 is closing a gap this run's data exposes rather than opening one.

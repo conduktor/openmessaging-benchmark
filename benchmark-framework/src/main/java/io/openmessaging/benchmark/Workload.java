@@ -170,6 +170,21 @@ public class Workload {
      */
     public Integer rampConfirmationHolds;
 
+    /**
+     * CHOP only: how many *consecutive* polls must breach the backlog limit before a candidate is
+     * failed. Defaults to 2. Only applies to rampVerdict: BACKLOG, which is the mode that decides
+     * per-poll; THROUGHPUT is decided once at hold completion and is unaffected.
+     *
+     * <p>1 restores the old behaviour of condemning a candidate on a single sample. That is a coin
+     * toss near the boundary, and because nothing ever reopens hi, the mistake is permanent: on AKS a
+     * 640,000 msg/s candidate ran seven consecutive healthy polls, dipped for one poll 10% past the
+     * limit, and capped the whole search 7% low -- on a hold whose own aggregate was 99.13% of
+     * target. Genuine overload does not look like that; the same trial measured backlog jumping ~57x
+     * in one poll and then staying elevated for 12-15s. So the second poll costs almost nothing
+     * against a real failure and rejects a transient outright.
+     */
+    public Integer rampBreachPolls;
+
     /** CHOP only: relative (hi - lo) / lo band at which to stop chopping. Defaults to 0.05. */
     public Double rampConvergenceTolerance;
 

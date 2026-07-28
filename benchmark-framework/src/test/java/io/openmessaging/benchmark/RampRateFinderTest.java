@@ -138,8 +138,10 @@ class RampRateFinderTest {
         finder.poll(periodNanos, 6000 + 4500, 6000 + 4500);
         assertThat(finder.getHi()).isEqualTo(2000.0); // unchanged so far
 
-        // Second hold poll at 1500 shows a backlog breach -- must fail immediately, not after 30s
-        boolean done = finder.poll(periodNanos, 10500 + 1000, 10500 + 1000);
+        // Two consecutive breaching polls at 1500 -- must fail on the second, not after the full 30s.
+        // rampBreachPolls defaults to 2, so a single sample no longer condemns a candidate.
+        finder.poll(periodNanos, 10500 + 1000, 10500 + 1000);
+        boolean done = finder.poll(periodNanos, 11500 + 1000, 11500 + 1000);
 
         assertThat(done).isFalse();
         assertThat(finder.getHi()).isEqualTo(1500.0);
@@ -255,7 +257,10 @@ class RampRateFinderTest {
         absolute.rampStartRate = 100000;
         RampRateFinder absoluteFinder = new RampRateFinder(absolute);
         absoluteFinder.poll(periodNanos, 0, 0); // settle
+        // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
+        // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
         absoluteFinder.poll(periodNanos, 99500, 99500);
+        absoluteFinder.poll(periodNanos, 199000, 199000);
         assertThat(absoluteFinder.getHi()).isEqualTo(100000.0); // absolute limit (100) blown
         assertThat(absoluteFinder.getLo()).isNull();
 
@@ -302,7 +307,10 @@ class RampRateFinderTest {
         long periodNanos = SECONDS.toNanos(1);
 
         finder.poll(periodNanos, 0, 0); // settle
+        // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
+        // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
         finder.poll(periodNanos, 5000, 5000); // same massive shortfall as above
+        finder.poll(periodNanos, 10000, 10000);
 
         assertThat(finder.getHi()).isEqualTo(1000000.0); // caught by the ceiling this time
         assertThat(finder.getLo()).isNull();
@@ -317,7 +325,10 @@ class RampRateFinderTest {
         long periodNanos = SECONDS.toNanos(1);
 
         finder.poll(periodNanos, 0, 0); // settle
+        // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
+        // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
         finder.poll(periodNanos, 5000, 5000);
+        finder.poll(periodNanos, 10000, 10000);
 
         // The default ceiling (100,000) applies since none was set, catching the runaway
         // tolerance just like an explicit low ceiling would.
@@ -340,7 +351,10 @@ class RampRateFinderTest {
         long periodNanos = SECONDS.toNanos(1);
 
         finder.poll(periodNanos, 0, 0); // settle
+        // Two consecutive breaching polls: rampBreachPolls defaults to 2, so one sample no longer
+        // condemns a candidate (see aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp).
         finder.poll(periodNanos, 50, 50); // only 50 of the expected 100 published
+        finder.poll(periodNanos, 100, 100);
 
         assertThat(finder.getHi()).isEqualTo(100.0); // wrongly treated as a capacity failure
         assertThat(finder.getLo()).isNull();
@@ -1069,6 +1083,64 @@ class RampRateFinderTest {
         assertThat(done).isTrue();
         assertThat(finder.isConfirmed()).isTrue();
         assertThat(Math.abs(4500.0 - finder.getCurrentRate()) / 4500.0).isLessThan(0.1);
+    }
+
+    @Test
+    void aSingleBreachingPollDoesNotFailACandidateThatIsOtherwiseKeepingUp() {
+        // From the AKS trial: a 640,000 msg/s candidate ran 7 consecutive healthy polls (achieved
+        // 629,694-650,592, backlog 3,430-6,573 against a 100,000 limit), then one 3-second poll dipped
+        // to 603,315 -- a publish shortfall of 110,055, exceeding the limit by 10%. That single sample
+        // set hi=640,000 permanently, because nothing ever reopens hi. The hold's own aggregate was
+        // published/expected = 99.13%.
+        //
+        // A per-poll fast-fail has no noise tolerance at all: one sample decides. Real overload is not
+        // like that -- the same trial measured backlog going from ~1,300 to ~74,800 in one poll and
+        // then *staying* elevated for 12-15s. So requiring two consecutive breaches costs one poll
+        // against a genuine failure and filters a transient entirely.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 15; // 5 polls, so the breach is not the final one
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(3);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        // Three clean polls at 1000 msg/s: 3000 published per period, consumers keeping pace.
+        finder.poll(periodNanos, 3000, 3000);
+        finder.poll(periodNanos, 6000, 6000);
+        finder.poll(periodNanos, 9000, 9000);
+        assertThat(finder.getHi()).isNull();
+
+        // One poll breaches: 500 messages of receive backlog against the 100 limit. Isolated.
+        finder.poll(periodNanos, 12000, 11500);
+        assertThat(finder.getHi()).as("a lone breaching poll must not condemn the rate").isNull();
+
+        // Recovers on the next poll, which also completes the 15s hold. A hold that *ended* while
+        // still breaching is a different case and does fail -- the tolerance is for breaches the
+        // candidate recovered from, not one still in progress when the clock runs out.
+        finder.poll(periodNanos, 15000, 15000);
+        assertThat(finder.getHi()).isNull();
+        assertThat(finder.getLo()).as("the candidate held: 15s of hold completed").isEqualTo(1000.0);
+    }
+
+    @Test
+    void twoConsecutiveBreachingPollsStillFailTheCandidateImmediately() {
+        // The other side: sustained overload must still fail fast. Debouncing buys noise immunity, and
+        // it must not turn into waiting out a full hold on a rate that is genuinely gone.
+        Workload workload = workload();
+        workload.rampStartRate = 1000;
+        workload.rampBracketHoldSeconds = 60; // long, so an early exit is unambiguous
+        RampRateFinder finder = new RampRateFinder(workload);
+        long periodNanos = SECONDS.toNanos(3);
+
+        finder.poll(periodNanos, 0, 0); // settle + baseline
+        finder.poll(periodNanos, 3000, 3000); // clean
+        finder.poll(periodNanos, 6000, 5500); // breach 1: 500 behind
+        assertThat(finder.getHi()).isNull();
+        finder.poll(periodNanos, 9000, 8000); // breach 2: 1000 behind, consecutive
+
+        assertThat(finder.getHi())
+                .as("sustained overload fails on the second breach, not after the full 60s hold")
+                .isEqualTo(1000.0);
     }
 
     @Test
