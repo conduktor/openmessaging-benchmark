@@ -29,6 +29,11 @@ class RampRateFinderTest {
         workload.subscriptionsPerTopic = 1; // one delivery per publish, so received tracks published
         workload.rampPublishBacklogLimit = 100L;
         workload.rampReceiveBacklogLimit = 100L;
+        // Explicitly null so the small fixed limits above are what decide. rampMaxBacklogSeconds now
+        // defaults to 0.5, and with the 1,000-message floor that would override anything this tight --
+        // these hand-fed fixtures work in hundreds of messages, not hundreds of thousands. Tests that
+        // are *about* the rate-scaled limit set it themselves.
+        workload.rampMaxBacklogSeconds = null;
         workload.rampSettleSeconds = 0; // most tests don't care about settling; a few override it
         // Pinned off so a failure's trajectory is the search's own. rampDrainSeconds now defaults ON
         // (to the resolved rampHoldSeconds), which inserts a recovery period after every failed
@@ -94,7 +99,9 @@ class RampRateFinderTest {
         assertThat(finder.getPhase()).isEqualTo(RampRateFinder.Phase.CHOP);
         assertThat(finder.getLo()).isEqualTo(4000.0);
         assertThat(finder.getHi()).isEqualTo(8000.0);
-        assertThat(finder.getCurrentRate()).isEqualTo(6000.0);
+        // rampSeedFromAchievedRate is on by default, so the first chop candidate is what the failed
+        // 8000 hold actually achieved (4500) rather than the blind midpoint of [4000, 8000].
+        assertThat(finder.getCurrentRate()).isEqualTo(4500.0);
     }
 
     @Test
@@ -624,6 +631,7 @@ class RampRateFinderTest {
         workload.rampHoldSeconds = 1;
         workload.rampConvergenceTolerance = 0.05;
         workload.rampDrainSeconds = 0; // see workload() -- pinned off so trajectories stay readable
+        workload.rampMaxBacklogSeconds = null; // THROUGHPUT ignores it; keeps the BACKLOG arms honest
         return workload;
     }
 
@@ -879,6 +887,30 @@ class RampRateFinderTest {
             totalPublished += (long) (Math.min(rate, producerCapacity) * periodSeconds);
             long lag = totalPublished - totalReceived;
             totalReceived += (long) Math.min(consumerCapacity * periodSeconds, lag);
+        }
+    }
+
+    /**
+     * A producer capped at {@code producerCapacity} whose in-flight depth is {@code backlogSeconds}
+     * worth of whatever it is currently publishing. This is how a healthy pipeline actually behaves
+     * -- depth scales with throughput -- which is exactly what no fixed message count can be right
+     * about at two different rates.
+     */
+    private static final class FakeProportionalBacklogSystem {
+        private final double producerCapacity;
+        private final double backlogSeconds;
+        long totalPublished;
+        long totalReceived;
+
+        FakeProportionalBacklogSystem(double producerCapacity, double backlogSeconds) {
+            this.producerCapacity = producerCapacity;
+            this.backlogSeconds = backlogSeconds;
+        }
+
+        void advance(double rate, long periodNanos) {
+            double delivered = Math.min(rate, producerCapacity);
+            totalPublished += (long) (delivered * (periodNanos / 1e9));
+            totalReceived = Math.max(0, totalPublished - (long) (delivered * backlogSeconds));
         }
     }
 
@@ -1496,6 +1528,40 @@ class RampRateFinderTest {
         finder.poll(periodNanos, 200, 200);
 
         assertThat(finder.getHi()).as("a measured shortfall is still a breach").isEqualTo(10000.0);
+    }
+
+    @Test
+    void theDefaultConfigurationDiscoversAHighRateInsteadOfCollapsing() {
+        // The shipped default used to be the configuration the trial log documents collapsing. With
+        // rampMaxBacklogSeconds unset, CHOP fell back to a *fixed* 1,000-message receive limit -- which
+        // at 1,100,000 msg/s is 0.9 milliseconds of tolerance. Every real cluster carries far more than
+        // that in flight when healthy, so every candidate breached and the search halved to nothing.
+        // Every AKS run that produced a usable number set rampMaxBacklogSeconds: 0.5 by hand.
+        //
+        // Here: a producer capped at 1,000,000 msg/s whose healthy in-flight depth is 10ms of whatever
+        // it is currently publishing -- which is how a real pipeline behaves, since depth scales with
+        // throughput. At 1,000,000 msg/s that is 10,000 messages: ten times the fixed default limit,
+        // and
+        // a fiftieth of what 0.5 seconds allows.
+        Workload workload = new Workload();
+        workload.subscriptionsPerTopic = 1;
+        workload.rampStartRate = 10000;
+        RampRateFinder finder = new RampRateFinder(workload); // everything else left at its default
+        FakeProportionalBacklogSystem system = new FakeProportionalBacklogSystem(1_000_000, 0.01);
+        long periodNanos = SECONDS.toNanos(3);
+
+        boolean done = false;
+        for (int i = 0; i < 5_000 && !done; i++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).isTrue();
+        assertThat(finder.isSafetyCapped()).isFalse();
+        assertThat(finder.isConfirmed()).as("the defaults must reach a genuine confirm").isTrue();
+        assertThat(finder.getCurrentRate())
+                .as("10ms of in-flight depth is not a capacity failure at any rate")
+                .isGreaterThan(800_000.0);
     }
 
     @Test

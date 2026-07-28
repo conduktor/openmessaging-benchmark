@@ -90,9 +90,15 @@ public class Workload {
      * CHOP only: backlog limit expressed as seconds' worth of the candidate rate (limit = currentRate
      * * rampMaxBacklogSeconds) instead of a fixed message count, so the check is equally strict at
      * every rate tested during the bracket phase's exponential range. When set, this replaces
-     * rampPublishBacklogLimit/rampReceiveBacklogLimit for CHOP. Unset by default.
+     * rampPublishBacklogLimit/rampReceiveBacklogLimit for CHOP.
+     *
+     * <p>Defaults to 0.5. Explicitly null falls back to the fixed counts, which is almost never what
+     * you want: at 1,100,000 msg/s the 1,000-message default is 0.9 milliseconds of tolerance, and
+     * any real cluster carries far more than that in flight while perfectly healthy -- so every
+     * candidate breaches and the search halves to nothing. That was the shipped default until the AKS
+     * trials, every one of which had to set this by hand to get a usable number.
      */
-    public Double rampMaxBacklogSeconds;
+    public Double rampMaxBacklogSeconds = 0.5;
 
     /**
      * CHOP only: hard floor (in messages) on the limit rampMaxBacklogSeconds computes. Without it, a
@@ -101,6 +107,13 @@ public class Workload {
      * cascade all the way down to a near-zero "confirmed" rate. Defaults to 1000, matching the old
      * fixed-count default so the relative check can never become stricter than a fixed-count check
      * would have been. Only meaningful when rampMaxBacklogSeconds is set.
+     *
+     * <p>Note the interaction with a low rampStartRate: the limit scales with the *candidate* rate,
+     * so early bracket candidates get small limits. A topology carrying a large *standing* backlog --
+     * one the consumers keep pace with but never close -- can therefore fail every early candidate
+     * and stop bracket climbing at all. Raise this above that standing depth, raise rampStartRate
+     * past it, or use rampVerdict: THROUGHPUT, which is the one shape that verdict genuinely handles
+     * better.
      */
     public Long rampMaxBacklogFloor;
 
@@ -132,9 +145,16 @@ public class Workload {
 
     /**
      * CHOP only: seconds a bracket-phase candidate (the exponential doubling/halving search that
-     * finds the initial [lo, hi] window) must hold clean before being accepted. Defaults to the
-     * resolved rampHoldSeconds, i.e. bracket and chop are equally rigorous unless you explicitly
-     * shorten this once you trust bracket's coarser candidates need less scrutiny.
+     * finds the initial [lo, hi] window) must hold clean before being accepted. Defaults to 20, or
+     * rampHoldSeconds if that is shorter.
+     *
+     * <p>Bracket only has to *locate* the knee, and overload announces itself in a poll or two -- an
+     * AKS arm went from ~1,300 messages of backlog to ~74,800 in a single 3-second poll the moment a
+     * candidate genuinely exceeded capacity. Whenever this is shorter than rampHoldSeconds, chop
+     * re-verifies lo at full length before narrowing anything, which is what makes a cheap probe
+     * safe: lo only ever moves upward, so an over-confirmed lo could otherwise never be undone.
+     * Measured on the AKS geometry, 90s probes cost 1,494s of discovery against 942s for 20s -- a 37%
+     * saving with every variant converging on the identical rate.
      */
     public Integer rampBracketHoldSeconds;
 
@@ -220,12 +240,13 @@ public class Workload {
      * the tolerance band is inside the noise the search already ignores), and strictly above the
      * highest rate already known to hold. Otherwise the bracket is bisected as before.
      *
-     * <p>Defaults to false, because it changes the search trajectory after every failed candidate.
+     * <p>Defaults to true: ~12% less discovery time with no measured accuracy cost, and it fired
+     * correctly on every AKS arm whose failures were producer-side. Set false to bisect blindly.
      */
     public Boolean rampSeedFromAchievedRate;
 
     /**
-     * CHOP only: safety cap on total discovery time, in minutes. Defaults to 75.
+     * CHOP only: safety cap on total discovery time, in minutes. Defaults to 45.
      *
      * <p>Coupled to rampHoldSeconds. Under rampVerdict: THROUGHPUT there is no per-poll fast-fail, so
      * every candidate costs a full hold -- including the bracket phase's doomed 2x overshoots -- and
