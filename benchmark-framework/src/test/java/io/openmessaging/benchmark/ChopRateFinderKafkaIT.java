@@ -171,11 +171,14 @@ class ChopRateFinderKafkaIT {
 
         Double confirmedRate = result.rampVerification == null ? null : result.rampVerification.rate;
         double publishDelayAvgMs = result.aggregatedPublishDelayLatencyAvg / 1000.0;
-        // Median, not mean. LocalWorker.resetStats() only calls stats.resetLatencies() and never
-        // stats.reset(), so the message counters are NOT cleared between discovery and measurement:
-        // the first interval of a producerRate:0 run reports every message published during
-        // discovery as if it arrived in that one 10s window. Observed at 15,439,670 msg/s against a
-        // steady-state 481,000. A mean is wrecked by that single sample; the median ignores it.
+        // Median, not mean, and still so after the counter-reset fix. It was originally needed because
+        // resetStats() left the period counters intact, so the window's first interval reported every
+        // message published during discovery as if it arrived in one 10s sample -- 15,439,670 msg/s
+        // against a steady-state 481,000. resetStats() clears them now, but a single anomalous interval
+        // can still arise for ordinary reasons (a GC pause, a leader election), and one sample is
+        // enough
+        // to wreck a mean over ~60 of them. The median is the right statistic for "what did this window
+        // sustain" regardless of whether that particular bug exists.
         double measuredPublishRate =
                 result.publishRate.stream()
                         .mapToDouble(Double::doubleValue)

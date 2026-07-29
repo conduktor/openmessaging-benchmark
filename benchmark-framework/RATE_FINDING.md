@@ -446,21 +446,26 @@ contamination was not producing a good answer for a good reason; it was masking 
 5%-over-a-finite-hold predicate is too permissive when a broker can absorb the overshoot. Fixing the
 isolation exposes that. Hold length is the lever that addresses it.
 
-### Caveat when reading a ramp run's reported rates
+### The measurement window's first interval
 
-`LocalWorker.resetStats()` calls only `stats.resetLatencies()`, never `stats.reset()` — so the
-message counters are *not* cleared between discovery and the measurement window. The first 10-second
-interval of `printAndCollectStats` therefore attributes everything published during discovery to that
-one window. On a `producerRate: 0` run this was observed reporting **15,439,670 msg/s** for the first
-interval against a steady-state **481,000 msg/s**: roughly six minutes of discovery folded into one
-sample.
+`printAndCollectStats` derives each interval's rate as `periodStats.messagesSent / (now − previousPoll)`,
+and `messagesSent` accumulates until something calls `toPeriodStats()`. Nothing did so between
+`startLoad()` and the window's first poll, so that first interval used to absorb everything published
+beforehand — on a `producerRate: 0` run, **15,439,670 msg/s** against a steady-state **481,000**, which
+is roughly six minutes of discovery folded into one 10-second sample.
 
-So the first entry of `publishRate` / `consumeRate` (and the byte-rate equivalents) is junk on any
-`producerRate: 0` run, AIMD included, and a mean over those lists inherits it — use the median, or
-drop the first sample. Latency figures are unaffected: `resetLatencies()` does clear both the
-interval and cumulative recorders, so `aggregatedPublishDelayLatencyAvg` and the quantiles describe
-the measurement window only. Not fixed here because `WorkerStats.reset()` also clears
-`totalMessagesSent`/`totalMessagesReceived`, which the backlog-drain logic depends on.
+**Fixed:** `LocalWorker.resetStats()` now clears the per-period counters as well as the latency
+recorders, so the window starts from zero. Deliberately *not* via `WorkerStats.reset()`, which also
+clears `totalMessagesSent`/`totalMessagesReceived` — `buildAndDrainBacklog` is launched before
+`resetStats()` and runs concurrently for the whole test, computing its remaining backlog from those
+totals, so clearing them mid-flight would collapse its backlog to zero and let it conclude the drain had
+finished. `WorkerStatsTest` pins both halves of that.
+
+Worth knowing anyway, for two reasons. Any run from before this fix has a junk first sample in
+`publishRate`/`consumeRate` and the byte-rate equivalents, so a mean over those lists inherits it. And a
+single anomalous interval can still arise for ordinary reasons — a GC pause, a leader election — so
+prefer the median over the mean when you want "the rate this window sustained". Latency figures were
+never affected: `resetLatencies()` always cleared both the interval and cumulative recorders.
 
 ### Trial log
 
