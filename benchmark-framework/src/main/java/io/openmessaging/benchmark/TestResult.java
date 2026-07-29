@@ -14,6 +14,7 @@
 package io.openmessaging.benchmark;
 
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +28,10 @@ public class TestResult {
     public int partitions;
     public int producersPerTopic;
     public int consumersPerTopic;
+
+    // Only present for rampAlgorithm: CHOP workloads that reached a genuine confirm.
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public RampVerification rampVerification;
 
     public List<Double> publishRate = new ArrayList<>();
     public List<Double> publishErrorRate = new ArrayList<>();

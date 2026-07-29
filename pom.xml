@@ -87,6 +87,9 @@
         <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
         <maven.enforcer.plugin.version>3.1.0</maven.enforcer.plugin.version>
         <maven.surefire.plugin.version>3.0.0-M7</maven.surefire.plugin.version>
+        <!-- Integration tests (failsafe *IT) are skipped by default so PR CI stays fast and
+             Docker-free; enable with the integration-tests profile or -DskipITs=false. -->
+        <skipITs>true</skipITs>
         <spotbugs.plugin.version>4.7.3.6</spotbugs.plugin.version>
         <spotless.plugin.version>2.25.0</spotless.plugin.version>
     </properties>
@@ -347,6 +350,9 @@
             <plugin>
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <version>${maven.surefire.plugin.version}</version>
+                <configuration>
+                    <skipITs>${skipITs}</skipITs>
+                </configuration>
                 <executions>
                     <execution>
                         <goals>
@@ -491,6 +497,14 @@
                     </plugins>
                 </pluginManagement>
             </build>
+        </profile>
+        <profile>
+            <!-- Opt in to the Docker-backed integration tests (failsafe *IT), e.g.
+                 mvn verify -Pintegration-tests. Requires a running Docker daemon. -->
+            <id>integration-tests</id>
+            <properties>
+                <skipITs>false</skipITs>
+            </properties>
         </profile>
     </profiles>
 </project>

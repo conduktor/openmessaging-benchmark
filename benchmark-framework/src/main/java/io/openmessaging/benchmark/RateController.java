@@ -25,6 +25,11 @@ class RateController {
     private static final long ONE_SECOND_IN_NANOS = SECONDS.toNanos(1);
     private final long publishBacklogLimit;
     private final long receiveBacklogLimit;
+
+    // Each publish is delivered once per subscription, so the consumers owe
+    // subscriptions x published deliveries. WorkloadGenerator applies the same factor wherever it
+    // reports backlog.
+    private final long subscriptions;
     private final double minRampingFactor;
     private final double maxRampingFactor;
     private final double warmupRateFraction;
@@ -37,8 +42,23 @@ class RateController {
     private boolean warmedUp = false;
 
     RateController() {
-        publishBacklogLimit = Env.getLong("PUBLISH_BACKLOG_LIMIT", 1_000);
-        receiveBacklogLimit = Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
+        this(null, null);
+    }
+
+    RateController(Long publishBacklogLimit, Long receiveBacklogLimit) {
+        this(publishBacklogLimit, receiveBacklogLimit, 1);
+    }
+
+    RateController(Long publishBacklogLimit, Long receiveBacklogLimit, long subscriptions) {
+        this.subscriptions = subscriptions;
+        this.publishBacklogLimit =
+                publishBacklogLimit != null
+                        ? publishBacklogLimit
+                        : Env.getLong("PUBLISH_BACKLOG_LIMIT", 1_000);
+        this.receiveBacklogLimit =
+                receiveBacklogLimit != null
+                        ? receiveBacklogLimit
+                        : Env.getLong("RECEIVE_BACKLOG_LIMIT", 1_000);
         minRampingFactor = Env.getDouble("MIN_RAMPING_FACTOR", 0.01);
         maxRampingFactor = Env.getDouble("MAX_RAMPING_FACTOR", 1);
         // Fraction of the offered rate the producer must reach before the controller starts
@@ -78,7 +98,7 @@ class RateController {
             }
         }
 
-        long receiveBacklog = totalPublished - totalReceived;
+        long receiveBacklog = subscriptions * totalPublished - totalReceived;
         if (receiveBacklog > receiveBacklogLimit) {
             return nextRate(periodNanos, received, expected, receiveBacklog, "Receive");
         }

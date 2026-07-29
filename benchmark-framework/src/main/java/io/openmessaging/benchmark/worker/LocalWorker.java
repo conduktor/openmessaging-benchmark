@@ -316,6 +316,10 @@ public class LocalWorker implements Worker, ConsumerCallback {
     @Override
     public void resetStats() throws IOException {
         stats.resetLatencies();
+        // Also the per-period counters, or the measurement window's first interval inherits everything
+        // published since the last getPeriodStats() call and reports a rate tens of times too high. The
+        // cumulative totals are left alone: a concurrent buildAndDrainBacklog reads those.
+        stats.resetPeriodCounters();
     }
 
     @Override

@@ -32,6 +32,7 @@ import io.openmessaging.benchmark.worker.commands.TopicSubscription;
 import io.openmessaging.benchmark.worker.commands.TopicsInfo;
 import java.io.IOException;
 import java.text.DecimalFormat;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -57,6 +58,8 @@ public class WorkloadGenerator implements AutoCloseable {
 
     private volatile double targetPublishRate;
 
+    private RampVerification rampVerification;
+
     public WorkloadGenerator(String driverName, Workload workload, Worker worker) {
         this.driverName = driverName;
         this.workload = workload;
@@ -65,6 +68,54 @@ public class WorkloadGenerator implements AutoCloseable {
         if (workload.consumerBacklogSizeGB > 0 && workload.producerRate == 0) {
             throw new IllegalArgumentException(
                     "Cannot probe producer sustainable rate when building backlog");
+        }
+
+        // Discovery judges a candidate rate partly on whether the consumers drain what was
+        // published, so with no consumers there is no drain signal and every candidate fails --
+        // the search then halves its way down to a meaningless near-zero "sustainable" rate. Both
+        // fields are primitive ints, so an omitted (or, since the YAML mapper runs with
+        // FAIL_ON_UNKNOWN_PROPERTIES disabled, a misspelled) field silently arrives as 0.
+        if (workload.producerRate == 0
+                && (workload.subscriptionsPerTopic == 0 || workload.consumerPerSubscription == 0)) {
+            throw new IllegalArgumentException(
+                    "Cannot discover a sustainable producer rate without consumers"
+                            + " (subscriptionsPerTopic="
+                            + workload.subscriptionsPerTopic
+                            + ", consumerPerSubscription="
+                            + workload.consumerPerSubscription
+                            + "): there is no drain signal to judge a candidate rate against."
+                            + " Set both to at least 1, or set a fixed producerRate.");
+        }
+
+        // The ramp knobs all default silently, so an out-of-range value shows up as a collapsed or
+        // runaway discovery rather than as an error. Reject the combinations that cannot work.
+        if (workload.rampMinThroughputRatio != null
+                && (workload.rampMinThroughputRatio <= 0 || workload.rampMinThroughputRatio > 1)) {
+            throw new IllegalArgumentException(
+                    "rampMinThroughputRatio must be in (0, 1] but was "
+                            + workload.rampMinThroughputRatio
+                            + ": it is the fraction of the target rate a candidate must achieve, and"
+                            + " the rate limiter's fixed schedule means published can never exceed"
+                            + " the target, so a ratio above 1 fails every candidate.");
+        }
+        if (workload.rampConvergenceTolerance != null
+                && (workload.rampConvergenceTolerance <= 0 || workload.rampConvergenceTolerance >= 1)) {
+            throw new IllegalArgumentException(
+                    "rampConvergenceTolerance must be in (0, 1) but was "
+                            + workload.rampConvergenceTolerance
+                            + ": confirmation holds run at lo x (1 - tolerance), so 1 or more drives"
+                            + " the confirmed rate to zero, and 0 never converges.");
+        }
+        if (workload.rampMaxBacklogFloor != null
+                && workload.rampMaxBacklogCeiling != null
+                && workload.rampMaxBacklogFloor > workload.rampMaxBacklogCeiling) {
+            throw new IllegalArgumentException(
+                    "rampMaxBacklogFloor ("
+                            + workload.rampMaxBacklogFloor
+                            + ") must not exceed rampMaxBacklogCeiling ("
+                            + workload.rampMaxBacklogCeiling
+                            + "): the limit is max(floor, min(rate x seconds, ceiling)), so the floor"
+                            + " would silently win and the ceiling never apply.");
         }
     }
 
@@ -83,17 +134,20 @@ public class WorkloadGenerator implements AutoCloseable {
             targetPublishRate = workload.producerRate;
         } else {
             // Producer rate is 0 and we need to discover the sustainable rate
-            targetPublishRate = 10000;
+            targetPublishRate =
+                    workload.rampStartRate != null ? workload.rampStartRate.doubleValue() : 10000.0;
 
-            executor.execute(
-                    () -> {
-                        // Run background controller to adjust rate
-                        try {
-                            findMaximumSustainableRate(targetPublishRate);
-                        } catch (IOException e) {
-                            log.warn("Failure in finding max sustainable rate", e);
-                        }
-                    });
+            if (workload.rampAlgorithm == RampAlgorithm.AIMD) {
+                executor.execute(
+                        () -> {
+                            // Run background controller to adjust rate
+                            try {
+                                findMaximumSustainableRate(targetPublishRate);
+                            } catch (IOException e) {
+                                log.warn("Failure in finding max sustainable rate", e);
+                            }
+                        });
+            }
         }
 
         ProducerWorkAssignment producerWorkAssignment = new ProducerWorkAssignment();
@@ -146,6 +200,10 @@ public class WorkloadGenerator implements AutoCloseable {
         }
 
         worker.startLoad(producerWorkAssignment);
+
+        if (workload.producerRate == 0 && workload.rampAlgorithm == RampAlgorithm.CHOP) {
+            runChopDiscovery();
+        }
 
         if (workload.warmupDurationMinutes > 0) {
             log.info("----- Starting warm-up traffic ({}m) ------", workload.warmupDurationMinutes);
@@ -223,7 +281,11 @@ public class WorkloadGenerator implements AutoCloseable {
         int controlPeriodMillis = 3000;
         long lastControlTimestamp = System.nanoTime();
 
-        RateController rateController = new RateController();
+        RateController rateController =
+                new RateController(
+                        workload.rampPublishBacklogLimit,
+                        workload.rampReceiveBacklogLimit,
+                        workload.subscriptionsPerTopic);
 
         while (!runCompleted) {
             // Check every few seconds and adjust the rate
@@ -247,10 +309,194 @@ public class WorkloadGenerator implements AutoCloseable {
         }
     }
 
+    /**
+     * Discovers the maximum sustainable rate via bracket + binary-chop + hold-and-verify
+     * (RampAlgorithm.CHOP), blocking until the search converges or hits its safety cap, so that
+     * warmup/measurement start at an already-verified, fixed rate instead of a rate still being
+     * adjusted.
+     */
+    private void runChopDiscovery() throws IOException {
+        int bracketPeriodSeconds =
+                workload.rampBracketPeriodSeconds != null ? workload.rampBracketPeriodSeconds : 3;
+        long pollMillis = TimeUnit.SECONDS.toMillis(bracketPeriodSeconds);
+
+        RampRateFinder finder = new RampRateFinder(workload);
+        double startRate = finder.getCurrentRate();
+        double appliedRate = startRate;
+        log.info(
+                "----- Ramp discovery (CHOP) starting: pollPeriod={}s {} -----",
+                bracketPeriodSeconds,
+                finder.describeConfig());
+        worker.adjustPublishRate(startRate);
+
+        // Drain the period counters and latency histograms once before the loop. They have been
+        // accumulating since the worker started -- through topic readiness probing and producer
+        // warm-up -- so without this the first poll attributes all of it to its own 2-second period and
+        // the diagnostic series opens with a spike that is pure artifact. The finder's own inputs are
+        // cumulative and unaffected either way.
+        worker.getPeriodStats();
+
+        long lastControlTimestamp = System.nanoTime();
+        long discoveryStartedAt = lastControlTimestamp;
+        boolean done = false;
+        boolean wasConfirming = finder.isConfirming();
+        Instant verificationStartedAt = null;
+
+        while (!done && !runCompleted) {
+            try {
+                Thread.sleep(pollMillis);
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            // getPeriodStats rather than getCountersStats: PeriodStats.totalMessagesSent/Received are
+            // the same cumulative sums CountersStats reports, so the finder's inputs are unchanged,
+            // but the same snapshot also carries the publish-delay and publish-latency histograms.
+            // One round trip instead of two, and -- the reason it matters -- the counters and the
+            // latency describe the same instant, so the diagnostic series below has no skew between
+            // them. Draining the period histograms here is safe: nothing else reads them during
+            // discovery, and worker.resetStats() clears every latency recorder before the measurement
+            // window begins.
+            PeriodStats stats = worker.getPeriodStats();
+            long currentTime = System.nanoTime();
+            long periodNanos = currentTime - lastControlTimestamp;
+            lastControlTimestamp = currentTime;
+
+            // The rate this period actually ran at, captured before poll() can choose the next one.
+            double rateDuringPeriod = appliedRate;
+
+            // Publish delay goes in too: it is not a verdict input, but recovery after a failed
+            // candidate cannot be judged without it. Work queued in the producer client has not been
+            // published, so it contributes nothing to receive backlog -- the drain would otherwise call
+            // itself recovered while the producer is still seconds behind its own schedule.
+            done =
+                    finder.poll(
+                            periodNanos,
+                            stats.totalMessagesSent,
+                            stats.totalMessagesReceived,
+                            stats.publishDelayLatency.getValueAtPercentile(99));
+
+            logDiscoveryPoll(currentTime - discoveryStartedAt, rateDuringPeriod, periodNanos, stats);
+
+            // Only re-apply on an actual change. adjustPublishRate builds a fresh
+            // UniformRateLimiter, which resets its virtual schedule -- calling it every poll threw
+            // away publish-delay accumulation every few seconds, and publish delay is the signal
+            // this file's own integration test uses to decide whether a rate was sustainable.
+            if (finder.getCurrentRate() != appliedRate) {
+                appliedRate = finder.getCurrentRate();
+                worker.adjustPublishRate(appliedRate);
+            }
+
+            if (!wasConfirming && finder.isConfirming()) {
+                verificationStartedAt = Instant.now();
+            }
+            wasConfirming = finder.isConfirming();
+        }
+
+        // The bracket phase halves on every failure, so a run where nothing ever holds cleanly ends
+        // with currentRate at startRate / 2^n and no lo to fall back on. Reporting that would hand
+        // the measurement window a near-zero rate (LocalWorker clamps anything below 1 to 1 msg/s)
+        // and then certify it -- the shape of a reproduced field incident. There is no answer here,
+        // so say so rather than inventing one.
+        if (finder.getLo() == null) {
+            throw new IllegalStateException(
+                    "Ramp discovery found no candidate rate that held cleanly, starting from "
+                            + startRate
+                            + " msg/s and halving down to "
+                            + finder.getCurrentRate()
+                            + " msg/s. Check that consumers are draining, and that the verdict"
+                            + " thresholds (rampVerdict, backlog limits / rampMinThroughputRatio)"
+                            + " are not impossibly strict for this setup.");
+        }
+
+        // The measurement window runs at whatever rate discovery settled on. The loop above already
+        // applied it on its final iteration; re-applying makes the contract explicit rather than
+        // incidental.
+        worker.adjustPublishRate(finder.getCurrentRate());
+
+        if (finder.isConfirmed() && !finder.isNonMonotonic()) {
+            Instant verificationConfirmedAt = Instant.now();
+            rampVerification = new RampVerification();
+            // Report what the confirmation hold actually delivered, not what it was asked for. The
+            // two agree at a sustainable rate; where they disagree, the achieved figure is the one
+            // that is true, and it is the figure the epoch window below actually brackets.
+            rampVerification.rate = finder.lastHoldAchievedRate();
+            rampVerification.startEpochMillis = verificationStartedAt.toEpochMilli();
+            rampVerification.endEpochMillis = verificationConfirmedAt.toEpochMilli();
+            rampVerification.nonMonotonic = false;
+            log.info(
+                    "----- CHOP verification window: {} -> {} (rate {} msg/s) -----",
+                    verificationStartedAt,
+                    verificationConfirmedAt,
+                    finder.getCurrentRate());
+        }
+
+        if (finder.isSafetyCapped()) {
+            // Without this, a discovery that simply ran out of time logs exactly like one that
+            // converged -- the rate is reported either way and rampVerification is quietly absent.
+            log.warn(
+                    "Ramp discovery hit its {} minute budget (rampMaxDiscoveryMinutes) before"
+                            + " converging; reporting the best rate that held ({} msg/s) without a"
+                            + " confirmation. This is not a verified result -- raise the budget, or"
+                            + " shorten rampHoldSeconds/rampBracketHoldSeconds, to let it finish.",
+                    workload.rampMaxDiscoveryMinutes != null ? workload.rampMaxDiscoveryMinutes : 10,
+                    finder.getCurrentRate());
+        }
+
+        if (finder.isNonMonotonic()) {
+            // A discovery that contradicted itself anywhere isn't verified, however it ended --
+            // rampVerification is deliberately withheld above rather than reporting a specific
+            // rate that might not reproduce.
+            log.warn(
+                    "Ramp discovery detected non-monotonic backlog behavior -- {} msg/s may not"
+                            + " reproduce reliably; rampVerification will not be attached to the"
+                            + " result. Treat this as a band rather than an exact figure.",
+                    finder.getCurrentRate());
+        }
+        log.info("----- Ramp discovery (CHOP) complete: {} msg/s -----", finder.getCurrentRate());
+    }
+
     @Override
     public void close() throws Exception {
         worker.stopAll();
         executor.shutdownNow();
+    }
+
+    // A per-poll diagnostic series covering the whole of discovery: one line per
+    // rampBracketPeriodSeconds carrying the four signals needed to locate a knee -- the rate asked
+    // for, the rate achieved, the backlog, and publish delay.
+    //
+    // FINDER-HOLD already records every verdict, but at hold granularity (45s is a typical setting)
+    // and with no latency at all, because the finder is handed counters and never sees any. Neither
+    // is
+    // enough to see *where* the knee is: backlog and publish delay start moving well before a hold's
+    // aggregate verdict flips, which is the whole reason a hold's aggregate can accept a rate that
+    // the
+    // measurement window then fails on. INFO to match RateController's FINDER-TRACE, which likewise
+    // emits per control period regardless of the active log4j2 config.
+    private void logDiscoveryPoll(
+            long elapsedNanos, double rateDuringPeriod, long periodNanos, PeriodStats stats) {
+        double periodSeconds = periodNanos / (double) TimeUnit.SECONDS.toNanos(1);
+        long backlog =
+                Math.max(
+                        0L,
+                        workload.subscriptionsPerTopic * stats.totalMessagesSent - stats.totalMessagesReceived);
+        log.info(
+                "FINDER-POLL t={} rate={} achieved={} backlog={} delayP50Ms={} delayP99Ms={}"
+                        + " delayMaxMs={} latencyP99Ms={}",
+                TimeUnit.NANOSECONDS.toSeconds(elapsedNanos),
+                String.format("%.0f", rateDuringPeriod),
+                String.format("%.0f", stats.messagesSent / periodSeconds),
+                backlog,
+                millisFromMicros(stats.publishDelayLatency.getValueAtPercentile(50)),
+                millisFromMicros(stats.publishDelayLatency.getValueAtPercentile(99)),
+                millisFromMicros(stats.publishDelayLatency.getMaxValue()),
+                millisFromMicros(stats.publishLatency.getValueAtPercentile(99)));
+    }
+
+    // Composes with the existing microsToMillis(long) rather than restating the conversion.
+    private static String millisFromMicros(long micros) {
+        return String.format("%.1f", microsToMillis(micros));
     }
 
     private void createConsumers(List<String> topics) throws IOException {
@@ -382,6 +628,7 @@ public class WorkloadGenerator implements AutoCloseable {
                         : workload.messageSize;
         result.producersPerTopic = workload.producersPerTopic;
         result.consumersPerTopic = workload.consumerPerSubscription;
+        result.rampVerification = rampVerification;
 
         while (true) {
             try {

@@ -144,6 +144,29 @@ public class WorkerStats {
         endToEndCumulativeLatencyRecorder.reset();
     }
 
+    /**
+     * Clears the per-period counters, leaving the cumulative totals alone.
+     *
+     * <p>printAndCollectStats derives each interval's rate as {@code periodStats.messagesSent / (now
+     * - previousPoll)}, but messagesSent accumulates until something calls toPeriodStats(). If
+     * nothing does so between startLoad() and the measurement window's first poll -- which is exactly
+     * what an AIMD ramp does, since its control loop reads getCountersStats() -- the first interval
+     * divides every message published during discovery by one 10-second period. Observed at
+     * 15,439,670 msg/s against a steady-state 481,000 on a producerRate: 0 run.
+     *
+     * <p>Deliberately not reset(), which also clears totalMessagesSent/totalMessagesReceived.
+     * buildAndDrainBacklog is launched *before* resetStats() and runs concurrently for the whole
+     * test, computing its remaining backlog from those totals; clearing them mid-flight would
+     * collapse its backlog to zero and let it conclude the drain had finished.
+     */
+    public void resetPeriodCounters() {
+        messagesSent.reset();
+        messageSendErrors.reset();
+        bytesSent.reset();
+        messagesReceived.reset();
+        bytesReceived.reset();
+    }
+
     public void reset() {
         resetLatencies();
 

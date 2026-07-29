@@ -19,6 +19,10 @@
     <Bug pattern="UWF_UNWRITTEN_PUBLIC_OR_PROTECTED_FIELD" />
   </Match>
   <Match>
+    <Class name="io.openmessaging.benchmark.RampVerification" />
+    <Bug pattern="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD" />
+  </Match>
+  <Match>
     <Class name="io.openmessaging.benchmark.driver.jms.JMSBenchmarkConsumer" />
     <Bug pattern="EI_EXPOSE_REP2" />
   </Match>

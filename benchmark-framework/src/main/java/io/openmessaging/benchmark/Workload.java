@@ -61,6 +61,207 @@ public class Workload {
     public int producerRate;
 
     /**
+     * The following fields only apply when producerRate == 0, i.e. when the generator probes for the
+     * maximum sustainable rate (a "ramp test"). Leave unset to fall back to the existing env-var /
+     * hardcoded defaults.
+     */
+    public RampAlgorithm rampAlgorithm = RampAlgorithm.AIMD;
+
+    public RampVerdict rampVerdict = RampVerdict.BACKLOG;
+
+    // Minimum fraction of target throughput (and of consumer drain) a candidate must achieve over a
+    // hold to count as clean under rampVerdict: THROUGHPUT. Null -> default 0.95 in RampRateFinder.
+    public Double rampMinThroughputRatio;
+
+    /** Initial probe rate for ramp discovery. Defaults to 10000 if unset. */
+    public Integer rampStartRate;
+
+    /**
+     * Publish backlog limit used by ramp discovery. Defaults to env PUBLISH_BACKLOG_LIMIT, else 1000.
+     */
+    public Long rampPublishBacklogLimit;
+
+    /**
+     * Receive backlog limit used by ramp discovery. Defaults to env RECEIVE_BACKLOG_LIMIT, else 1000.
+     */
+    public Long rampReceiveBacklogLimit;
+
+    /**
+     * CHOP only: backlog limit expressed as seconds' worth of the candidate rate (limit = currentRate
+     * * rampMaxBacklogSeconds) instead of a fixed message count, so the check is equally strict at
+     * every rate tested during the bracket phase's exponential range. When set, this replaces
+     * rampPublishBacklogLimit/rampReceiveBacklogLimit for CHOP.
+     *
+     * <p>Defaults to 0.5. Explicitly null falls back to the fixed counts, which is almost never what
+     * you want: at 1,100,000 msg/s the 1,000-message default is 0.9 milliseconds of tolerance, and
+     * any real cluster carries far more than that in flight while perfectly healthy -- so every
+     * candidate breaches and the search halves to nothing. That was the shipped default until the AKS
+     * trials, every one of which had to set this by hand to get a usable number.
+     */
+    public Double rampMaxBacklogSeconds = 0.5;
+
+    /**
+     * CHOP only: hard floor (in messages) on the limit rampMaxBacklogSeconds computes. Without it, a
+     * single early false failure halves the candidate rate and, in the same stroke, halves the
+     * tolerance too -- the wrong direction for a recovery mechanism -- letting one bad reading
+     * cascade all the way down to a near-zero "confirmed" rate. Defaults to 1000, matching the old
+     * fixed-count default so the relative check can never become stricter than a fixed-count check
+     * would have been. Only meaningful when rampMaxBacklogSeconds is set.
+     *
+     * <p>Note the interaction with a low rampStartRate: the limit scales with the *candidate* rate,
+     * so early bracket candidates get small limits. A topology carrying a large *standing* backlog --
+     * one the consumers keep pace with but never close -- can therefore fail every early candidate
+     * and stop bracket climbing at all. Raise this above that standing depth, raise rampStartRate
+     * past it, or use rampVerdict: THROUGHPUT, which is the one shape that verdict genuinely handles
+     * better.
+     */
+    public Long rampMaxBacklogFloor;
+
+    /**
+     * CHOP only: hard cap (in messages) on the limit rampMaxBacklogSeconds computes, so the tolerance
+     * can't grow unbounded as bracket's exponential doubling searches far past the real ceiling --
+     * without it, a high enough candidate rate can make the relative check tolerate an enormous
+     * backlog and report a wildly implausible "confirmed" rate. Only meaningful when
+     * rampMaxBacklogSeconds is set. Defaults to 500000.
+     *
+     * <p>Watch the interaction with rampMaxBacklogSeconds: the limit is {@code max(floor, min(rate x
+     * seconds, ceiling))}, so once {@code rate x seconds} exceeds the ceiling the ceiling wins and
+     * the limit stops scaling with rate. At the 100000 this used to default to, that happened above
+     * roughly 200000 msg/s -- an AKS run asking for 0.5s at 589000 msg/s silently got 0.17s worth,
+     * which is what tripped its one false failure. If you run above 1000000 msg/s, raise this too or
+     * the rate-scaled limit quietly becomes a fixed count again.
+     */
+    public Long rampMaxBacklogCeiling;
+
+    /** CHOP only: seconds between bracket-phase steps / hold-phase polls. Defaults to 3. */
+    public Integer rampBracketPeriodSeconds;
+
+    /**
+     * CHOP only: seconds to run at rampStartRate before backlog is evaluated at all, so a
+     * consumer-group rebalance tail or producer connection warm-up still settling right after the
+     * load starts can never be mistaken for the candidate rate being unsustainable. Defaults to 30.
+     */
+    public Integer rampSettleSeconds;
+
+    /**
+     * CHOP only: seconds a bracket-phase candidate (the exponential doubling/halving search that
+     * finds the initial [lo, hi] window) must hold clean before being accepted. Defaults to 20, or
+     * rampHoldSeconds if that is shorter.
+     *
+     * <p>Bracket only has to *locate* the knee, and overload announces itself in a poll or two -- an
+     * AKS arm went from ~1,300 messages of backlog to ~74,800 in a single 3-second poll the moment a
+     * candidate genuinely exceeded capacity. Whenever this is shorter than rampHoldSeconds, chop
+     * re-verifies lo at full length before narrowing anything, which is what makes a cheap probe
+     * safe: lo only ever moves upward, so an over-confirmed lo could otherwise never be undone.
+     * Measured on the AKS geometry, 90s probes cost 1,494s of discovery against 942s for 20s -- a 37%
+     * saving with every variant converging on the identical rate.
+     */
+    public Integer rampBracketHoldSeconds;
+
+    /**
+     * CHOP only: upper bound, in seconds, on the recovery period run after a candidate rate fails. A
+     * failed candidate leaves the system carrying its overshoot (deep queues, consumer lag, GC
+     * pressure); judging the next candidate immediately measures that fallout instead of the
+     * candidate, and since the bracket phase only ever raises lo, one contaminated reading cannot be
+     * recovered from. During recovery the load runs at the highest rate already known to be
+     * sustainable and nothing is evaluated. This is a cap, not a fixed wait: recovery ends as soon as
+     * the backlog is back within the limit it is judged against, so when there is nothing to drain it
+     * costs a single poll.
+     *
+     * <p>Defaults to the resolved rampHoldSeconds, i.e. on. Set 0 to disable. The AKS trial showed
+     * what leaving it off costs: its encrypt arm rejected eight consecutive candidates in 24 seconds,
+     * none of them measured, each failing on the previous candidate's undrained overshoot rather than
+     * on its own rate -- and the achievedRatio of those holds read 1.03-1.13, i.e. published
+     * exceeding target, which only happens when a queue from a higher previous rate is still
+     * emptying.
+     *
+     * <p>Recovery is skipped entirely while the bracket phase is still halving downward, because
+     * there is no known-good rate to drain at yet: draining at the next candidate guarantees nothing,
+     * since it may itself be above capacity, and the recovery test would then never pass.
+     *
+     * <p>Known gap: the recovery test looks only at cumulative *receive* backlog. Messages still
+     * queued in the producer client (buffer.memory, commonly 64MB) have not been published, so they
+     * contribute no receive backlog and recovery can be declared while the producer is still seconds
+     * behind its own schedule. See the trial log.
+     */
+    public Integer rampDrainSeconds;
+
+    /**
+     * CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 120.
+     *
+     * <p>This is the setting that decides whether a broker can absorb an oversubscribed rate for the
+     * whole hold and so look clean. A broker acks at the full target rate until its page cache,
+     * batching and socket buffers saturate; only then does throughput droop. A hold shorter than that
+     * absorption time accepts a rate the measurement window afterwards fails on, and no verdict
+     * predicate can detect it from inside the hold.
+     *
+     * <p>Two things bound it, and neither is a round number. The hold must outlast absorption; and
+     * rampMinThroughputRatio caps the detectable overshoot at about 5%, since a candidate 3% over
+     * capacity asymptotes to ~0.97 and never crosses 0.95 however long you hold it. Past roughly
+     * twice the absorption time, longer buys nothing.
+     *
+     * <p>120 comes from measurement: across 18 full-length passing holds on AKS every verdict was
+     * settled by 60 seconds, 11 of them sitting within 0.01 of their final ratio from 30s onward. It
+     * is not universal -- absorption scales with the cluster's cache -- but it is calibratable in one
+     * run rather than guessed. See RATE_FINDING.md, "Calibrating rampHoldSeconds".
+     */
+    public Integer rampHoldSeconds;
+
+    /**
+     * CHOP only: number of consecutive clean confirmation holds required at the same rate before
+     * accepting it, beyond the initial tolerance-meeting hold. Defaults to 1. Raising this trades
+     * discovery time for confidence that the accepted rate isn't a one-off pass.
+     */
+    public Integer rampConfirmationHolds;
+
+    /**
+     * CHOP only: how many *consecutive* polls must breach the backlog limit before a candidate is
+     * failed. Defaults to 2. Only applies to rampVerdict: BACKLOG, which is the mode that decides
+     * per-poll; THROUGHPUT is decided once at hold completion and is unaffected.
+     *
+     * <p>1 restores the old behaviour of condemning a candidate on a single sample. That is a coin
+     * toss near the boundary, and because nothing ever reopens hi, the mistake is permanent: on AKS a
+     * 640,000 msg/s candidate ran seven consecutive healthy polls, dipped for one poll 10% past the
+     * limit, and capped the whole search 7% low -- on a hold whose own aggregate was 99.13% of
+     * target. Genuine overload does not look like that; the same trial measured backlog jumping ~57x
+     * in one poll and then staying elevated for 12-15s. So the second poll costs almost nothing
+     * against a real failure and rejects a transient outright.
+     */
+    public Integer rampBreachPolls;
+
+    /** CHOP only: relative (hi - lo) / lo band at which to stop chopping. Defaults to 0.05. */
+    public Double rampConvergenceTolerance;
+
+    /**
+     * CHOP only: when a candidate rate fails, seed the next candidate from the throughput that
+     * candidate actually achieved rather than bisecting the bracket blindly. A failed hold has
+     * already measured what the system can do -- published / elapsed is a direct capacity estimate --
+     * so bisection throws away a measurement the run just paid for.
+     *
+     * <p>The estimate is only used when it is informative and safe: it must sit at least
+     * rampConvergenceTolerance below the rate that just failed (a candidate that failed on consumer
+     * lag while publishing at its full target says nothing about producer capacity, and a seed within
+     * the tolerance band is inside the noise the search already ignores), and strictly above the
+     * highest rate already known to hold. Otherwise the bracket is bisected as before.
+     *
+     * <p>Defaults to true: ~12% less discovery time with no measured accuracy cost, and it fired
+     * correctly on every AKS arm whose failures were producer-side. Set false to bisect blindly.
+     */
+    public Boolean rampSeedFromAchievedRate;
+
+    /**
+     * CHOP only: safety cap on total discovery time, in minutes. Defaults to 45.
+     *
+     * <p>Coupled to rampHoldSeconds. Under rampVerdict: THROUGHPUT there is no per-poll fast-fail, so
+     * every candidate costs a full hold -- including the bracket phase's doomed 2x overshoots -- and
+     * a search from the default start rate to a 7-figure ceiling runs roughly 15 holds. Budget about
+     * {@code settle + 15 x rampHoldSeconds}, plus the drain if rampDrainSeconds is set. Hitting the
+     * cap is not a failure: discovery reports the best rate that held, having never confirmed it,
+     * with a WARN and no rampVerification attached.
+     */
+    public Integer rampMaxDiscoveryMinutes;
+
+    /**
      * If the consumer backlog is > 0, the generator will accumulate messages until the requested
      * amount of storage is retained and then it will start the consumers to drain it.
      *
