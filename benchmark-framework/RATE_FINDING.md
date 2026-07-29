@@ -512,6 +512,36 @@ single anomalous interval can still arise for ordinary reasons — a GC pause, a
 prefer the median over the mean when you want "the rate this window sustained". Latency figures were
 never affected: `resetLatencies()` always cleared both the interval and cumulative recorders.
 
+### Resource-bound paths: a confirmed rate can sit at the edge of a hard resource limit
+
+CHOP verifies a candidate from the producer's and consumer's own counters. It cannot see the resource
+that is actually the bottleneck -- e.g. the gateway CPU on an encrypting proxy path. When that resource
+is the wall, a rate can be confirmed cleanly and still fail to reproduce.
+
+A gateway campaign made this concrete. CHOP confirmed **129,326 msg/s** for an encrypting arm; a later
+fixed-rate confirmation at that exact target sustained only **~96,000** (75%), with the gateway pegged
+at its 2-core limit and p99 publish latency at 46 s. It was not a measurement artifact: during discovery
+the rate held for ~7.5 minutes with backlog of 1--2 K messages and publish delay of ~31 microseconds --
+clean by every producer/consumer signal. The difference was the gateway CPU, which CHOP never sees: even
+in the good run it peaked at **1.82 of 2.0 cores (91%)** and was already throttling. 129k simply sits at
+the edge of the encryption CPU budget (encryption here is per-*message*-bound -- 2 pegged cores move only
+~9.6 MB/s of 100-byte messages), where ordinary run-to-run variance flips the outcome between sustainable
+and saturated. Broker health and arm ordering were ruled out; both were the same across the runs.
+
+No producer/consumer-side gate can catch this -- not the backlog check, not the `THROUGHPUT` ratio, not a
+latency gate -- because at ramp time the wall is *approached, not breached*: throughput, backlog, and
+delay are all genuinely clean at 91% CPU. The only signal that reveals the fragility is the bottleneck
+resource's own utilization.
+
+**Direction (not yet implemented): a resource-headroom gate.** Reject or derate a candidate whose
+bottleneck-resource utilization during the confirming hold exceeds a headroom threshold (~85%). It can be
+applied harness-side with no finder change -- `rampVerification` already carries the confirmation window,
+and the harness already samples resource metrics over exactly that window (`chop-verify.metrics.json`);
+derate to `target x (headroom / observed_peak)` (~120k here) and re-confirm. This is complementary to the
+verdict choice: the verdict decides what "kept up" means; the headroom gate refuses a rate that kept up
+only by consuming the last of a hard resource. Full design in
+[`docs/superpowers/specs/2026-07-24-chop-throughput-verdict-design.md`](../docs/superpowers/specs/2026-07-24-chop-throughput-verdict-design.md).
+
 ### Trial log
 
 The specific runs behind several of the guards above -- the two backlog-tolerance incidents, the

@@ -158,3 +158,86 @@ correct, scale-free verdict.
 - `benchmark-framework/RATE_FINDING.md` — algorithm docs and the two "Trial finding" incidents.
 - AKS run 30103329337 (`conduktor/benchmarks`) — the re-validation that produced the data above.
 
+---
+
+## Update (2026-07-29): AKS validation findings and revised direction — resource-headroom gate
+
+Two AKS campaigns after the design above changed the conclusion. Recording them here because they
+supersede the "THROUGHPUT verdict fixes the over-estimate" framing for at least one important class
+of load.
+
+### What the runs showed
+
+1. **THROUGHPUT did not beat BACKLOG on a same-cluster comparison** (run 30256170166): `chop-throughput`
+   confirmed 2,363 msg/s vs `chop-backlog` 2,383 — essentially identical, both far below AIMD's ~17k.
+   The scale-free verdict was not the improvement it was designed to be on that cluster.
+
+2. **A gateway confirmation campaign** (ramp = report10, fixed-rate confirm = report11) set each arm's
+   target from a CHOP (`BACKLOG`) ramp, then re-ran at that fixed target with repeats:
+
+   |     Arm     | CHOP target | Confirmed (sustained)  |    Gateway CPU (limit 2.0)     |      Verdict      |
+   |-------------|-------------|------------------------|--------------------------------|-------------------|
+   | direct      | 1,156,448   | ~1,165,446 (101%)      | ~0.02 cores (bypasses gateway) | sustainable       |
+   | transparent | 1,177,897   | 1,088,637 (92%)        | —                              | close             |
+   | encrypt     | 129,326     | 96,414 (75%), 46 s p99 | **2.0 pegged, throttled**      | **over-estimate** |
+
+### Why `encrypt` over-estimated — it is NOT a verdict-signal problem
+
+During the CHOP **ramp**, 129k for `encrypt` was clean by *every* producer/consumer signal, sustained
+for ~7.5 min: backlog 0.6–5.9 K messages, publish-delay ~31 **microseconds** (flat), pub-latency
+5–25 ms, gateway CPU **mean 1.47 / max 1.82 of 2.0 cores** (throttle 4.3/s). In the fixed-rate
+**confirm**, the same 129k saturated: gateway 2.0 pegged (throttle ~10/s), backlog ~300 K,
+publish-delay 6→60 s, achieved 96k.
+
+Ruled out as the cause: **broker health** (broker CPU 0.3–0.5 cores and produce-time ~0 ms in both;
+not degraded), **arm ordering** (encrypt ran last in both), **node hardware** (same dedicated
+`aks-gateway` node pool / VM family in both).
+
+Root cause: **129k sits at the very edge of the gateway's 2-core encryption budget.** Even in the
+successful ramp the gateway peaked at 1.82/2.0 = **91%** and was already throttling. Encryption is
+per-*message*-bound (2 pegged cores sustain only ~9.6 MB/s of 100-byte messages — <1% of raw AES-NI),
+so per-message cost is high and nearly size-independent. At ~90–100% of a hard resource limit, small
+run-to-run variance (GC/JIT/cgroup-throttle scheduling) flips the outcome sustainable ↔ saturated.
+
+**Consequence for the design:** none of the producer/consumer-side gates — the `THROUGHPUT` ratio,
+nor the proposed queue/latency/backlog-trend gates — could have caught this at ramp time, because the
+CPU wall was *approached but not breached* (91%), so throughput, backlog, and delay were all
+genuinely clean. Throughput-side signals cannot see a resource ceiling until it is crossed. The only
+signal that revealed the fragility was the **gateway CPU utilization itself (91%, throttling)**, which
+`RampRateFinder` never sees — it consumes only worker counters.
+
+### Revised direction: gate on bottleneck-resource headroom
+
+Reject or derate a candidate whose **bottleneck resource utilization** during the confirming hold
+exceeds a headroom threshold (e.g. 85%), independent of the throughput/backlog/latency signals.
+
+Two ways to apply it:
+
+- **Harness-side, post-hoc (recommended; no CHOP change).** `RampRateFinder` already emits
+  `rampVerification` with the confirmation-window timestamps, and the harness already captures
+  `chop-verify.metrics.json` — a Prometheus resource sample over exactly that window. The harness
+  computes peak (or p95) utilization of the bottleneck resource (gateway `container_cpu_usage /
+  cpu_limit_cores`) and: (a) **flags** the result when > threshold ("confirmed at 91% gateway CPU —
+  low headroom, may not reproduce"), and/or (b) **derates** the recommended target to leave headroom:
+  `target' = target × (headroom_target / observed_peak_util)`. For encrypt that is
+  `129k × (0.85 / 0.91) ≈ 120k`, and ideally a short re-confirm at 120k. This keeps OMB generic (it
+  never learns about "gateway CPU"), uses data already collected, and needs no change to the finder.
+
+- **In-loop (larger change).** Give the finder a pluggable `ResourceHeadroomProvider` — a callback
+  returning current bottleneck utilization [0,1], default a no-op returning 0 — and have the verdict
+  fail/derate when utilization exceeds the threshold. This lets headroom shape *discovery* (bracket
+  stops climbing once the resource nears its limit) rather than only correcting the reported number
+  after the fact. More invasive and adds a live-scrape dependency; the harness injects the provider,
+  so OMB stays infra-agnostic.
+
+The bottleneck resource is topology-dependent (gateway CPU for `encrypt`; broker CPU/disk/NIC for
+`direct`). The harness knows the topology, which is another reason the harness-side application is the
+natural home. This gate is complementary to — not a replacement for — the `THROUGHPUT` verdict: the
+verdict addresses scale/count blindness; the headroom gate addresses confirming rates that sit at the
+edge of a hard resource limit.
+
+### References (this update)
+
+- report10 (`conduktor/benchmarks`) — CHOP `BACKLOG` ramp that set the confirmation targets.
+- report11 — fixed-rate confirmation with repeats (direct/transparent/encrypt).
+
