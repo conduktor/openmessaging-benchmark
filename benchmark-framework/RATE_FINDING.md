@@ -75,27 +75,29 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
 2. **Bracket** — starting at `rampStartRate`, double the rate every poll while backlog stays
    clean. A breach is immediately actionable (fail-fast, no need to hold out a rate that's already
    failing) and sets a known-bad `hi`; a clean reading must hold for `rampBracketHoldSeconds`
-   (defaults to the resolved `rampHoldSeconds`) before being accepted as the known-good `lo`. Handles
-   the reverse case too — if even the start rate is already overloaded, it halves downward until it
-   finds a clean `lo`.
+   (default 20s) before being accepted as the known-good `lo`. Handles the reverse case too — if even
+   the start rate is already overloaded, it halves downward until it finds a clean `lo`.
 
-   **Shortening `rampBracketHoldSeconds` is the main speed lever, and it is safe.** When bracket holds
-   for less time than chop, the first thing chop does is re-run `lo` at *full* length before narrowing
-   anything — the probe locates the bracket, the full hold certifies it. That matters because `lo` only
-   ever moves upward, so an over-confirmed `lo` could otherwise never be undone. If the re-verification
+   **The bracket probe is deliberately much shorter than a chop hold, and that is safe.** Whenever it
+   is shorter, the first thing chop does is re-run `lo` at *full* length before narrowing anything — the
+   probe locates the bracket, the full hold certifies it. That matters because `lo` only ever moves
+   upward, so an over-confirmed `lo` could otherwise never be undone. If the re-verification
    fails, `hi` becomes that `lo` and the search drops back to the highest rate history records as
    passing below it. A short probe disagreeing with a full hold does *not* set `isNonMonotonic()`:
    verdicts of different rigor are different measurements, not a contradiction. Measured on the AKS
-   run's geometry (5,000 msg/s start, 180s chop holds, hard 589k ceiling): 90s probes cost 1,494s of
+   run's geometry (5,000 msg/s start, full-length chop holds, hard 589k ceiling): 90s probes cost 1,494s of
    discovery, 45s cost 1,134s (−24%), 20s cost 942s (−37%), 9s cost 846s (−43%) — all four converging
    on the identical rate.
 
 3. **Chop** — binary search the `[lo, hi]` bracket. Each candidate is held for `rampHoldSeconds`
-   (default 180s), not just glanced at — a single reactive snapshot (AIMD's approach) isn't enough
-   to know a rate actually holds.
+   (default 120s), not just glanced at — a single reactive snapshot (AIMD's approach) isn't enough
+   to know a rate actually holds. The re-verification above is load-bearing rather than theoretical: on
+   AKS a 20s probe passed 1,280,000 msg/s at a ratio of 0.999, and the full-length re-run of the same
+   rate failed it at 0.883 — the search went on to confirm 1,153,675, so the probe had over-confirmed
+   `lo` by 11%.
 
-   Optionally (`rampSeedFromAchievedRate: true`, default off) the candidate after a *failed* hold is
-   taken from the throughput that hold actually achieved rather than from the midpoint. A hold that
+   The candidate after a *failed* hold is taken from the throughput that hold actually achieved rather
+   than from the midpoint (`rampSeedFromAchievedRate`, on by default; set false to bisect blindly). A hold that
    asked for 800k msg/s and managed 600k has already measured the system; bisecting to 700k spends
    another full hold rediscovering that. The estimate is only used when it is informative and safe —
    at least `rampConvergenceTolerance` below the rate that just failed, and strictly above the
@@ -221,37 +223,41 @@ check publish delay in the measurement window before believing the rate.
 
 ### Configuration (workload YAML fields, all optional, only apply when `producerRate: 0`)
 
-**The defaults are tuned to finish quickly and still be trustworthy, from the AKS trial data** — six
-cells took 15–22 minutes of discovery under `BACKLOG` on these settings. Three carry most of that:
-`rampMaxBacklogSeconds: 0.5` (a rate-scaled limit; the old fixed-count fallback capped the answer ~5x
-low above 200k msg/s), `rampBracketHoldSeconds: 20` (−37% discovery, safe because `lo` is re-verified at
-full length), and `rampSeedFromAchievedRate: true` (−12%, no accuracy cost).
+**Every default here comes from the AKS trial data rather than from caution.** The ones that matter:
 
-`rampHoldSeconds` is deliberately *not* tuned down. It is the one setting measured to move the answer
-rather than the clock, and it has to exceed the time your broker can absorb an oversubscribed rate —
-a property of its cache, not something the finder can discover.
+- `rampMaxBacklogSeconds: 0.5` — a rate-scaled limit. The old fixed-count fallback was 0.9 *milliseconds*
+  of tolerance at 1.1M msg/s and capped the answer ~5x low above 200k msg/s.
+- `rampBracketHoldSeconds: 20` — bracket only locates the knee; `lo` is re-verified at full length before
+  chop narrows anything. Worth −37% discovery against a 90s probe, converging on the identical rate.
+- `rampSeedFromAchievedRate: true` — −12%, no measured accuracy cost.
+- `rampHoldSeconds: 120` — see "Calibrating `rampHoldSeconds`" below. This is the setting to change if
+  you change one; the rest travel well between clusters and this one does not.
 
-|           Field            |                Default                 |                                                                                                                                                                                                                                                   Applies to                                                                                                                                                                                                                                                   |
-|----------------------------|----------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `rampAlgorithm`            | `AIMD`                                 | Selects the algorithm                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `rampVerdict`              | `BACKLOG`                              | CHOP only — selects the clean/not-clean predicate for holds; `THROUGHPUT` is the scale-free alternative (see "Verdict modes" above). AIMD never builds a `RampRateFinder`, so this field has no effect on it                                                                                                                                                                                                                                                                                                   |
-| `rampMinThroughputRatio`   | 0.95                                   | CHOP only — THROUGHPUT verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `rampStartRate`            | 10000                                  | Both                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `rampReceiveBacklogLimit`  | env `RECEIVE_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `rampMaxBacklogSeconds`    | 0.5                                    | CHOP only — when set, replaces the two fields above with a limit that scales with the candidate rate (`limit = clamp(currentRate * rampMaxBacklogSeconds, rampMaxBacklogFloor, rampMaxBacklogCeiling)`), so the check is equally strict at every rate tried during bracket's exponential range instead of being loose at high rates and tight at low ones                                                                                                                                                      |
-| `rampMaxBacklogFloor`      | 1000                                   | CHOP only — hard floor (messages) on the limit `rampMaxBacklogSeconds` computes, matching the old fixed-count default so the relative check can never become stricter than a fixed-count check would have been at any rate; only meaningful when `rampMaxBacklogSeconds` is set (see the trial log)                                                                                                                                                                                                            |
-| `rampMaxBacklogCeiling`    | 500000                                 | CHOP only — hard cap (messages) on the same limit; only meaningful when `rampMaxBacklogSeconds` is set (see the trial log for why this exists)                                                                                                                                                                                                                                                                                                                                                                 |
-| `rampBracketPeriodSeconds` | 3                                      | CHOP only — poll cadence, not a hold duration                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `rampSettleSeconds`        | 30                                     | CHOP only — grace period at start before backlog counts at all                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `rampBracketHoldSeconds`   | 20 (or `rampHoldSeconds` if shorter)   | CHOP only — how long a bracket candidate must hold clean; shorten independently once you trust bracket's coarser candidates need less scrutiny                                                                                                                                                                                                                                                                                                                                                                 |
-| `rampDrainSeconds`         | resolved `rampHoldSeconds`             | CHOP only — cap on the recovery period run after a *failed* candidate, at the highest rate already known to hold. Ends as soon as the backlog is back within the limit it is judged against, so it costs one poll when there is nothing to drain. Set 0 to disable. Skipped while bracket is still halving downward, since there is no known-good rate to drain at yet. Known gap: the recovery test sees only *receive* backlog, so a producer client still holding a full `buffer.memory` can look recovered |
-| `rampHoldSeconds`          | 180                                    | CHOP only — how long a chop candidate must hold clean. The most consequential ramp setting: a hold shorter than the broker's burst-absorption time at the candidate rate accepts a rate the measurement window then fails on, and no predicate can detect that from inside the hold. Size it from the cluster's cache depth, not from this default                                                                                                                                                             |
-| `rampConfirmationHolds`    | 1                                      | CHOP only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `rampBreachPolls`          | 2                                      | CHOP only, `BACKLOG` verdict — consecutive polls that must breach before a candidate fails. 1 restores the old one-sample behaviour; on AKS a single dipping poll capped a search 7% low on a hold whose aggregate was 99.13% of target, and nothing ever reopens `hi`                                                                                                                                                                                                                                         |
-| `rampConvergenceTolerance` | 0.05                                   | CHOP only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `rampSeedFromAchievedRate` | true                                   | CHOP only — after a failed hold, take the next candidate from the throughput that hold achieved instead of bisecting. Measured at ~12% less discovery time on a 5000 → 841k geometry; no effect when the start rate is already above capacity, since the bracket's downward halving path is not seeded                                                                                                                                                                                                         |
-| `rampMaxDiscoveryMinutes`  | 45                                     | CHOP only — coupled to `rampHoldSeconds`: budget roughly `settle + 15 x rampHoldSeconds`, plus the drain if set. Hitting the cap reports the best rate that held without confirming it, with a WARN and no `rampVerification`                                                                                                                                                                                                                                                                                  |
+On these settings three arms took 16–22 minutes of discovery each, of which 75–85% is chop's
+full-length holds. Bracket is down to ~3 minutes, so there is nothing left to win there: the remaining
+levers are `rampHoldSeconds` and `rampConvergenceTolerance`, and both trade accuracy for time.
+
+|           Field            |                Default                 |                                                                                                                                                                                                                                                                    Applies to                                                                                                                                                                                                                                                                     |
+|----------------------------|----------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `rampAlgorithm`            | `AIMD`                                 | Selects the algorithm                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `rampVerdict`              | `BACKLOG`                              | CHOP only — selects the clean/not-clean predicate for holds; `THROUGHPUT` is the scale-free alternative (see "Verdict modes" above). AIMD never builds a `RampRateFinder`, so this field has no effect on it                                                                                                                                                                                                                                                                                                                                      |
+| `rampMinThroughputRatio`   | 0.95                                   | CHOP only — THROUGHPUT verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `rampStartRate`            | 10000                                  | Both                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `rampPublishBacklogLimit`  | env `PUBLISH_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `rampReceiveBacklogLimit`  | env `RECEIVE_BACKLOG_LIMIT`, else 1000 | Both                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `rampMaxBacklogSeconds`    | 0.5                                    | CHOP only — when set, replaces the two fields above with a limit that scales with the candidate rate (`limit = clamp(currentRate * rampMaxBacklogSeconds, rampMaxBacklogFloor, rampMaxBacklogCeiling)`), so the check is equally strict at every rate tried during bracket's exponential range instead of being loose at high rates and tight at low ones                                                                                                                                                                                         |
+| `rampMaxBacklogFloor`      | 1000                                   | CHOP only — hard floor (messages) on the limit `rampMaxBacklogSeconds` computes, matching the old fixed-count default so the relative check can never become stricter than a fixed-count check would have been at any rate; only meaningful when `rampMaxBacklogSeconds` is set (see the trial log)                                                                                                                                                                                                                                               |
+| `rampMaxBacklogCeiling`    | 500000                                 | CHOP only — hard cap (messages) on the same limit; only meaningful when `rampMaxBacklogSeconds` is set (see the trial log for why this exists)                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `rampBracketPeriodSeconds` | 3                                      | CHOP only — poll cadence, not a hold duration                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `rampSettleSeconds`        | 30                                     | CHOP only — grace period at start before backlog counts at all                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `rampBracketHoldSeconds`   | 20 (or `rampHoldSeconds` if shorter)   | CHOP only — how long a bracket candidate must hold clean; shorten independently once you trust bracket's coarser candidates need less scrutiny                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `rampDrainSeconds`         | resolved `rampHoldSeconds`             | CHOP only — cap on the recovery period run after a *failed* candidate, at **half** the highest rate already known to hold, so there is headroom for the queue to actually shrink. Ends as soon as the backlog is back within the limit it is judged against, so it costs one poll when there is nothing to drain. Set 0 to disable. Skipped while bracket is still halving downward, since there is no known-good rate to drain at yet. Requires *both* sides caught up: receive backlog inside its limit and publish delay back within tolerance |
+| `rampHoldSeconds`          | 120                                    | CHOP only — how long a chop candidate must hold clean. The most consequential ramp setting: a hold shorter than the broker's burst-absorption time at the candidate rate accepts a rate the measurement window then fails on, and no predicate can detect that from inside the hold. Size it from the cluster's cache depth, not from this default                                                                                                                                                                                                |
+| `rampConfirmationHolds`    | 1                                      | CHOP only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `rampBreachPolls`          | 2                                      | CHOP only, `BACKLOG` verdict — consecutive polls that must breach before a candidate fails. 1 restores the old one-sample behaviour; on AKS a single dipping poll capped a search 7% low on a hold whose aggregate was 99.13% of target, and nothing ever reopens `hi`                                                                                                                                                                                                                                                                            |
+| `rampConvergenceTolerance` | 0.05                                   | CHOP only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `rampSeedFromAchievedRate` | true                                   | CHOP only — after a failed hold, take the next candidate from the throughput that hold achieved instead of bisecting. Measured at ~12% less discovery time on a 5000 → 841k geometry; no effect when the start rate is already above capacity, since the bracket's downward halving path is not seeded                                                                                                                                                                                                                                            |
+| `rampMaxDiscoveryMinutes`  | 45                                     | CHOP only — coupled to `rampHoldSeconds`: budget roughly `settle + 15 x rampHoldSeconds`, plus the drain if set. Hitting the cap reports the best rate that held without confirming it, with a WARN and no `rampVerification`                                                                                                                                                                                                                                                                                                                     |
 
 See `workloads/max-rate-chop-1-topic-100-partitions-100b.yaml` for a runnable example.
 
@@ -335,14 +341,70 @@ FINDER-POLL t=124 rate=640000 achieved=639871 backlog=241 delayP50Ms=0.1 delayP9
             delayMaxMs=3.4 latencyP99Ms=8.1
 ```
 
-This exists because the verdict record is not enough to locate a knee. It is at hold granularity (45s
-is a typical setting), and it carries no latency at all, because the finder is handed counters and
+This exists because the verdict record is not enough to locate a knee. It is at hold granularity (120s
+by default), and it carries no latency at all, because the finder is handed counters and
 never sees any. Backlog and publish delay both start moving well before a hold's *aggregate* verdict
 flips — which is precisely how a hold can accept a rate the measurement window then fails on. Plot
 `rate`, `achieved`, `backlog` and `delayP99Ms` on one time axis and the knee is visible directly.
 
 Both series come from a single `getPeriodStats()` call per poll, so the counters and the latency
 describe the same instant with no skew between them.
+
+Three lines appear only when something happens, and each is worth grepping for:
+
+```
+FINDER-SEED  next candidate 131332 msg/s from the failed hold's achieved rate
+             (bisecting [80000.0, 160000.0] would have tried 120000.0)
+FINDER-DRAIN recovery complete after 6s at 640000.0 msg/s (backlog 8386, delayP99 0ms,
+             consumerCaughtUp=true producerCaughtUp=true); resuming at 1280000.0 msg/s
+FINDER-STALL no acknowledgements in a 3000ms poll at 10000.0 msg/s (expected 30000);
+             not judged, hold restarted
+```
+
+- **`FINDER-SEED`** — the search jumped to a failed hold's measured throughput instead of bisecting. It
+  prints the midpoint it skipped, so the saving is visible.
+- **`FINDER-DRAIN`** — `complete` versus `capped` tells you whether recovery finished or gave up, and
+  `consumerCaughtUp`/`producerCaughtUp` which side was not ready. Frequent `capped` means the failed
+  candidates are leaving more behind than `rampDrainSeconds` allows for.
+- **`FINDER-STALL`** — a poll in which *nothing* was acknowledged. Every counter the finder sees is
+  populated on ack, so an acknowledgement stall zeroes all of them at once while the messages are still
+  in flight; that is an absence of data rather than a breach, so the candidate is not judged and the hold
+  restarts. On AKS a pair of these once failed a rate that had just held cleanly and drove the search
+  ~120x low. A handful is normal; a steady stream means the transport is stalling, not that the rate is
+  wrong.
+
+### Calibrating `rampHoldSeconds`
+
+This is the one setting that cannot be derived up front, because it depends on how long *your* broker can
+absorb an oversubscribed rate — a property of its page cache, batching and socket buffers, not of the
+rate. Two things bound it:
+
+- It must **outlast absorption**. Until buffers saturate the broker acks at the full target rate, so a
+  shorter hold accepts a rate the measurement window then fails on.
+- `rampMinThroughputRatio` caps the **detectable overshoot at about 5%**. A candidate 3% over capacity
+  asymptotes to a ratio of ~0.97 and never crosses 0.95, at any hold length. Precision comes from the
+  ratio and `rampConvergenceTolerance`, not from holding longer.
+
+Past roughly twice the absorption time, a longer hold buys nothing. So calibrate it once, from a run's
+own `FINDER-POLL` series, rather than guessing:
+
+1. Run once with a generous hold (180s is a good probe value).
+2. For each hold that **passed**, group its `FINDER-POLL` lines and compute the running cumulative ratio
+   `Σ achieved / Σ rate` as the hold progresses.
+3. Find where that ratio stops moving. Set `rampHoldSeconds` to about **twice** that.
+
+Worked example, from the AKS run this default came from. Across 18 full-length passing holds, 11 sat
+within 0.01 of their final ratio from 30s onward — 150 seconds each producing no new information. One
+hold showed the absorption signature clearly:
+
+```
+rate=1,205,023   30s=1.000   60s=0.967   90s=0.962   120s=0.962   150s=0.957   180s=0.955
+```
+
+Settled within 0.012 of its final value by 60s. Hence the 120s default: twice the point at which every
+verdict was determined, with the slow tail still inside it. **At 30s that same hold read a confident
+1.000 against a true 0.955** — which is why 30s is not safe, and why a wrongly-passed `lo` matters: it
+only ever moves upward.
 
 ### Known limitation
 
@@ -418,7 +480,10 @@ With CHOP, leave `rampVerdict` at its `BACKLOG` default. See "Verdict modes" abo
 `docs/ramp-finder-trial-log.md` for the runs behind it.
 
 Whichever you use, the number is only as good as the hold it was verified over. `rampHoldSeconds` has to
-exceed the time your broker can absorb an oversubscribed rate, which is a property of its cache and not
-something the finder can discover — so size it from the cluster, and check publish delay in the
-measurement window that follows. That check is the one thing that has caught every over-confirm in the
-trial log.
+exceed the time your broker can absorb an oversubscribed rate — a property of its cache, not something
+the finder can discover a priori. The 120s default suits the cluster it was measured on; see
+"Calibrating `rampHoldSeconds`" for how to derive it for yours from one run rather than guessing.
+
+And whatever it says, **check publish delay in the measurement window that follows**. That single check
+has caught every over-confirm in the trial log, including ones where every gate the finder applied
+reported clean and `isNonMonotonic()` was false.

@@ -187,19 +187,23 @@ public class Workload {
     public Integer rampDrainSeconds;
 
     /**
-     * CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 180.
+     * CHOP only: seconds to hold and verify each chop-phase candidate. Defaults to 120.
      *
-     * <p>This is the single most consequential ramp setting, because it is what decides whether a
-     * broker can absorb an oversubscribed rate for the whole hold and so look clean. A broker acks at
-     * the full target rate until its page cache, batching and socket buffers saturate; only then does
-     * throughput droop. A hold shorter than that absorption time accepts a rate that the measurement
-     * window afterwards fails on, and no verdict predicate can detect it from inside the hold.
+     * <p>This is the setting that decides whether a broker can absorb an oversubscribed rate for the
+     * whole hold and so look clean. A broker acks at the full target rate until its page cache,
+     * batching and socket buffers saturate; only then does throughput droop. A hold shorter than that
+     * absorption time accepts a rate the measurement window afterwards fails on, and no verdict
+     * predicate can detect it from inside the hold.
      *
-     * <p>180 rather than the earlier 30 because 30 is not survivable on real hardware: absorption
-     * scales with the cache the cluster has. Size it from the cluster, not from this default --
-     * roughly buffer-depth / overshoot -- and note higher candidate rates need longer holds, not
-     * equal ones. Raising this raises discovery time proportionally, so check rampMaxDiscoveryMinutes
-     * with it.
+     * <p>Two things bound it, and neither is a round number. The hold must outlast absorption; and
+     * rampMinThroughputRatio caps the detectable overshoot at about 5%, since a candidate 3% over
+     * capacity asymptotes to ~0.97 and never crosses 0.95 however long you hold it. Past roughly
+     * twice the absorption time, longer buys nothing.
+     *
+     * <p>120 comes from measurement: across 18 full-length passing holds on AKS every verdict was
+     * settled by 60 seconds, 11 of them sitting within 0.01 of their final ratio from 30s onward. It
+     * is not universal -- absorption scales with the cluster's cache -- but it is calibratable in one
+     * run rather than guessed. See RATE_FINDING.md, "Calibrating rampHoldSeconds".
      */
     public Integer rampHoldSeconds;
 

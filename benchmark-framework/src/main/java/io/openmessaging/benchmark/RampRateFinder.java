@@ -45,14 +45,11 @@ class RampRateFinder {
     private static final double CONFIRMATION_BACKOFF_FACTOR = 0.9;
 
     // Recovery runs at this fraction of lo. lo means "keeps up", not "has spare capacity", so
-    // draining
-    // at lo itself leaves the queue shrinking at (capacity - lo) -- nearly nothing. Two AKS
-    // recoveries
-    // ran their full 180s cap and gave up with the producer still 10 and 24 seconds behind, draining
-    // at
-    // ~1.16M against a ~1.17M ceiling. Half leaves real headroom, and since nothing is evaluated
-    // during
-    // recovery and it ends as soon as both sides are caught up, running slower costs nothing.
+    // draining at lo itself leaves the queue shrinking at (capacity - lo) -- nearly nothing. Two
+    // AKS recoveries ran their full 180s cap and gave up with the producer still 10 and 24 seconds
+    // behind, draining at ~1.16M against a ~1.17M ceiling. Half leaves real headroom, and since
+    // nothing is evaluated during recovery and it ends as soon as both sides are caught up,
+    // running slower costs nothing.
     private static final double DRAIN_HEADROOM_FACTOR = 0.5;
 
     enum Phase {
@@ -176,7 +173,23 @@ class RampRateFinder {
         int settleSeconds =
                 workload.rampSettleSeconds != null ? workload.rampSettleSeconds.intValue() : 30;
         this.settleNanos = SECONDS.toNanos(settleSeconds);
-        int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 180;
+        // 120, down from 180, on measurement rather than caution. Across 18 full-length passing holds
+        // on
+        // AKS, every verdict was settled by 60 seconds: 11 of the 18 sat within 0.01 of their final
+        // ratio
+        // from 30s onward, producing no new information for the remaining 150. The one hold that did
+        // drift -- 1,205,023 msg/s reading 1.000 at 30s, 0.967 at 60s, 0.955 at 180s -- is the
+        // absorption
+        // signature, and it had settled within 0.012 of its final value by 60s. 120 is twice that, and
+        // still keeps the slow tail that ran out to ~150s on that hold.
+        //
+        // Two things bound this, and neither is a round number of minutes: the hold must outlast the
+        // broker's absorption, and minThroughputRatio caps the detectable overshoot at about 5% -- a
+        // candidate 3% over capacity asymptotes to ~0.97 and never crosses 0.95 at any hold length.
+        // Past
+        // roughly twice the absorption time, a longer hold buys nothing. See RATE_FINDING.md for how to
+        // calibrate it from one run's FINDER-POLL series rather than guessing.
+        int holdSeconds = workload.rampHoldSeconds != null ? workload.rampHoldSeconds.intValue() : 120;
         this.holdNanos = SECONDS.toNanos(holdSeconds);
         // Bracket only has to *locate* the knee, and overload announces itself in a poll or two: an AKS
         // arm went from ~1,300 messages of backlog to ~74,800 in a single 3-second poll the moment a
