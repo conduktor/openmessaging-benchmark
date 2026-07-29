@@ -72,11 +72,12 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    connection warm-up can still be settling; without this grace period, that transient gets
    evaluated exactly like a real capacity problem and can permanently cap the search too low (see
    "Known limitation" below).
-2. **Bracket** — starting at `rampStartRate`, double the rate every poll while backlog stays
-   clean. A breach is immediately actionable (fail-fast, no need to hold out a rate that's already
-   failing) and sets a known-bad `hi`; a clean reading must hold for `rampBracketHoldSeconds`
-   (default 20s) before being accepted as the known-good `lo`. Handles the reverse case too — if even
-   the start rate is already overloaded, it halves downward until it finds a clean `lo`.
+2. **Bracket** — starting at `rampStartRate`, double the rate every poll while backlog stays clean. A
+   breach fails the candidate without waiting out the rest of its hold and sets a known-bad `hi`; a
+   clean reading must hold for `rampBracketHoldSeconds` (default 20s) before being accepted as the
+   known-good `lo`. Handles the reverse case too — if even the start rate is already overloaded, it
+   halves downward until it finds a clean `lo`. Bounded at 20 doublings/halvings: if neither a `lo` nor
+   a `hi` has been established by then, discovery gives up rather than searching indefinitely.
 
    **The bracket probe is deliberately much shorter than a chop hold, and that is safe.** Whenever it
    is shorter, the first thing chop does is re-run `lo` at *full* length before narrowing anything — the
@@ -106,7 +107,22 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    achieved rate is the target restated rather than a measurement of capacity, and seeding from it
    would propose the rate that just failed.
 
-4. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
+4. **Recover** — after *every* failed candidate, run for up to `rampDrainSeconds` (default: the resolved
+   `rampHoldSeconds`) at **half** the highest rate already known to hold, evaluating nothing and
+   re-baselining the counters, exactly as **Settle** does for start-up transients. A failed candidate
+   leaves the system carrying its overshoot, and judging the next one immediately measures that fallout
+   rather than the candidate — which matters because `lo` only ever moves upward, so one contaminated
+   reading cannot be undone.
+
+   *Half* of `lo`, not `lo`: draining needs arrival below service, and `lo` means "keeps up", not "has
+   spare capacity". It is a cap rather than a fixed wait, ending as soon as **both** sides have caught up
+   — receive backlog inside its limit *and* publish delay back within tolerance, since work still queued
+   in the producer client has not been published and so contributes no backlog at all. With nothing to
+   drain it costs a single poll. Skipped entirely while bracket is still halving downward, because there
+   is no known-good rate to drain at yet. See "Known limitation" for the measurements behind each of
+   those three choices.
+
+5. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
    isn't accepted immediately. It must pass `rampConfirmationHolds` (default 1) additional,
    consecutive clean holds before being accepted. This is what makes "verified" mean something more
    than "passed once."
@@ -121,23 +137,45 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    was actually held for a full hold. Note the coupling: `rampConvergenceTolerance` therefore doubles
    as the size of the safety margin.
 
-5. **Reopen on a failed confirmation** — if a confirmation hold fails (the rate looked fine, then
-   didn't hold up), CHOP does not accept it anyway. It reopens the search: tightens `hi` to the
-   failed rate, and falls back to the highest rate already *observed* to pass below it (never a
-   blind guess — `lo` is always sourced from a real, recorded pass) as the new `lo`, then restarts
-   the hold-and-confirm cycle from there.
+6. **Reopen on a failed confirmation** — if a confirmation hold fails (the rate looked fine, then didn't
+   hold up), CHOP does not accept it anyway. It reopens the search: tightens `hi` to the failed rate and
+   takes the highest rate already *recorded as passing* below it as the new `lo`, then restarts the
+   hold-and-confirm cycle from there. The same fallback fires whenever any chop candidate at or below `lo`
+   fails — including a failed re-verification of a cheap bracket probe — because `lo` and `hi` would
+   otherwise collide and bisecting a zero-width bracket retests one rate forever.
 
-6. **Non-monotonic flag** — every tested `(rate, passed/failed)` outcome is recorded. If a later
-   verdict ever contradicts an earlier one (e.g. a lower rate fails after a higher one already
-   passed), `isNonMonotonic()` is set and stays set for the rest of the run, even if the reopened
-   search goes on to confirm cleanly. It's a signal that the system showed unstable behavior
+   If history holds no passing rate below `hi` at all, `lo` falls back to `hi × 0.9`. That one *is* a
+   blind guess, and it is reachable: a large `rampConvergenceTolerance` puts the confirmation rate below
+   every rate previously recorded as passing. It only sets a starting point — the next hold judges it on
+   its own merits.
+
+7. **Non-monotonic flag** — every tested `(rate, passed/failed)` outcome is recorded, along with whether
+   it came from a full-length hold. If a later verdict contradicts an earlier one (e.g. a lower rate fails
+   after a higher one already passed), `isNonMonotonic()` is set and stays set for the rest of the run,
+   even if the reopened search goes on to confirm cleanly. **Only full-length verdicts are compared:** a
+   bracket probe run at a shorter `rampBracketHoldSeconds` is a cheaper measurement, not a weaker verdict
+   on the same thing, so a probe disagreeing with a full hold is not a contradiction. When bracket and
+   chop hold for the same length, every verdict is full-rigor and all of them are compared. It's a signal that the system showed unstable behavior
    *somewhere* during discovery, so the final number may not reproduce as cleanly as a clean run
    would.
 
-7. **Safety cap** — `rampMaxDiscoveryMinutes` (default 10) bounds total discovery time; if hit,
-   discovery stops and reports the best confirmed-or-passed `lo` found so far. Bear in mind the
+8. **Safety cap** — `rampMaxDiscoveryMinutes` (default 45) bounds total discovery time; if hit,
+   discovery stops and reports the best rate observed to pass so far — flagged, `WARN`-logged, and with
+   no `rampVerification` attached, so a truncated search cannot be mistaken for a converged one. Bear in mind the
    settle period and every bracket/chop hold all draw from this same budget — with generous hold
    settings, raise this alongside them.
+
+Two guards apply to every poll of every hold, before any of the above sees it:
+
+- **A breach must persist.** `rampBreachPolls` (default 2) consecutive breaching polls are required
+  before a candidate fails, and a hold that *ends* while still breaching fails regardless. One poll is
+  one sample; on AKS a single dipping poll once capped a search 7% low on a hold whose own aggregate was
+  99.13% of target, and nothing ever reopens `hi`.
+- **A poll that acknowledges nothing is not evidence.** Every counter the finder sees is populated on
+  ack, so an acknowledgement stall zeroes all of them at once while the messages are still in flight.
+  Such a poll is not judged and the hold restarts rather than resuming a window it did not observe — a
+  hold has to be a continuous observation to mean what it claims. If a stall never clears, the safety cap
+  reports no `rampVerification`, which is the honest outcome for an outage.
 
 ### Verdict modes: we use `BACKLOG`
 
