@@ -107,6 +107,12 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    achieved rate is the target restated rather than a measurement of capacity, and seeding from it
    would propose the rate that just failed.
 
+   Do not expect the seed to save wall clock. It was originally justified on discovery time, but the
+   convergence check described under **Confirm** shortens the same thing it does — a run of failing
+   candidates — and largely absorbed the saving. Measured across seven capacities, seeding now wins two,
+   loses three and ties two. What it still buys is placement: `lo` lands on a rate the system was
+   measured at rather than on a midpoint.
+
 4. **Recover** — after *every* failed candidate, run for up to `rampDrainSeconds` (default: the resolved
    `rampHoldSeconds`) at **half** the highest rate already known to hold, evaluating nothing and
    re-baselining the counters, exactly as **Settle** does for start-up transients. A failed candidate
@@ -122,9 +128,19 @@ Unlike AIMD, CHOP runs to completion **before** warmup starts (`runChopDiscovery
    is no known-good rate to drain at yet. See "Known limitation" for the measurements behind each of
    those three choices.
 
-5. **Confirm** — once a candidate holds clean within `rampConvergenceTolerance` (default 5%), it
-   isn't accepted immediately. It must pass `rampConfirmationHolds` (default 1) additional,
-   consecutive clean holds before being accepted. This is what makes "verified" mean something more
+5. **Confirm** — chopping stops once the bracket is narrower than `rampConvergenceTolerance` (default
+   5%), i.e. `(hi − lo) / lo ≤ tolerance`. That is checked on **both** routes into a narrower bracket:
+   after a clean hold raises `lo`, and after a failed one tightens `hi`. Checking only the first is a
+   trap — a stop condition reachable only when candidates succeed cannot stop a search whose
+   candidates all fail, which is exactly the runaway case. A gateway encrypt arm ran eleven
+   consecutive failures bisecting a bracket that had been inside the tolerance since the second one,
+   spending 49% of the run's wall clock and eleven drain cycles to move the reported rate by 0.003%.
+   When convergence is reached by failing, the search still routes through **Recover** first, since
+   the candidate that just failed left a backlog and a confirmation hold that inherits one is judging
+   the previous candidate's overshoot rather than its own rate.
+
+   Reaching the tolerance isn't acceptance. The rate must then pass `rampConfirmationHolds`
+   (default 1) additional, consecutive clean holds before being accepted. This is what makes "verified" mean something more
    than "passed once."
 
    Those confirmation holds run at **`lo × (1 − rampConvergenceTolerance)`**, not at `lo` itself.
