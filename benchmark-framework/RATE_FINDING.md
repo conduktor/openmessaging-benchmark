@@ -285,6 +285,13 @@ confirmation runs at `lo x (1 - rampConvergenceTolerance)` (see "Confirm" above)
 deliberately on the conservative side of the knee — read it as "a rate you can run", not as a
 capacity ceiling.
 
+A single figure rather than a band is a deliberate choice, and it survives being checked: across two
+independent AKS runs on the same cluster the gateway-passthrough arm confirmed 1,177,872 then 1,177,897
+msg/s, a spread of 0.002%, with the other two arms inside 4% and 8%. What reproduces less well is whether
+a *given* window stays clean — the same arm showed a mid-window publish-delay excursion in one run and
+nothing comparable in the next at the same rate. So treat the rate as reproducible and the measurement
+window as the independent check on it, not as a formality.
+
 `nonMonotonic` is therefore always `false` whenever this object is present (kept in the schema for
 stability rather than removed). `startEpochMillis`/`endEpochMillis` bracket the confirmation holds —
 useful for attributing resource usage (CPU/memory) to the verified rate rather than the whole warmup

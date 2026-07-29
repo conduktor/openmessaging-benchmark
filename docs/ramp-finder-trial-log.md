@@ -893,3 +893,51 @@ mostly-zero series with a mid-window excursion is meaningless — sorting each h
 ordering that distinguishes "inherited and decaying" from "grew and recovered". The interval series
 shows near-zero at both ends, so the window never started behind and a post-confirm drain would have
 fixed nothing. The drain-rate defect above is the real one, and it was in the same data.
+
+## Decisions taken, and what is still open
+
+Recorded here because several findings above end in "worth a decision" and a reader should not have to
+infer which way they went.
+
+**Verdict: `BACKLOG`.** `THROUGHPUT`'s diagnosis was right and `BACKLOG` has since absorbed the fix — its
+limit scales with rate, and its producer side is now the same ratio `THROUGHPUT` uses. What separates
+them is what each can see, and that is settled by Findings 13 and 16: `BACKLOG` watches a level, which
+rises the moment arrival exceeds service; `THROUGHPUT` watches flows, which stay healthy for as long as
+something downstream absorbs the overshoot. `THROUGHPUT` is retained for the one shape it handles better
+(a large *stable* standing backlog, where a level has no correct threshold). See `RATE_FINDING.md`.
+
+**Report a point value, not a band.** This reverses the earlier lean. The case for a band was that the
+verdict looked history-dependent: three of six local runs withheld, and two identical local `BACKLOG`
+runs landed 37% apart. Both of those turned out to be defects rather than properties — the withholding
+was mostly the confirm hold running *at* the knee (fixed by confirming at `lo x (1 - tolerance)`), and
+the spread was the count-based limit misfiring at high rates (fixed by the rate-scaled default). What is
+left reproduces:
+
+|     arm     |   run 9   |  run 10   |   spread   |
+|-------------|-----------|-----------|------------|
+| transparent | 1,177,872 | 1,177,897 | **0.002%** |
+| direct      | 1,111,681 | 1,156,448 | 4.0%       |
+| encrypt     | 119,670   | 129,326   | 8.1%       |
+
+A point value is defensible at that reproducibility. Note the two things it does *not* claim: the rate is
+deliberately conservative (`lo x 0.95`), and its *sustainability* has more run-to-run variance than the
+rate itself — `direct` showed a mid-window publish-delay excursion peaking at 2,978 ms in run 9 and
+nothing comparable in run 10, at essentially the same confirmed rate. So the number reproduces; whether
+a given window is clean does not, which is why the measurement window remains the independent check
+rather than a formality.
+
+**`rampConvergenceTolerance` stays at 0.05 for now.** Loosening to 0.10 is the only untaken speed lever
+(~1 fewer chop hold, ~18% of discovery), and it costs a wider converged band plus a reported rate 10%
+below `lo` instead of 5%. Deferred pending more real runs rather than decided on a single job — the
+tolerance is also the safety margin, so this trades measured accuracy for time and there is no reason to
+spend that before the wall-clock actually hurts.
+
+**Still genuinely open**, and inherent rather than unfixed:
+
+- A hold whose buffers absorb for its *entire* length cannot be distinguished from a healthy one by any
+  statistic computed inside it. Only a longer hold helps, and `rampHoldSeconds` is now calibratable from
+  one run's `FINDER-POLL` series rather than guessed (see `RATE_FINDING.md`).
+- The verdict is not a pure function of rate. `rampDrainSeconds` removes cross-candidate contamination,
+  which was most of it, but the same rate can still pass and fail on the same broker minutes apart. The
+  `isNonMonotonic()` latch exists to surface exactly that rather than to fix it.
+
