@@ -175,41 +175,100 @@ of load.
 2. **A gateway confirmation campaign** (ramp = report10, fixed-rate confirm = report11) set each arm's
    target from a CHOP (`BACKLOG`) ramp, then re-ran at that fixed target with repeats:
 
-   |     Arm     | CHOP target | Confirmed (sustained)  |    Gateway CPU (limit 2.0)     |      Verdict      |
-   |-------------|-------------|------------------------|--------------------------------|-------------------|
-   | direct      | 1,156,448   | ~1,165,446 (101%)      | ~0.02 cores (bypasses gateway) | sustainable       |
-   | transparent | 1,177,897   | 1,088,637 (92%)        | —                              | close             |
-   | encrypt     | 129,326     | 96,414 (75%), 46 s p99 | **2.0 pegged, throttled**      | **over-estimate** |
+   |     Arm     | CHOP target |   Whole-window mean    | Steady tail (last 100s) |      Gateway CPU (limit 2.0)      |      Verdict      |
+   |-------------|-------------|------------------------|-------------------------|-----------------------------------|-------------------|
+   | direct      | 1,156,448   | ~1,165,446 (101%)      | 1,158,515 (100%)        | ~0.02 cores (bypasses gateway)    | sustainable       |
+   | transparent | 1,177,897   | 1,088,637 (92%)        | **1,186,455 (101%)**    | 0.71–0.84, **no** throttling      | **sustainable**   |
+   | encrypt     | 129,326     | 96,414 (75%), 46 s p99 | ~103,946 (80%) plateau  | **1.998 pegged, throttled ~10/s** | **over-estimate** |
+
+   The transparent row was originally recorded as a 92% near-miss ("close"). It is not: the arm sustained
+   *above* target once warm, and its whole-window mean is dragged under 0.95× by a ~90-second cold-start
+   ramp during which nothing is saturated (median publish latency 14–17 ms, zero backlog, gateway
+   unthrottled). Only encrypt is a real over-estimate. A confirm harness that averages across the ramp
+   will misclassify any arm whose warmup is shorter than its time-to-steady-state.
 
 ### Why `encrypt` over-estimated — it is NOT a verdict-signal problem
 
 During the CHOP **ramp**, 129k for `encrypt` was clean by *every* producer/consumer signal, sustained
 for ~7.5 min: backlog 0.6–5.9 K messages, publish-delay ~31 **microseconds** (flat), pub-latency
-5–25 ms, gateway CPU **mean 1.47 / max 1.82 of 2.0 cores** (throttle 4.3/s). In the fixed-rate
-**confirm**, the same 129k saturated: gateway 2.0 pegged (throttle ~10/s), backlog ~300 K,
-publish-delay 6→60 s, achieved 96k.
+5–25 ms. It then ran a *600-second* measurement window at the same rate and sustained 100.0% of it. In
+the fixed-rate **confirm**, the same 129k saturated: gateway 1.998 pegged (throttle ~10/s), backlog
+~300 K, publish-delay 6→60 s (clipped at the histogram ceiling), achieved 96k.
 
-Ruled out as the cause: **broker health** (broker CPU 0.3–0.5 cores and produce-time ~0 ms in both;
-not degraded), **arm ordering** (encrypt ran last in both), **node hardware** (same dedicated
-`aks-gateway` node pool / VM family in both).
+Gateway CPU over the **confirming hold** — the window a headroom gate would inspect, and the figures to
+use when sizing one — was **median 1.690 / peak 1.807 of 2.0 cores (84.5% / 90.3%)**, throttling at
+~1.9 CFS periods/s. (An earlier draft quoted "mean 1.47 / max 1.82, throttle 4.3/s"; those are whole-ramp
+statistics spanning the low-rate bracket holds and the *failed* 136k hold, which both understates the
+utilisation at the confirmed rate and overstates the peak attributable to it.)
 
-Root cause: **129k sits at the very edge of the gateway's 2-core encryption budget.** Even in the
-successful ramp the gateway peaked at 1.82/2.0 = **91%** and was already throttling. Encryption is
-per-*message*-bound (2 pegged cores sustain only ~9.6 MB/s of 100-byte messages — <1% of raw AES-NI),
-so per-message cost is high and nearly size-independent. At ~90–100% of a hard resource limit, small
-run-to-run variance (GC/JIT/cgroup-throttle scheduling) flips the outcome sustainable ↔ saturated.
+Ruled out as the cause: **broker health** (broker CPU 0.3–0.5 cores and produce-time ~0 ms in both; not
+degraded, and 98–99% request-handler idle), **arm ordering** (encrypt ran last in both), and **workers /
+network** (the non-gateway `direct` arm was unaffected — marginally *faster* in the confirm run).
+
+**Not** ruled out: **node hardware.** The original entry dismissed this on the grounds of "same dedicated
+`aks-gateway` node pool / VM family", which does not follow — the two runs are different physical clusters
+(`aks-gateway-21146700` vs `aks-gateway-22649591`), so same pool config and VM family but a different
+host. This is the hypothesis the data most supports, and it is the one that was excluded without evidence.
+
+Root cause: **129k sits close enough to the gateway's 2-core encryption budget that a modest change in
+per-message CPU cost consumes the whole margin.** Encryption is per-*message*-bound (2 pegged cores
+sustain only ~9.6 MB/s of 100-byte messages — <1% of raw AES-NI), so per-message cost is high and nearly
+size-independent. Report10's CPU-vs-rate curve for this arm is clean and linear at **~76,000 msg/s per
+core** across 80k–136k (0.4% spread). Report11's gateway needed *more than* 2.0 cores to do what
+report10's did in 1.69 — a regression of **≥18%**, with no measurable upper bound because throttling
+censors demand above the quota. It was already throttled in its **first sample**, while publish delay was
+still 2.2 ms and no back-pressure existed, so the CPU wall is the cause and not a consequence of the
+collapse. The rest follows arithmetically: gateway latency >1 s → the producer's 15 in-flight requests ×
+~9,523 records ÷ 1.19 s ≈ 120k ceiling → `buffer.memory` exhausted → `bufferpool_wait_rate` 0.91 → ~96k.
 
 **Consequence for the design:** none of the producer/consumer-side gates — the `THROUGHPUT` ratio,
 nor the proposed queue/latency/backlog-trend gates — could have caught this at ramp time, because the
-CPU wall was *approached but not breached* (91%), so throughput, backlog, and delay were all
+CPU wall was *approached but not breached* (84.5% median), so throughput, backlog, and delay were all
 genuinely clean. Throughput-side signals cannot see a resource ceiling until it is crossed. The only
-signal that revealed the fragility was the **gateway CPU utilization itself (91%, throttling)**, which
-`RampRateFinder` never sees — it consumes only worker counters.
+signal that revealed the fragility was the **gateway CPU utilization itself**, which `RampRateFinder`
+never sees — it consumes only worker counters.
 
 ### Revised direction: gate on bottleneck-resource headroom
 
 Reject or derate a candidate whose **bottleneck resource utilization** during the confirming hold
-exceeds a headroom threshold (e.g. 85%), independent of the throughput/backlog/latency signals.
+exceeds a headroom threshold, independent of the throughput/backlog/latency signals.
+
+**Two corrections to the threshold, from checking it against the run it was designed to reject.** An
+earlier draft of this section proposed 85%, gated on peak-or-p95, with a derate to ~120k. Neither survives
+contact with `encrypt.chop-verify.metrics.json` — the very file this design says the harness should
+consume:
+
+- **The median over the confirming hold is 84.5%, so an "85%" gate PASSES the rate that failed to
+  reproduce.** Only the peak (90.3%) rejects it. If the threshold is 85%, the statistic must be the peak
+  or a high percentile; "peak (or p95)" is not an implementation detail here, it decides the outcome.
+- **85% is itself too high, and the proposed derate does not survive either.** Pricing each candidate
+  against the measured ~76,000 msg/s/core curve:
+
+  |                 target                  | cores | % of 2-core limit | within report11's ~104k plateau? |
+  |-----------------------------------------|-------|-------------------|----------------------------------|
+  | 129,326 (confirmed)                     | 1.690 | 84.5%             | no                               |
+  | 120,000 (`129k × 0.85/0.91`, this spec) | 1.568 | 78.4%             | **no**                           |
+  | 103,946 (report11's post-stall plateau) | 1.358 | **67.9%**         | at the limit, by construction    |
+  | 100,570 (report11's final interval)     | 1.314 | 65.7%             | yes                              |
+
+  To have produced a number that reproduced, the gate would have had to reject anything above **~65–68%**.
+
+  Report11's encrypt run is not a monotone decline, and its summary statistics mislead accordingly: it
+  declines (135k → 87k over 18 intervals), **stalls near-completely for ~50 s** to a low of 942 msg/s, then
+  recovers to a ~104k plateau. Its whole-window mean of 96,414 — and any "last N intervals" average that
+  straddles the stall — understate the plateau, which is the defensible capacity figure.
+
+The general form matters more than the constant: ~65% is calibrated to one observed cross-cluster delta
+(≥18%), so the threshold belongs expressed as **required margin ≥ measured node-to-node variance**. A
+fixed 85% silently encodes an assumption of ~15% variance that this campaign refutes. This also means the
+threshold cannot be calibrated from a single cluster — it needs the same arm on two cluster instances,
+which report10 and report11 only provided by accident.
+
+**And read utilisation only over an otherwise-clean hold.** Past the knee the signal inverts: during that
+50-second stall the gateway's CPU *fell* to 0.273 cores, because the producer had wedged on `buffer.memory`
+and stopped feeding it. A gate averaging utilisation over a window containing such a stall would read low
+utilisation as ample headroom. The confirming hold is the right window precisely because it is otherwise
+clean, which is an argument against generalising the gate to arbitrary windows.
 
 Two ways to apply it:
 
@@ -217,11 +276,13 @@ Two ways to apply it:
   `rampVerification` with the confirmation-window timestamps, and the harness already captures
   `chop-verify.metrics.json` — a Prometheus resource sample over exactly that window. The harness
   computes peak (or p95) utilization of the bottleneck resource (gateway `container_cpu_usage /
-  cpu_limit_cores`) and: (a) **flags** the result when > threshold ("confirmed at 91% gateway CPU —
+  cpu_limit_cores`) and: (a) **flags** the result when > threshold ("confirmed at 90% peak gateway CPU —
   low headroom, may not reproduce"), and/or (b) **derates** the recommended target to leave headroom:
-  `target' = target × (headroom_target / observed_peak_util)`. For encrypt that is
-  `129k × (0.85 / 0.91) ≈ 120k`, and ideally a short re-confirm at 120k. This keeps OMB generic (it
-  never learns about "gateway CPU"), uses data already collected, and needs no change to the finder.
+  `target' = target × (headroom_target / observed_peak_util)`. With the corrected threshold that is
+  `129k × (0.65 / 0.903) ≈ 93k` for encrypt, plus a short re-confirm at the derated rate. This keeps OMB
+  generic (it never learns about "gateway CPU"), uses data already collected, and needs no change to the
+  finder. Note the derate is only as good as `headroom_target`, so it inherits the calibration problem
+  above — a re-confirm at the derated rate is what actually establishes the number, not the arithmetic.
 
 - **In-loop (larger change).** Give the finder a pluggable `ResourceHeadroomProvider` — a callback
   returning current bottleneck utilization [0,1], default a no-op returning 0 — and have the verdict

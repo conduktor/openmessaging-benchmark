@@ -941,3 +941,256 @@ spend that before the wall-clock actually hurts.
   which was most of it, but the same rate can still pass and fail on the same broker minutes apart. The
   `isNonMonotonic()` latch exists to surface exactly that rather than to fix it.
 
+## Finding 18: 1 of 3 arms didn't survive 5 continuous minutes
+
+> **Partly corrected — read the correction before quoting this.** Originally recorded as "2 of 3 arms",
+> and as direct evidence for the hold-length concern just above. Re-analysis of the same two report
+> directories found that transparent *did* sustain its rate, and that encrypt failed on a resource CHOP
+> cannot see — so neither arm is a hold-length result. The per-interval observations below stand; three of
+> the conclusions drawn from them do not. See
+> [Correction and root cause for Finding 18](#correction-and-root-cause-for-finding-18).
+
+AKS, harness commit adding an arm-level `producerRate`
+override so one job can fix each arm at ITS OWN rate (run 30439959807, `repeats-chop-confirm-3arms.yaml`,
+`repeats: 5`): direct at 1,156,448, transparent at 1,177,897, encrypt at 129,326 — run 10's three
+confirmed rates, run continuously at a FIXED rate for 5 minutes straight instead of a 180s hold.
+
+**Result**: direct ran cleanly for all 5 measured repetitions (mean `publishRate` 1,173,936, matching
+target within noise). transparent and encrypt each triggered the repeats harness's own adaptive-stop
+after their *first* measured run — `is_saturated`: mean achieved < 0.95x target over the whole window.
+~~Not a false positive of that check.~~ **For transparent it is a false positive of that check** — its
+whole-window mean is dragged under 0.95x by a ~90s cold-start ramp, while its steady-state tail runs
+*above* target (corrected below). Each 10-second interval's own `Pub Delay Latency` (an HdrHistogram
+`getIntervalHistogram()` — confirmed against `WorkerStats.java`, so genuinely fresh per interval, not a
+cumulative-since-start average that could just be absorbing an early bad patch) climbed **monotonically
+for the entire 5 minutes**:
+
+|     arm     |   delay at start    |                              delay, final interval                              |     rate, last 100s vs target     |                    shape                    |
+|-------------|---------------------|---------------------------------------------------------------------------------|-----------------------------------|---------------------------------------------|
+| direct      | 2.6ms avg, climbing | settles ~0.1-1.3s                                                               | 1,158,515 / 1,156,448 =  **100%** | rises then **recovers and stabilizes**      |
+| transparent | 2.2s avg            | 49.5s avg (max over run 54.2s)                                                  | 1,186,455 / 1,177,897 =  **101%** | delay never recovers, **but the rate does** |
+| encrypt     | 2.2ms avg           | **60.0s — clipped at the HdrHistogram ceiling**, so the true value is unbounded | 103,946 / 129,326 = **80%**       | neither recovers                            |
+
+The rate column is the one that decides the question, and it was missing from this table originally: for
+transparent, delay and rate **diverge** — the delay climbs for the whole window while the achieved rate
+climbs *past* target. Both are true at once, and the reason is in the correction below. Note also that the
+"delay at end" figures first recorded here were not end-of-run values (transparent's 54.2s was the max over
+the run; encrypt's 23.0s was the mean, `aggregatedPublishDelayLatencyAvg` 24.0s) — and encrypt's genuine
+final value sits on the histogram's highest trackable value, which is a different fact from "23s".
+
+Encrypt's rate figure needs its own note, because the obvious summary statistics all mislead. Its 30
+intervals are not a decline but a decline, a **stall**, and a recovery:
+
+| intervals |    mean    |                          shape                          |
+|-----------|------------|---------------------------------------------------------|
+| 0-17      | 114,571    | gradual decline, 134,978 → 86,941                       |
+| **18-22** | **20,506** | **near-total stall over ~50s — low interval 942 msg/s** |
+| 23-29     | 103,946    | recovers to a plateau, final interval 100,570           |
+
+So the whole-window mean (96,414) and any "last N intervals" figure that straddles intervals 18-22 both
+understate the arm's actual plateau. The defensible capacity figure for report11's encrypt is the
+**post-stall plateau, ~104,000** — used throughout the rest of this correction. The stall itself coincides
+with the gateway CPU briefly falling to 0.273 cores: not the CPU ceiling at that instant but the producer
+wedged on `buffer.memory`, starving the gateway of work. (An earlier draft of this correction quoted
+"last 100s: 80,289" as encrypt's steady tail. That average spans the stall and is not a steady-state
+number.)
+
+**Where the bottleneck actually sits, from the Prometheus series** (not guessed): for both transparent
+and encrypt, `producer_buffer_available_bytes` collapses to ~0 within the first couple of intervals and
+stays there, and `producer_bufferpool_wait_rate` is substantial (transparent 0.06-0.24, encrypt as high
+as 0.9 — 90% of the interval spent blocked waiting for send-buffer space). Meanwhile the brokers are
+93-100% idle (`broker_request_handler_idle`) with `broker_produce_total_time_ms` ~0.01-0.04ms throughout,
+so **the brokers** are certainly not the constraint in either arm.
+
+~~and gateway CPU (encrypt) *falls* from its 2-core cap to ~0.7 by the end as less work arrives to
+process. Nothing downstream is under pressure. This is the OMB worker's own producer client running out
+of its own send buffer under sustained production, not a broker or gateway capacity limit — the same 64MB
+`buffer.memory` blind spot Finding 17 found from the drain side, now seen from the sustained-load side.~~
+
+**Struck: this reads the encrypt gateway series backwards.** Encrypt's gateway CPU does not fall away — it
+is pegged: median **1.998 of 2.0 cores**, final sample 1.999, and 58% of samples at ≥1.95, with
+`cpu_throttled_periods_rate` at ~10/s (i.e. *every* 100ms CFS period throttled). The two brief dips in the
+series are transient, not a trend. So for encrypt the gateway **is** the capacity limit, and the producer's
+`buffer.memory` exhaustion is downstream of it, not the cause — see the correction below. The buffer
+observations themselves are right, and for transparent the `buffer.memory` reading is still the relevant
+one (its gateway sat at 0.71-0.84 of 2.0 cores, with no throttling at all).
+
+**This does not yet distinguish two different explanations, and that matters for where a fix belongs**
+(both are superseded by the correction below — the answer turned out to be a *third* thing, and a
+different third thing per arm):
+(a) `lo` genuinely isn't sustainable at these arms' true ceiling and CHOP's 180s hold is too short to see
+a queue that only visibly runs away over minutes, or (b) the rate IS sustainable at the Kafka/gateway
+level and it's OMB's own producer `buffer.memory` default that's undersized for continuous production
+above ~1M msg/s for multiple minutes — a harness/client-config limitation, not a CHOP or cluster one.
+`producerConfig: {buffer.memory: ...}` is already a supported per-load override in the harness
+(`client_extra_overlay.py`); the natural next step is re-running this same repeats-confirm matrix with a
+larger buffer.memory and checking whether the delay growth disappears. Not run yet.
+
+direct is the control here: its brokers show real, comparable CPU (0.2-0.85 cores, matching what CHOP
+itself observed for this arm) and its delay genuinely recovers and stabilizes — consistent with its rate
+being sustainable by any read of this data, buffer-limited or not.
+
+**Addendum, checked against run 10's own measurement-phase metrics (`producer_buffer_available_bytes`,
+`producer_bufferpool_wait_rate` were captured there too — same collect-metrics, not rerun).** Run 10's
+post-discovery measurement window is *longer* than the 5 minutes above (`testDurationMinutes: 10`), and
+its producer buffer stayed healthy the entire time for all three arms, including transparent and
+encrypt at the identical rates:
+
+|             |        run 10 (post-CHOP measurement)         |    run 30439959807 (cold repeats-confirm)    |
+|-------------|-----------------------------------------------|----------------------------------------------|
+| direct      | bufferpool_wait max 0.112, buffer stays ~full | max 0.071, dips to 0 and **recovers**        |
+| transparent | bufferpool_wait max 0.003, buffer stays ~full | max 0.24, collapses to 0 and **stays there** |
+| encrypt     | bufferpool_wait max 0.000, buffer stays ~full | max 0.90, collapses to 0 and **stays there** |
+
+So it isn't simply "needs more than 180s to see" — run 10's window was longer than this one and never
+saw it. The variable this isolates: run 10's measurement phase begins already warm, arriving at the
+confirmed rate via CHOP's own gradual bracket-doubling ramp (5,000 -> ... -> 1M+ over ~15-20 minutes).
+This run's cells instead start a **fresh JVM cold** (a new `helm upgrade --install` per warm-up/measured
+run) and jump straight to the full target rate after only `warmupDurationMinutes: 2`. direct tolerates
+that fine — brief dips, quick recovery. transparent and encrypt do not recover from it.
+
+This narrows explanation (b) above rather than confirming (a): less "the rate is unsustainable
+period" or "OMB's `buffer.memory` is universally undersized above 1M msg/s", more "a cold-started
+producer without CHOP's own gradual ramp can't reach steady state within a 2-minute warmup, at
+transparent/encrypt's specific rates." That points first at lengthening `warmupDurationMinutes` in a
+repeats-confirm matrix like this one before reaching for `buffer.memory` — though `buffer.memory` is
+still untested and not ruled out. Neither has been rerun yet.
+
+*(That last paragraph holds up for **transparent** — see the correction below, which confirms the
+cold-start diagnosis and quantifies it. It does not hold for **encrypt**, which never had the capacity
+in that cluster regardless of warmup.)*
+
+### Correction and root cause for Finding 18
+
+Re-analysis of the same two directories (report10 = CHOP ramp + its own 10-minute measurement window,
+report11 = fixed-rate confirm), driven off the Prometheus series and the per-interval `publishRate`
+arrays rather than the aggregate fields. Three of Finding 18's conclusions were wrong, and the two arms
+failed for **unrelated** reasons — neither of which is hold length.
+
+**The control Finding 18 didn't use: report10's own measurement window already validated all three
+rates.** Each arm ran its discovered rate for 10 continuous minutes immediately after discovery:
+
+|     arm     | CHOP discovered | report10 10-min window | ratio  | mean publish delay over the window |
+|-------------|-----------------|------------------------|--------|------------------------------------|
+| direct      | 1,153,675       | 1,153,489              | 99.98% | 92.6 ms                            |
+| transparent | 1,178,000       | 1,177,916              | 99.99% | 592 **µs**                         |
+| encrypt     | 129,356         | 129,365                | 100.0% | 31.9 **µs**                        |
+
+So "a 180s hold is too short" cannot be the explanation for either arm: a *600s* window at the same rate
+was clean, in the same run, minutes later. Whatever changed, changed between report10 and report11.
+
+**Encrypt: a genuine failure, on a resource CHOP cannot see.** The gateway hit its 2-core cgroup quota.
+
+|                         |    report10 (clean)     |                 report11 (collapsed)                 |
+|-------------------------|-------------------------|------------------------------------------------------|
+| gateway CPU, median     | 1.691 / 2.0 (**84.5%**) | **1.998 / 2.0 (99.9%)**                              |
+| throttled CFS periods/s | 1.9                     | **9.98** (every period)                              |
+| gateway p99             | 71 ms                   | 1,611 ms (max 26.8 s)                                |
+| achieved                | 129,365                 | 96,414 whole-window; **~104,000** post-stall plateau |
+
+It was already being throttled **in the very first sample** (8.12 periods/s while publish delay was still
+2.2 ms), before any back-pressure existed — so the CPU wall is the cause, not a consequence of the spiral.
+The cascade then closes arithmetically: gateway latency >1s → the producer's 15 in-flight requests ×
+~9,523 records ÷ 1.19s ≈ 120k ceiling → `buffer.memory` exhausted → `bufferpool_wait_rate` 0.91 → settles
+at ~96k with delay pinned to the histogram ceiling. Finding 18 saw the last link in that chain and read it
+as the first.
+
+Report10's encrypt gateway CPU-vs-rate curve is clean and linear at **~76,000 msg/s per core** across
+80k–136k (0.4% spread over 80k/120k/129k/132k/136k holds). Report11's node could not reproduce it: it
+needed *more than* 2.0 cores to do what report10's did in 1.69, so the regression is **≥18%**; the upper
+bound is unmeasurable because throttling censors demand above the quota. Cause not established —
+`report11`'s cluster is a fresh AKS deploy (`aks-gateway-22649591` vs `aks-gateway-21146700`), so same
+pool config and VM family but a different physical host. **Finding 18's spec counterpart lists "node
+hardware" as ruled out on the grounds of same pool/VM family; that does not follow, and this is the one
+hypothesis the data most supports.** Direct is the control and was unaffected (in fact marginally faster
+in report11), so brokers, workers and network are all excluded.
+
+**Transparent: it sustained the rate. The harness's metric didn't.**
+
+|         window          |     rate      | vs target 1,177,897 |
+|-------------------------|---------------|---------------------|
+| first 100s              | 957,949       | 81%                 |
+| **last 100s**           | **1,186,455** | **101%** ✓          |
+| whole window (reported) | 1,088,637     | 92.4% ✗             |
+
+The measured window opens mid-ramp — 261k → 496k → 550k → 690k → 850k → 1,088k over ~90 seconds — and
+during that ramp median publish latency is 14-17 ms, backlog is 0, gateway CPU is 0.71 of 2.0 with
+effectively no throttling (median 0, max 0.1 periods/s), and the brokers are ~98% idle. Nothing is
+saturated; it is a cold sending pipeline warming up.
+`is_saturated` (whole-window mean < 0.95× target) therefore fired on the ramp. Finding 18's cold-start
+diagnosis was right; its conclusion that the arm "didn't survive" was not.
+
+Why the 2-minute warmup didn't absorb it: the warmup is a **separate benchmark invocation with fresh
+worker pods** — the `transparent.warmup` and `transparent.run1` coordinator logs resolve different worker
+pod addresses at startup, so the pods were replaced between the two. Nothing carries over; each run pays
+cold-start again.
+
+**Why the delay climbed while the rate recovered** — the divergence the original table hid. Transparent
+entered its window ~14s behind `UniformRateLimiter`'s virtual schedule and left it 47s behind, *while*
+exceeding target. Both are true at once: closing a 14s deficit on ~1% surplus capacity needs ~1,400s, not
+300s. So `aggregatedPublishLatency99pct` (3,287 ms) and the publish-delay series for these windows
+describe a queue that formed **before the window opened**. That is structurally the same defect as the
+`resetStats()` bug in the section above — a *level* carried across a boundary that the reader takes for a
+*flow* measured inside it. Resetting the histogram does not help, because the deficit lives in the rate
+limiter, not the recorder. Any confirm harness that judges on publish delay needs to either reset the rate
+limiter at the window boundary or discard the deficit explicitly.
+
+**What this changes**
+
+- Finding 18's count: **1 of 3**, not 2 of 3.
+- Neither arm is evidence for lengthening `rampHoldSeconds`. Report10's 600s window at the same rates was
+  clean.
+- For transparent, the fix is harness-side and cheap: judge the confirm on a steady-state tail rather than
+  the whole-window mean, and/or lengthen the warmup for gateway arms. `buffer.memory` remains untested but
+  is no longer the leading hypothesis for this arm.
+- For encrypt, the fix is the resource-headroom gate already proposed in `RATE_FINDING.md` — **but not at
+  the threshold proposed there.** See the next finding.
+
+## Finding 19: the proposed 85% resource-headroom gate would have passed the rate it was designed to reject
+
+Checked directly against `encrypt.chop-verify.metrics.json` — the file the harness already captures over
+exactly the confirmation window, and precisely the input the proposed gate would consume:
+
+```
+report10 encrypt confirming hold (129,356 msg/s), n=19 samples
+  median 1.690 / 2.0 = 84.5%   -> PASSES a "reject if > 85%" gate
+  max    1.807 / 2.0 = 90.3%   -> rejects, but only if gated on peak
+```
+
+Two corrections to the gate as specified:
+
+1. **It must gate on peak (or a high percentile), not the median.** On the median this rate clears an 85%
+   threshold by half a point. `RATE_FINDING.md` said, before this correction, that the good run "peaked at
+   1.82 of 2.0 cores (91%)". That figure is the max over the *whole* metrics window (1.818), which includes
+   the failed 136k bracket hold. Over the confirming hold alone the peak is 1.807 and the median 1.690.
+   Quoting whole-run statistics to size a gate that inspects only the confirming hold is what made 85% look
+   sufficient.
+
+2. **85% is too high, and the spec's own derate arithmetic doesn't survive either.** Using report10's
+   measured ~76,000 msg/s/core curve to price each candidate on that node:
+
+   |                   target                    | cores | % of 2-core limit |           within report11's ~104k plateau?            |
+   |---------------------------------------------|-------|-------------------|-------------------------------------------------------|
+   | 129,326 (what CHOP confirmed)               | 1.690 | 84.5%             | no — collapsed, with a ~50s stall                     |
+   | 120,000 (spec's derate, `129k × 0.85/0.91`) | 1.568 | 78.4%             | **no** — still above what report11's node could serve |
+   | 103,946 (report11's post-stall plateau)     | 1.358 | **67.9%**         | at the limit, by construction                         |
+   | 100,570 (report11's final interval)         | 1.314 | 65.7%             | yes                                                   |
+
+   To have produced a number that reproduced on report11's node, the gate would have had to reject anything
+   above roughly **65-68%** of the CPU limit — not 85%.
+
+The general form matters more than the constant: ~65% is calibrated to one observed cross-cluster delta
+(≥18%), so the threshold should be expressed as **required margin ≥ measured node-to-node variance**, and
+that variance has to be measured rather than assumed. A fixed 85% encodes an assumption of ~15% variance
+that this campaign directly refutes. It also means a single-cluster calibration cannot set this threshold
+at all — you need the same arm on at least two cluster instances, which is what report10 and report11
+accidentally provided.
+
+One caveat on the whole approach, visible in the stall: utilisation of the bottleneck resource is not a
+clean instrument once the system is past its knee. During intervals 18-22 the gateway's CPU *fell* to 0.273
+cores while throughput was collapsing, because the producer had wedged on `buffer.memory` and stopped
+feeding it. A headroom gate reading utilisation over a window that includes such a stall would see low
+utilisation and conclude there was plenty of headroom. The gate is sound only over a hold that is otherwise
+clean — which is exactly the confirming hold it is specified to read, so this is an argument for keeping it
+there rather than generalising it to arbitrary windows.
+

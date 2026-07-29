@@ -519,28 +519,52 @@ that is actually the bottleneck -- e.g. the gateway CPU on an encrypting proxy p
 is the wall, a rate can be confirmed cleanly and still fail to reproduce.
 
 A gateway campaign made this concrete. CHOP confirmed **129,326 msg/s** for an encrypting arm; a later
-fixed-rate confirmation at that exact target sustained only **~96,000** (75%), with the gateway pegged
-at its 2-core limit and p99 publish latency at 46 s. It was not a measurement artifact: during discovery
+fixed-rate confirmation at that exact target averaged **~96,000** (75%) and plateaued at **~104,000** (80%)
+after a ~50-second near-total stall, with the gateway pegged at its 2-core limit and p99 publish latency at
+46 s. It was not a measurement artifact: during discovery
 the rate held for ~7.5 minutes with backlog of 1--2 K messages and publish delay of ~31 microseconds --
-clean by every producer/consumer signal. The difference was the gateway CPU, which CHOP never sees: even
-in the good run it peaked at **1.82 of 2.0 cores (91%)** and was already throttling. 129k simply sits at
-the edge of the encryption CPU budget (encryption here is per-*message*-bound -- 2 pegged cores move only
-~9.6 MB/s of 100-byte messages), where ordinary run-to-run variance flips the outcome between sustainable
-and saturated. Broker health and arm ordering were ruled out; both were the same across the runs.
+clean by every producer/consumer signal, and a *600-second* measurement window at the same rate immediately
+afterwards sustained 100.0% of it. The difference was the gateway CPU, which CHOP never sees. Measured over
+the confirming hold itself: **median 1.690 of 2.0 cores (84.5%), peak 1.807 (90.3%)**, already throttling
+at ~1.9 CFS periods/s. In the failed confirmation the same gateway sat at a median of **1.998 (99.9%)** and
+was throttled in essentially every period (~10/s) -- from its very first sample, before any back-pressure
+existed. Encryption here is per-*message*-bound (2 pegged cores move only ~9.6 MB/s of 100-byte messages),
+so 129k sits close enough to the CPU budget that a **≥18%** change in per-message cost consumes the whole
+margin. Brokers, workers and arm ordering were ruled out -- a non-gateway arm on the same clusters was
+unaffected. Node hardware was *not* ruled out: the two runs are different physical clusters with the same
+pool config and VM family, and this is the hypothesis the data most supports.
 
 No producer/consumer-side gate can catch this -- not the backlog check, not the `THROUGHPUT` ratio, not a
 latency gate -- because at ramp time the wall is *approached, not breached*: throughput, backlog, and
-delay are all genuinely clean at 91% CPU. The only signal that reveals the fragility is the bottleneck
+delay are all genuinely clean at ~85% CPU. The only signal that reveals the fragility is the bottleneck
 resource's own utilization.
 
 **Direction (not yet implemented): a resource-headroom gate.** Reject or derate a candidate whose
-bottleneck-resource utilization during the confirming hold exceeds a headroom threshold (~85%). It can be
-applied harness-side with no finder change -- `rampVerification` already carries the confirmation window,
-and the harness already samples resource metrics over exactly that window (`chop-verify.metrics.json`);
-derate to `target x (headroom / observed_peak)` (~120k here) and re-confirm. This is complementary to the
-verdict choice: the verdict decides what "kept up" means; the headroom gate refuses a rate that kept up
-only by consuming the last of a hard resource. Full design in
-[`docs/superpowers/specs/2026-07-24-chop-throughput-verdict-design.md`](../docs/superpowers/specs/2026-07-24-chop-throughput-verdict-design.md).
+bottleneck-resource utilization during the confirming hold exceeds a headroom threshold. It can be applied
+harness-side with no finder change -- `rampVerification` already carries the confirmation window, and the
+harness already samples resource metrics over exactly that window (`chop-verify.metrics.json`).
+
+Two things to get right, both learned by checking a proposed threshold against the run it was meant to
+reject:
+
+- **Gate on peak (or a high percentile), not the median.** Over the confirming hold above, the median is
+  84.5% -- so a "reject above 85%" gate *passes* the very rate that failed to reproduce. Only the peak
+  (90.3%) rejects it.
+- **85% is too high.** Pricing candidates against that run's measured ~76,000 msg/s per gateway core, the
+  rate that actually held on the second cluster (~104k, its post-stall plateau) sits at **~68%** of the
+  limit; an 85%-derated target (~120k, i.e. 78%) would still have failed. Express the threshold as
+  **required margin ≥ measured node-to-node variance** rather than as a fixed number -- a fixed 85% encodes
+  an assumption of ~15% variance that this campaign refutes. Note this cannot be calibrated from a single
+  cluster: you need the same arm on two cluster instances to know the variance at all.
+- **Read utilization only over an otherwise-clean hold.** Past the knee the signal inverts: in the failed
+  confirmation the gateway's CPU *fell* to 0.27 cores during a ~50-second stall, because the producer had
+  wedged on `buffer.memory` and stopped feeding it. Low utilization there means starvation, not headroom.
+
+This is complementary to the verdict choice: the verdict decides what "kept up" means; the headroom gate
+refuses a rate that kept up only by consuming the last of a hard resource. Full design in
+[`docs/superpowers/specs/2026-07-24-chop-throughput-verdict-design.md`](../docs/superpowers/specs/2026-07-24-chop-throughput-verdict-design.md);
+the supporting runs are Findings 18--19 in
+[`docs/ramp-finder-trial-log.md`](../docs/ramp-finder-trial-log.md).
 
 ### Trial log
 
