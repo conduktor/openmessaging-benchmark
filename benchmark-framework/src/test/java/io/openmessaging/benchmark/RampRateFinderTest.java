@@ -1200,12 +1200,21 @@ class RampRateFinderTest {
                 .isEqualTo(1250.0);
     }
 
-    // Drives a fixed-capacity fixture to completion and returns the polls discovery cost, checking on
-    // the way out that it still lands on the real ceiling. Mirrors the integration test's geometry:
-    // 3s
+    /** What one discovery run cost, and where it landed. */
+    private static final class Discovery {
+        private final int polls;
+        private final double rate;
+
+        Discovery(int polls, double rate) {
+            this.polls = polls;
+            this.rate = rate;
+        }
+    }
+
+    // Drives a fixed-capacity fixture to completion. Mirrors the integration test's geometry: 3s
     // polls, 45s holds, and a deliberately low 5000 msg/s start rate, so the bracket phase does real
     // work climbing to the ceiling rather than starting next to it.
-    private static int pollsToDiscover(double capacity, boolean seedFromAchievedRate) {
+    private static Discovery discover(double capacity, boolean seedFromAchievedRate) {
         Workload workload = throughputWorkload();
         workload.rampStartRate = 5000;
         workload.rampBracketHoldSeconds = 45;
@@ -1225,22 +1234,52 @@ class RampRateFinderTest {
             polls++;
         }
         assertThat(done).isTrue();
-        assertThat(Math.abs(capacity - finder.getCurrentRate()) / capacity)
+        return new Discovery(polls, finder.getCurrentRate());
+    }
+
+    // The polls a discovery cost, checking on the way out that it still lands on the real ceiling.
+    private static int pollsToDiscover(double capacity, boolean seedFromAchievedRate) {
+        Discovery discovery = discover(capacity, seedFromAchievedRate);
+        assertThat(Math.abs(capacity - discovery.rate) / capacity)
                 .as("seeded or not, discovery must still land on the real ceiling")
                 .isLessThan(0.05);
-        return polls;
+        return discovery.polls;
     }
 
     @Test
-    void seedingReachesTheSameCeilingInFewerHoldsThanBlindBisection() {
-        // The reason the seed exists: discovery time. Every hold costs its full length under
-        // THROUGHPUT, which has no per-poll fast-fail, so holds are the unit of cost. Note this is a
-        // real but modest saving -- the seed places lo accurately and leaves hi where bracket's last
-        // doubling put it, so chop still has the whole [lo, hi] span to bisect afterwards.
-        int bisecting = pollsToDiscover(841_000, false);
-        int seeded = pollsToDiscover(841_000, true);
+    void seedingAndBlindBisectionAgreeOnTheCeiling() {
+        // Was seedingReachesTheSameCeilingInFewerHoldsThanBlindBisection, asserting
+        // seeded < bisecting as the justification for D5. That ordering no longer holds here, and a
+        // sweep across capacities shows it never generalised -- it held at the single capacity this
+        // test happened to pick. Cost in polls on this fixture (THROUGHPUT, 45s holds, 5,000 start),
+        // before and after convergence-on-failure landed:
+        //
+        //     capacity   blind before -> after   seeded (unchanged by it)   winner now
+        //      120,000        166 -> 166                  166                 tie
+        //      300,000        181 -> 181                  151                 seed
+        //      450,000        196 -> 196                  211                 blind
+        //      634,000        226 -> 226                  226                 tie
+        //      841,000        256 -> 211                  226                 blind  <- here
+        //      900,000        211 -> 211                  226                 blind
+        //    1,112,274        211 -> 211                  196                 seed
+        //
+        // Both mechanisms shorten the same thing -- a run of failing candidates -- so evaluating
+        // convergence when a failure tightens hi absorbed most of what the seed was buying, and at
+        // 841,000 it absorbed enough to overtake it. Note the fix moves only that one cell: under
+        // THROUGHPUT a candidate within rampMinThroughputRatio of capacity still *passes*, so failure
+        // runs are short and the bracket rarely narrows inside the tolerance while still failing. The
+        // grind it fixes belongs to BACKLOG, whose backlog-level check has no such slack --
+        // aBracketThatConvergesThroughConsecutiveFailuresStopsChoppingInsteadOfGrindingOn covers it.
+        //
+        // What survives is the placement property the other two seed tests pin, plus this: whichever
+        // route chop takes, it agrees on the ceiling. Whether D5 still earns its complexity on
+        // discovery time is now an open question, recorded in the trial log rather than decided here.
+        Discovery bisecting = discover(841_000, false);
+        Discovery seeded = discover(841_000, true);
 
-        assertThat(seeded).isLessThan(bisecting);
+        assertThat(Math.abs(seeded.rate - bisecting.rate) / bisecting.rate)
+                .as("the seed changes the route through the bracket, not the answer it arrives at")
+                .isLessThan(0.05);
     }
 
     @Test
@@ -1737,5 +1776,118 @@ class RampRateFinderTest {
             long pendingDeliveries = subscriptions * totalPublished - totalReceived;
             totalReceived += (long) Math.min(consumerCapacity * periodSeconds, pendingDeliveries);
         }
+    }
+
+    /**
+     * A broker whose producer always keeps up but whose consumers drain at a fixed ceiling, so an
+     * oversubscribed rate shows as a growing *receive backlog* while the achieved-rate ratio stays
+     * healthy. This is the shape report12's encrypt arm actually failed with -- achievedRatio
+     * 0.98-0.996 (passing) against a backlog 1.0-1.4x its limit (failing) -- and the reason {@link
+     * FakeSystem} cannot express it: that fixture keeps received equal to published, so backlog is
+     * always zero and only the 5%-tolerant producer ratio can ever breach.
+     */
+    private static final class FakeConsumerLimitedSystem {
+        private final double consumerCapacity;
+        long totalPublished;
+        long totalReceived;
+
+        FakeConsumerLimitedSystem(double consumerCapacity) {
+            this.consumerCapacity = consumerCapacity;
+        }
+
+        void advance(double rate, long periodNanos) {
+            double periodSeconds = periodNanos / 1e9;
+            totalPublished += (long) (rate * periodSeconds);
+            long pending = totalPublished - totalReceived;
+            totalReceived += (long) Math.min(consumerCapacity * periodSeconds, pending);
+        }
+    }
+
+    // Bracket doubles 10k -> 80k clean, 160k fails, so lo lands at 80,000 with a capacity only 0.5%
+    // above it. Every bisection midpoint therefore stays above capacity and keeps failing while hi
+    // ratchets down past the convergence tolerance -- report12's grind, in miniature.
+    private static Workload grindingWorkload() {
+        Workload workload = workload();
+        workload.rampStartRate = 10_000;
+        workload.rampBracketHoldSeconds = 3;
+        workload.rampHoldSeconds = 3;
+        workload.rampMaxDiscoveryMinutes = 600; // measuring search shape, so the cap must not bite
+        // Unlike the hand-fed sequences that share workload(), these two drive a whole search against
+        // a stateful fixture, so the drain has to be on: without it each failed candidate's backlog is
+        // inherited by the next and the confirmation hold fails on debt it did not incur, which is a
+        // different defect from the one under test here.
+        workload.rampDrainSeconds = 30;
+        return workload;
+    }
+
+    @Test
+    void aBracketThatConvergesThroughConsecutiveFailuresStopsChoppingInsteadOfGrindingOn() {
+        // From report12's encrypt arm. lo held clean at 140,000, then ELEVEN consecutive candidates
+        // failed while chop bisected [140,000, 150,000] down to 4.88 msg/s wide -- 9m57s and 11
+        // drain/recovery cycles, 49% of the whole run, to move the reported rate by 0.003%. The
+        // bracket was already inside the 5% tolerance from the second failure onward; the search
+        // should have stopped there. It did not, because the convergence check sits only on
+        // pollChop's *pass* path -- a run of failures tightens hi and returns straight into the next
+        // drain without ever evaluating it. A stop condition reachable only when candidates succeed
+        // cannot stop a search whose candidates all fail, which is precisely the runaway case.
+        RampRateFinder finder = new RampRateFinder(grindingWorkload());
+        FakeConsumerLimitedSystem system = new FakeConsumerLimitedSystem(80_400);
+        long periodNanos = SECONDS.toNanos(1);
+
+        int pollsSpentInsideAConvergedBracket = 0;
+        boolean done = false;
+        for (int poll = 0; poll < 10_000 && !done; poll++) {
+            if (finder.getPhase() == RampRateFinder.Phase.CHOP
+                    && !finder.isDraining()
+                    && !finder.isConfirming()
+                    && finder.getLo() != null
+                    && finder.getHi() != null
+                    && (finder.getHi() - finder.getLo()) / finder.getLo() <= 0.05) {
+                pollsSpentInsideAConvergedBracket++;
+            }
+            system.advance(finder.getCurrentRate(), periodNanos);
+            done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+        }
+
+        assertThat(done).as("discovery must still finish").isTrue();
+        assertThat(pollsSpentInsideAConvergedBracket)
+                .as(
+                        "once (hi-lo)/lo is within the tolerance the answer is settled; every further"
+                                + " bisection poll refines a number the tolerance says we do not know")
+                .isZero();
+    }
+
+    @Test
+    void convergingOnAFailedCandidateStillDrainsBeforeTheConfirmationHold() {
+        // Guards the obvious way to get the above wrong: short-circuiting straight to the
+        // confirmation hold the moment hi is tightened. The candidate that just failed left a
+        // backlog behind, and Finding 17 is what happens when a hold begins carrying one -- the
+        // confirm would be judging the previous candidate's overshoot rather than its own rate.
+        // Convergence reached by failing must route through recovery, exactly as any other chop
+        // failure does. Note this says nothing about convergence reached by *passing*, where there
+        // is nothing to drain and inserting one would be pure waste.
+        RampRateFinder finder = new RampRateFinder(grindingWorkload());
+        FakeConsumerLimitedSystem system = new FakeConsumerLimitedSystem(80_400);
+        long periodNanos = SECONDS.toNanos(1);
+
+        boolean drainingWhenConfirmingBegan = false;
+        boolean reachedConfirm = false;
+        for (int poll = 0; poll < 10_000; poll++) {
+            system.advance(finder.getCurrentRate(), periodNanos);
+            boolean done = finder.poll(periodNanos, system.totalPublished, system.totalReceived);
+            if (finder.isConfirming()) {
+                reachedConfirm = true;
+                drainingWhenConfirmingBegan = finder.isDraining();
+                break;
+            }
+            if (done) {
+                break;
+            }
+        }
+
+        assertThat(reachedConfirm).as("the search must reach a confirmation hold").isTrue();
+        assertThat(drainingWhenConfirmingBegan)
+                .as("convergence on a failed candidate must enter recovery, not the confirm hold")
+                .isTrue();
     }
 }

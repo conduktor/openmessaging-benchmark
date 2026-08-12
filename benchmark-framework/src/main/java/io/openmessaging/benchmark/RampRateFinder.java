@@ -496,6 +496,22 @@ class RampRateFinder {
             if (lo >= hi) {
                 lo = bestKnownPassBelow(hi);
             }
+            // Tightening hi can converge the bracket just as raising lo can, so the stop condition has
+            // to be evaluated here too. It used to live only on the pass path below, which meant a run
+            // of consecutive failures narrowed hi indefinitely without anything asking whether the
+            // answer was already settled -- and a stop condition reachable only when candidates
+            // succeed cannot stop a search whose candidates all fail, which is exactly the runaway
+            // case. Observed on a gateway encrypt arm: eleven consecutive failures bisecting a bracket
+            // that had been inside the tolerance since the second one, burning 49% of the run's wall
+            // clock to move the reported rate by 0.003%.
+            if (converged()) {
+                confirming = true;
+                confirmationHoldsPassed = 0;
+                // Via beginDrain, not straight to the hold: the candidate that just failed left a
+                // backlog, and a confirmation hold that begins carrying it is judging the previous
+                // candidate's overshoot rather than its own rate.
+                return beginDrain(confirmRate());
+            }
             return beginDrain(nextAfterFailure());
         }
 
@@ -505,7 +521,7 @@ class RampRateFinder {
             lo = currentRate;
         }
 
-        if ((hi - lo) / lo <= convergenceTolerance) {
+        if (converged()) {
             if (!confirming) {
                 // Require requiredConfirmationHolds more consecutive clean holds before accepting
                 // -- but hold them at confirmRate(), not at lo. Chop converges to within
@@ -663,6 +679,12 @@ class RampRateFinder {
         draining = true;
         elapsedDrainNanos = 0;
         return false;
+    }
+
+    // The bracket is as narrow as the tolerance says the answer is knowable, so further bisection
+    // would be refining noise. Reached either by raising lo or by tightening hi.
+    private boolean converged() {
+        return (hi - lo) / lo <= convergenceTolerance;
     }
 
     private double confirmRate() {

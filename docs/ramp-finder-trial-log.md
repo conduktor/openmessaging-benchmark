@@ -273,6 +273,10 @@ settling behaviour, and check publish delay in the run that follows.
 
 ## Finding 6: achieved-rate seeding (D5) is worth ~12%, not the ~50% I claimed
 
+> **The ~12% is superseded by Finding 20.** It was measured at a single capacity; a later sweep shows
+> seeding was never a general time win, and evaluating convergence on the failure path then absorbed
+> most of what remained. The placement argument for the seed still stands.
+
 Working note. `rampSeedFromAchievedRate` uses a failed hold's achieved throughput as the next
 candidate instead of bisecting the bracket. I justified it in the review as the strongest available
 lever on the ~48-minute integration test, guessing it "would roughly halve" discovery. That guess was
@@ -1194,3 +1198,87 @@ utilisation and conclude there was plenty of headroom. The gate is sound only ov
 clean — which is exactly the confirming hold it is specified to read, so this is an argument for keeping it
 there rather than generalising it to arbitrary windows.
 
+## Finding 20: the convergence check was unreachable on the failure path, costing 49% of a run
+
+report12, encrypt arm, `BACKLOG`, shipped defaults (120s holds, 5% tolerance). `lo` held clean at
+140,000 msg/s at 17:14:59. The next **eleven** candidates all failed, each followed by a drain:
+
+| #  |    candidate    |  hold  |  verdict  |        `(hi-lo)/lo` after         |
+|----|-----------------|--------|-----------|-----------------------------------|
+| 1  | 150,000         | 6.2s   | exceeded  | 0.0714                            |
+| 2  | 145,000         | 24.6s  | exceeded  | **0.0357 — inside the tolerance** |
+| 3  | 142,500         | 55.4s  | exceeded  | 0.0179                            |
+| 4  | 141,250         | 33.9s  | exceeded  | 0.0089                            |
+| 5  | 140,625         | 98.6s  | exceeded  | 0.0045                            |
+| 6  | 140,312.5       | 27.8s  | exceeded  | 0.0022                            |
+| 7  | 140,156.25      | 15.4s  | exceeded  | 0.0011                            |
+| 8  | 140,078.125     | 21.6s  | exceeded  | 0.00056                           |
+| 9  | 140,039.0625    | 40.0s  | exceeded  | 0.00028                           |
+| 10 | 140,019.53125   | 43.1s  | exceeded  | 0.00014                           |
+| 11 | 140,009.765625  | 83.2s  | exceeded  | 0.00007                           |
+| —  | 140,004.8828125 | 120.1s | **clean** | 0.00003                           |
+
+17:15:06 → 17:25:03 is **9m57s of a 20m19s discovery**, plus eleven drain cycles. The payoff: `lo` moved
+140,000 → 140,004.88, so the confirmed rate went from a would-be 133,000 to 133,004.64 — **4.6 msg/s,
+0.003%**.
+
+Being precise about the recoverable portion, since the span above is not all of it: candidate 2 fails at
+17:15:33.8 leaving `(hi-lo)/lo = 0.0357`. Stopping there means a drain (~3s) plus one 120s confirmation
+hold at `140,000 x 0.95 = 133,000`, finishing ~17:17:37 against an actual 17:27:06.5. So the saving is
+**~9m29s of a 20m19s run, 47%** — the confirmation hold has to run either way.
+
+**Root cause, read off the code rather than inferred.** `pollChop()` has two exits. The failure path
+sets `hi = currentRate` and returns `beginDrain(...)` immediately; the convergence check lives further
+down, on the pass path, after `lo = currentRate`. So convergence was only ever evaluated after a hold
+*succeeded*. A run of consecutive failures tightened `hi` indefinitely without anything asking whether
+the answer was already settled — and a stop condition reachable only when candidates succeed cannot
+stop a search whose candidates all fail, which is precisely the runaway case it exists to prevent.
+
+Why the candidates failed at all: not a seeding problem. `achievedRatio` was 0.98–0.996 on every one,
+so the producer kept up and `rampSeedFromAchievedRate` correctly declined to seed (the achieved rate
+was the target restated, not a capacity estimate). What breached was the backlog *level*:
+`rampMaxBacklogSeconds: 0.5` x 140,000 ≈ 70,000, against observed 70,814–99,415, i.e. 1.0–1.4x the
+limit. Every rate in 140,009–150,000 sits in a band where the verdict is near-random. This is the
+failure mode the `searching-a-parameter-space` note names — *bisecting into noise gives false
+precision* — and the convergence tolerance is the guard that was wired to the wrong branch.
+
+`direct` and `transparent` in the same run were untouched (14 holds, 1 drain each, converging on the
+pass path), which is what makes this specific to a marginal band rather than general.
+
+**Fix**: evaluate convergence when a failure tightens `hi` as well, and route that case through
+`beginDrain(confirmRate())` rather than straight to the hold — the failed candidate left a backlog,
+and Finding 17 is what a confirmation hold inheriting one looks like. Two tests, both red first:
+one asserting no poll is ever spent bisecting inside an already-converged bracket (it counted 7 on
+the fixture, 96 with the drain off), one asserting convergence-by-failure enters recovery.
+
+The fixture is worth a note. `FakeSystem` cannot express this at all: it keeps received equal to
+published, so backlog is always zero and the only thing that can breach is the 5%-tolerant producer
+ratio — meaning candidates within 5% of capacity *pass* and failure runs stay short. Reproducing the
+grind needed a consumer-limited fixture, where the backlog level gives a threshold with no slack.
+That is the same asymmetry as the real arms: the grind is a `BACKLOG` phenomenon, and `THROUGHPUT`'s
+`rampMinThroughputRatio` slack hides it.
+
+### Consequence: Finding 6's D5 timing result no longer holds
+
+The fix shortens the same thing D5 does, so it partly absorbs it. Cost in polls on the `THROUGHPUT`
+hard-cap fixture (45s holds, 5,000 start), before and after:
+
+| capacity  | blind before | blind after | seeded (unchanged) | winner after |
+|-----------|--------------|-------------|--------------------|--------------|
+| 120,000   | 166          | 166         | 166                | tie          |
+| 300,000   | 181          | 181         | 151                | seed         |
+| 450,000   | 196          | 196         | 211                | blind        |
+| 634,000   | 226          | 226         | 226                | tie          |
+| 841,000   | **256**      | **211**     | 226                | blind        |
+| 900,000   | 211          | 211         | 226                | blind        |
+| 1,112,274 | 211          | 211         | 196                | seed         |
+
+Two observations. The fix moves exactly one cell on this fixture (841,000, −18%), for the slack reason
+above. And Finding 6's "~12%" was measured at that one capacity — the sweep shows seeding was never a
+general time win: two wins, three losses, two ties. `seedingReachesTheSameCeilingInFewerHoldsThanBlindBisection`
+asserted `seeded < bisecting` and had been passing because 841,000 was the capacity it happened to pick;
+it is now `seedingAndBlindBisectionAgreeOnTheCeiling`, asserting the property that survives.
+
+**Open**: whether `rampSeedFromAchievedRate` still earns its complexity. It is on by default and still
+buys accurate *placement* of `lo` — a measured rate rather than a midpoint — which is a correctness
+argument, not a speed one. Not changed here; flagged for a decision.
