@@ -2,33 +2,19 @@
 
 ## Precondition
 
-You need to install [Eclipse Temurin 17](https://adoptium.net/) (or 21)
+You need to install [Eclipse Temurin 21](https://adoptium.net/)
 and set the JAVA_HOME environment variable to its installation directory.
 
 ## Building the image
 
 You can use one of the Dockerfiles based on your needs:
 
-- `Dockerfile` - requires local build first
-- `Dockerfile.build` - builds inside Docker (JDK 17 only)
-- `Dockerfile.builder` - **recommended** - multi-JDK support (17 and 21)
-
-### `Dockerfile.builder` (Recommended)
-
-Supports both JDK 17 and JDK 21. Skips formatting checks that can have
-JDK version incompatibilities in container environments.
-
-```bash
-# Build with JDK 17 (default)
-docker build -t omb-benchmark:jdk17 -f docker/Dockerfile.builder .
-
-# Build with JDK 21
-docker build -t omb-benchmark:jdk21 --build-arg JDK_VERSION=21 -f docker/Dockerfile.builder .
-```
+- `Dockerfile` - requires local build first (this is the one CI builds)
+- `Dockerfile.build` - builds inside Docker, no local Maven needed
 
 ### `Dockerfile`
 
-Uses `eclipse-temurin:17` and takes `BENCHMARK_TARBALL` as an argument.
+Uses `eclipse-temurin:21` and takes `BENCHMARK_TARBALL` as an argument.
 While using this Dockerfile, you will need to build the project locally **first**.
 
 ```bash
@@ -39,10 +25,16 @@ docker build -t openmessaging-benchmark:latest --build-arg BENCHMARK_TARBALL . -
 
 ### `Dockerfile.build`
 
-Uses Maven to build the project inside Docker, then uses `eclipse-temurin:17` as runtime.
+Uses Maven to build the project inside Docker, then uses `eclipse-temurin:21` as runtime.
 This Dockerfile has no local dependency (you do not need Maven installed locally).
 
 ```bash
 docker build -t openmessaging-benchmark:latest . -f docker/Dockerfile.build
 ```
 
+## Image layout
+
+Both Dockerfiles unpack the distribution to `/opt/benchmark` in a **single** published
+layer, via a build stage that is discarded. Keep it that way: extracting to `/` and then
+relocating the tree with `mv` in a later instruction writes the whole ~247 MB
+distribution into two layers, both of which get pushed and pulled.

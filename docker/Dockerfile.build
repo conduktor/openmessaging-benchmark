@@ -13,21 +13,26 @@
 #
 
 # Build the Project
-FROM maven:3.9.9-eclipse-temurin-21 as build
+FROM maven:3.9.9-eclipse-temurin-21 AS build
 COPY . /benchmark
 WORKDIR /benchmark
-RUN mvn install
+# Extract in the same layer as the build: this stage is never published, and keeping the
+# unpack here means the distribution reaches the final image in a single layer.
+RUN mvn install \
+ && mkdir -p /dist/benchmark \
+ && tar -xzf package/target/openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz \
+        -C /dist/benchmark --strip=1
 
 # Create the benchmark image
 FROM eclipse-temurin:21
-COPY --from=build /benchmark/package/target/openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz /
-RUN mkdir /opt/benchmark && tar -xzf openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz -C /opt/benchmark --strip=1
-RUN rm /openmessaging-benchmark-*-SNAPSHOT-bin.tar.gz
-WORKDIR /opt/benchmark
 
 # Install vim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y vim tzdata && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build --chown=0:0 /dist/benchmark /opt/benchmark
+
+WORKDIR /opt/benchmark
 
 # Start a shell by default
 CMD ["/bin/bash"]
