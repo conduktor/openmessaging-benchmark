@@ -97,21 +97,23 @@ class ChopRateFinderKafkaIT {
                 .isGreaterThanOrEqualTo(backlog.confirmedRate);
     }
 
-    // Withholding a rate is a deliberate, safe outcome rather than a defect: the finder recorded a
-    // contradicting pair of verdicts during the search and refused to report a number it could not
-    // stand behind. On a single-container broker it is common -- 3 of 5 observed runs withheld.
-    // Failing
-    // for it would make this a test of the broker's stability rather than of this code, and it cannot
-    // hide the failure mode that matters: a *collapsed* discovery never reaches here at all, because
-    // WorkloadGenerator throws rather than handing a near-zero rate to the measurement window. So
-    // skip, loudly, and let the FINDER-HOLD lines say why.
+    // A null confirmedRate now means discovery never reached a genuine confirm at all (safety-capped,
+    // or WorkloadGenerator's collapse guard) -- a contradicting pair of verdicts during the search no
+    // longer withholds the rate by itself; it's still reported (flagged
+    // rampVerification.nonMonotonic)
+    // as long as a later confirm hold actually passed. Failing on an unconfirmed run would make this
+    // a
+    // test of the broker's stability rather than of this code, and it cannot hide the failure mode
+    // that matters: a *collapsed* discovery never reaches here at all, because WorkloadGenerator
+    // throws
+    // rather than handing a near-zero rate to the measurement window. So skip, loudly, and let the
+    // FINDER-HOLD lines say why.
     private static void assumeConfirmed(Discovery discovery, RampVerdict verdict) {
         assumeTrue(
                 discovery.confirmedRate != null,
                 verdict
-                        + " discovery withheld its rate (isNonMonotonic latched), so there is no"
-                        + " confirmed rate to judge. The FINDER-HOLD lines carry the contradicting"
-                        + " pair.");
+                        + " discovery never reached a genuine confirm (safety-capped), so there is no"
+                        + " confirmed rate to judge. The FINDER-HOLD lines carry the detail.");
     }
 
     private static void assertSustainable(Discovery discovery) {

@@ -13,6 +13,7 @@
  */
 package io.openmessaging.benchmark;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -24,6 +25,7 @@ import io.openmessaging.benchmark.worker.commands.PeriodStats;
 import io.openmessaging.benchmark.worker.commands.ProducerWorkAssignment;
 import io.openmessaging.benchmark.worker.commands.TopicsInfo;
 import java.io.File;
+import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
@@ -125,6 +127,37 @@ class WorkloadGeneratorRampTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("no candidate rate");
         }
+    }
+
+    @Test
+    void confirmedNonMonotonicDiscoveryStillAttachesRampVerification() {
+        // Regression for the 2026-09-16 capacity-watch run: CHOP reopened after an earlier
+        // candidate contradicted a prior pass, then genuinely confirmed a (lower) rate on its own
+        // hold -- that's real, held data, not a discovery that never converged. It must be reported
+        // as a flagged band, not withheld outright (which silently dropped the cell from the
+        // capacity-watch dashboard with no error).
+        Instant start = Instant.parse("2026-09-16T21:49:00Z");
+        Instant end = Instant.parse("2026-09-16T21:51:00Z");
+
+        RampVerification verification =
+                WorkloadGenerator.buildRampVerification(126_646.875, start, end, true);
+
+        assertThat(verification.rate).isEqualTo(126_646.875);
+        assertThat(verification.startEpochMillis).isEqualTo(start.toEpochMilli());
+        assertThat(verification.endEpochMillis).isEqualTo(end.toEpochMilli());
+        assertThat(verification.nonMonotonic).isTrue();
+    }
+
+    @Test
+    void confirmedMonotonicDiscoveryReportsAnUnflaggedRampVerification() {
+        Instant start = Instant.parse("2026-09-15T21:08:00Z");
+        Instant end = Instant.parse("2026-09-15T21:10:00Z");
+
+        RampVerification verification =
+                WorkloadGenerator.buildRampVerification(15_804.21, start, end, false);
+
+        assertThat(verification.rate).isEqualTo(15_804.21);
+        assertThat(verification.nonMonotonic).isFalse();
     }
 
     private static Workload discoveryWorkload() {
