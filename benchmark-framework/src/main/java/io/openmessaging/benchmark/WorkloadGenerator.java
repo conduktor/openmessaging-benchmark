@@ -414,16 +414,23 @@ public class WorkloadGenerator implements AutoCloseable {
         // incidental.
         worker.adjustPublishRate(finder.getCurrentRate());
 
-        if (finder.isConfirmed() && !finder.isNonMonotonic()) {
+        if (finder.isConfirmed()) {
             Instant verificationConfirmedAt = Instant.now();
-            rampVerification = new RampVerification();
             // Report what the confirmation hold actually delivered, not what it was asked for. The
             // two agree at a sustainable rate; where they disagree, the achieved figure is the one
             // that is true, and it is the figure the epoch window below actually brackets.
-            rampVerification.rate = finder.lastHoldAchievedRate();
-            rampVerification.startEpochMillis = verificationStartedAt.toEpochMilli();
-            rampVerification.endEpochMillis = verificationConfirmedAt.toEpochMilli();
-            rampVerification.nonMonotonic = false;
+            //
+            // A discovery that contradicted itself somewhere earlier still ended in a genuine,
+            // held confirm -- confirmed is a hold that actually passed, not the disputed earlier
+            // one -- so it's real data, just less certain than a clean run. Report it as a band
+            // (nonMonotonic=true) rather than discarding it: downstream (omb_history.py's
+            // non_monotonic column) already exists to carry exactly this distinction.
+            rampVerification =
+                    buildRampVerification(
+                            finder.lastHoldAchievedRate(),
+                            verificationStartedAt,
+                            verificationConfirmedAt,
+                            finder.isNonMonotonic());
             log.info(
                     "----- CHOP verification window: {} -> {} (rate {} msg/s) -----",
                     verificationStartedAt,
@@ -444,13 +451,11 @@ public class WorkloadGenerator implements AutoCloseable {
         }
 
         if (finder.isNonMonotonic()) {
-            // A discovery that contradicted itself anywhere isn't verified, however it ended --
-            // rampVerification is deliberately withheld above rather than reporting a specific
-            // rate that might not reproduce.
+            // Still attached above (when confirmed) as a flagged band -- see the comment there.
             log.warn(
                     "Ramp discovery detected non-monotonic backlog behavior -- {} msg/s may not"
-                            + " reproduce reliably; rampVerification will not be attached to the"
-                            + " result. Treat this as a band rather than an exact figure.",
+                            + " reproduce reliably; rampVerification is attached but flagged"
+                            + " nonMonotonic. Treat this as a band rather than an exact figure.",
                     finder.getCurrentRate());
         }
         log.info("----- Ramp discovery (CHOP) complete: {} msg/s -----", finder.getCurrentRate());
@@ -497,6 +502,19 @@ public class WorkloadGenerator implements AutoCloseable {
     // Composes with the existing microsToMillis(long) rather than restating the conversion.
     private static String millisFromMicros(long micros) {
         return String.format("%.1f", microsToMillis(micros));
+    }
+
+    // Pulled out as a pure function (no clock reads, no finder access) so the confirmed/nonMonotonic
+    // wiring is directly unit-testable without driving a full discovery loop -- same rationale as
+    // RampRateFinder staying a "caller owns time" state machine.
+    static RampVerification buildRampVerification(
+            double rate, Instant startedAt, Instant confirmedAt, boolean nonMonotonic) {
+        RampVerification verification = new RampVerification();
+        verification.rate = rate;
+        verification.startEpochMillis = startedAt.toEpochMilli();
+        verification.endEpochMillis = confirmedAt.toEpochMilli();
+        verification.nonMonotonic = nonMonotonic;
+        return verification;
     }
 
     private void createConsumers(List<String> topics) throws IOException {
